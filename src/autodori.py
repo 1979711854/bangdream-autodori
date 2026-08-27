@@ -460,8 +460,26 @@ def save_song(name):
     logging.debug("Save song: {}".format(name))
 
 
+def _reload_photogate():
+    """每首歌开始前重读 data/config.yml 的 photogate_latency_ms,
+    让 GUI 自动校准在单次运行里也能连续生效(不用重启 bot)。"""
+    global PHOTOGATE_LATENCY
+    try:
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        if isinstance(cfg, dict):
+            timing = cfg.get("timing", {})
+            if isinstance(timing, dict) and timing.get("photogate_latency_ms") is not None:
+                PHOTOGATE_LATENCY = int(timing["photogate_latency_ms"])
+                logging.debug(
+                    "PHOTOGATE_LATENCY reloaded to {}ms".format(PHOTOGATE_LATENCY)
+                )
+    except Exception as e:
+        logging.debug("Failed to reload photogate: {}".format(e))
+
+
 def play_song():
     logging.info("Start play")
+    _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
 
