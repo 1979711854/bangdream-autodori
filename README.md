@@ -51,16 +51,16 @@
 
 ## 🚀 使用方法
 
-### 方式一:GUI 启动器(推荐)
+### 方式一:独立版(不需要 Python,推荐给普通用户)
 
-**本地一键启动(任选其一):**
-- 双击项目根目录的 **`autodori_gui.exe`**(打包好的 GUI,直接打开)
-- 或双击 **`run_gui.bat`**(有 exe 就启动 exe,没有就自动用 `python gui.py` 跑源码版)
-- 或命令行 `python gui.py`(源码版,需先装好依赖)
+1. 从 [Release](https://github.com/1979711854/bangdream-autodori/releases) 下载 `bangdream-autodori_win64.zip`
+2. 解压到任意文件夹
+3. 双击 **`autodori_gui.exe`**
+4. 主界面选难度等参数,点 **开始打歌**
 
-打开后:在主界面选择难度、火罐策略、photogate、生命值耗尽策略等参数,点击 **开始打歌** 即可;日志区实时显示关键事件,「注意事项」「常见问题」分栏有设置说明。
+> 独立版已内置 bot 运行环境(autodori.exe + assets),解压即用;首次运行会在同目录生成 `data/`、`debug/` 文件夹。压缩包里的 exe 未被 .gitignore 影响,直接可分发。
 
-> 关于 `autodori_gui.exe`:它是用 `pyinstaller --onefile --windowed --name autodori_gui gui.py` 打包的产物,位于项目根目录(`dist/` 里也有一份,是构建输出目录)。exe 已被 `.gitignore` 忽略、**不会上传到仓库**,需要时可在 Release 下载或自行重新打包。
+### 方式二:源码运行(适合开发者/自行调参)
 
 ### 方式二:源码运行
 
