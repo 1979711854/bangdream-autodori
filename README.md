@@ -6,6 +6,8 @@
 
 ![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white)  ![MaaFramework](https://img.shields.io/badge/MaaFramework-LGPLv3-blue)  ![License](https://img.shields.io/badge/License-GPLv3-green)
 
+> 关键词:邦邦 / BanG Dream / 邦多利 / 国服 / 自动打歌 / 自动挖矿 / 脚本 / 模拟器 / MuMu / autodori
+
 </div>
 
 ## ✨ 功能
