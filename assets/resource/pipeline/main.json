@@ -6,9 +6,9 @@
             "live_home_button"
         ],
         "interrupt": [
+            "live_failed",
             "to_tome",
-            "start_app",
-            "live_failed"
+            "start_app"
         ]
     }
 }
