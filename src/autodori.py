@@ -372,14 +372,18 @@ class SavePlayResult(CustomAction):
             else:
                 play_failed_times += 1
                 playresult = {}
-            PlayRecord.create(
-                play_time=int(time.time()),
-                play_offset=OFFSET,
-                result=playresult,
-                succeed=succeed,
-                chart_id=current_song_id,
-                difficulty=DIFFICULTY,
-            )
+            if current_song_id is not None:
+                PlayRecord.create(
+                    play_time=int(time.time()),
+                    play_offset=OFFSET,
+                    result=playresult,
+                    succeed=succeed,
+                    chart_id=current_song_id,
+                    difficulty=DIFFICULTY,
+                )
+            else:
+                # 启动时游戏已在演出失败界面,没有选中过歌曲,跳过保存记录
+                logging.debug("No song selected, skip saving play result")
             if play_failed_times >= MAX_FAILED_TIMES:
                 logging.error("Failed attempts exceed max failed times")
                 context.run_action("close_app")
