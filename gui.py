@@ -9,14 +9,18 @@ import json
 import os
 import queue
 import subprocess
+import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
-# autodori 源码目录(含 src/ .venv/ assets/ data/)。
-# 如果移动了源码目录,改这里。
-BASE = r"E:\autodori-src"
+# 打包版:所有文件(bot.exe/assets/data)都在 exe 所在目录;
+# 源码版:项目根目录(含 src/ .venv/ assets/ data/)。
+if getattr(sys, "frozen", False):
+    BASE = os.path.dirname(sys.executable)
+else:
+    BASE = r"E:\autodori-src"
 PYTHON = os.path.join(BASE, ".venv", "Scripts", "python.exe")
 SCRIPT = os.path.join(BASE, "src", "autodori.py")
 CONFIG = os.path.join(BASE, "data", "config.yml")
@@ -264,15 +268,22 @@ class AutodoriGUI:
             return
         diff = self.diff_var.get()
         self._write_config()
-        if not os.path.exists(PYTHON):
-            messagebox.showerror("环境缺失", "找不到 {}".format(PYTHON))
-            return
-        cmd = [
-            PYTHON, SCRIPT,
-            "--mode", "main",
-            "--difficulty", diff,
-            "--livemode", LIVE_MODE,
-        ]
+        if getattr(sys, "frozen", False):
+            bot = os.path.join(BASE, "autodori.exe")
+            if not os.path.exists(bot):
+                messagebox.showerror("环境缺失", "找不到 {},请放在同目录".format(bot))
+                return
+            cmd = [bot, "--mode", "main", "--difficulty", diff, "--livemode", LIVE_MODE]
+        else:
+            if not os.path.exists(PYTHON):
+                messagebox.showerror("环境缺失", "找不到 {}".format(PYTHON))
+                return
+            cmd = [
+                PYTHON, SCRIPT,
+                "--mode", "main",
+                "--difficulty", diff,
+                "--livemode", LIVE_MODE,
+            ]
         self._log(">>> " + " ".join(cmd))
         # 隐藏 bot 子进程的控制台窗口(双保险)
         startupinfo = subprocess.STARTUPINFO()
@@ -343,23 +354,34 @@ class AutodoriGUI:
         self.stop_btn.configure(state="disabled")
         self.status.configure(text="已停止")
 
-    def stop(self):
-        if self.proc is not None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=5)
-            except Exception:
-                self.proc.kill()
-        self._on_finished()
-        self._log("=== 手动停止 ===")
+    def _kill_proc(self):
+        """杀掉 bot 进程的整个进程树。
 
-    def _on_close(self):
-        # 关窗口时强制结束 bot 子进程,避免它留在后台继续点游戏
-        if self.proc is not None and self.proc.poll() is None:
+        pyinstaller onefile exe 会派生子进程,只用 terminate()/kill() 只能杀父进程,
+        子进程会残留继续打歌。用 taskkill /f /t 按 PID 杀整棵树。
+        """
+        if self.proc is None:
+            return
+        try:
+            subprocess.run(
+                ["taskkill", "/f", "/t", "/pid", str(self.proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
             try:
                 self.proc.kill()
             except Exception:
                 pass
+        self.proc = None
+
+    def stop(self):
+        self._kill_proc()
+        self._on_finished()
+        self._log("=== 手动停止 ===")
+
+    def _on_close(self):
+        # 关窗口时强制结束 bot 整个进程树,避免它留在后台继续点游戏
+        self._kill_proc()
         self.root.destroy()
 
 
