@@ -294,7 +294,7 @@
  },
  "life_exhausted_confirm": {
   "recognition": "OCR",
-  "expected": "确定",
+  "expected": "退出",
   "roi": [
    630,
    395,
