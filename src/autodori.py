@@ -532,6 +532,17 @@ def play_song(context=None):
     _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
+    wait_first = get_runtime_info(current_player.resolution)["wait_first"]
+    logging.info(
+        "打歌: %s (#%s-%s), 动作%s, photogate=%sms, 检测带y=%s-%s",
+        current_song_name,
+        current_song_id,
+        DIFFICULTY,
+        len(current_chart.actions),
+        PHOTOGATE_LATENCY,
+        wait_first["from"],
+        wait_first["to"],
+    )
 
     def _get_wait_time():
         wait_for = 0.0
@@ -612,6 +623,7 @@ def wait_first_note():
     prev_change = None   # consecutive-frame change of the previous frame
     prev_frame_t = None
     CHANGE_THRESHOLD = 3.0
+    _freeze_t0 = None    # 冻结期开始时刻(用于统计采集帧率)
 
     # 注意:曾尝试"越阈值后持续变化 CONFIRM_MS 毫秒确认再触发"(问题A 防误触发),
     # 但真音符进入检测带只产生一帧大变化(音符进入),之后带内下移帧间变化 <3.0,
@@ -658,13 +670,21 @@ def wait_first_note():
                 )
                 if last_avg is not None:
                     if change_score <= CHANGE_THRESHOLD:
+                        if waited_frames == 0:
+                            _freeze_t0 = frame_t
                         waited_frames += 1
                     else:
                         waited_frames = 0
                     if waited_frames >= 200:
                         freezed = True
                         _log_t = 0.0  # 进入触发期,重置节流以便逐帧记录
-                        logging.debug("Picture freezed, waiting for the first note...")
+                        fps = (
+                            200.0 / max((frame_t - _freeze_t0) * 1000.0, 1e-6) * 1000.0
+                        )
+                        logging.debug(
+                            "Picture freezed, waiting for the first note... (freeze 200帧耗 %.0fms, 约 %.0f fps)",
+                            (frame_t - _freeze_t0) * 1000.0, fps,
+                        )
                 last_avg = band_avg
                 _maybe_log(change_score, band_avg)
                 continue
@@ -975,6 +995,45 @@ def check_update():
         logging.error("failed to check for updates: {}".format(e))
 
 
+def _log_environment():
+    """启动后打印一次环境诊断信息(版本/模拟器/分辨率/配置),便于远程排查。
+    纯日志,不影响流程。若解析器/分辨率不对,这里一眼可见。"""
+    try:
+        version = current_version or "(未知)"
+        res = current_player.resolution
+        orient = _get_orientation()
+        dname = device.name if device else "?"
+        daddr = device.address if device else "?"
+        dadb = str(device.adb_path) if device else "?"
+        extras = device.config.get("extras", {}) if device else {}
+        emu_type = "mumu" if "mumu" in extras else ("ld" if "ld" in extras else "?")
+        emu_cfg = extras.get(emu_type, {}) if emu_type in extras else {}
+        emu_path = emu_cfg.get("path", "")
+        emu_index = emu_cfg.get("index", "")
+        gate = PHOTOGATE_LATENCY
+        life = (config or {}).get("on_life_exhausted", "auto")
+        boost = (config or {}).get("play_at_zero_boost", True)
+        wf = get_runtime_info(current_player.resolution)["wait_first"]
+        logging.info("===== 环境诊断 =====")
+        logging.info("版本: %s", version)
+        logging.info(
+            "模拟器: %s [%s] addr=%s index=%s 路径=%s",
+            emu_type, dname, daddr, emu_index, emu_path,
+        )
+        logging.info("adb 路径: %s", dadb)
+        logging.info(
+            "分辨率: %sx%s, 方向: %s°, 首音检测带 y=%s-%s",
+            res[0], res[1], orient, wf["from"], wf["to"],
+        )
+        logging.info(
+            "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
+            gate, life, boost, DIFFICULTY, LIVEMODE,
+        )
+        logging.info("===== 环境诊断结束 =====")
+    except Exception as e:
+        logging.debug("环境诊断失败: %s", e)
+
+
 def main():
     configure_log()
 
@@ -1031,6 +1090,7 @@ def main():
     MIN_LIVEBOOST = args.liveboost
     init_maa()
     init_player_and_mnt()
+    _log_environment()
 
     maatasker.post_task(entry, _get_override_pipeline()).wait().get()
 

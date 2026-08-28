@@ -34,9 +34,10 @@ WINDOW_SIZES = ["600x460", "640x480", "680x520", "720x550",
                 "760x580", "860x620", "960x680", "1024x700", "1280x800"]
 
 # photogate 自动校准参数(见 _calibrate_gate)
-CAL_STEP_MS = 10        # 每次校准步长(ms)
+CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
 CAL_MIN_DIFF = 3        # |FAST-SLOW| 低于此值视为信号弱,不调整
 CAL_RANGE = (0, 150)    # photogate 允许范围(ms)
+CAL_COLLAPSE_STEP = 15  # 打歌中途崩(无结算)时按上次方向继续调整的步长(ms)
 
 
 def _parse_play_result(line):
@@ -83,10 +84,10 @@ def _calibrate_gate(data, current_ms):
         return None  # 信号太弱,暂不调整
 
     # 误差量级估计:FAST+SLOW 占全部判定的比例越高,photogate 偏离越大。
-    # 经验系数 40ms/100%:2% 歪→步长 ~1ms 精调,10%→~4ms,30%→~10ms(封顶)。
+    # 经验系数 50ms/100%:2% 歪→步长 1ms 精调,10%→5ms,30%→15ms(封顶)。
     total = perfect + great + good + bad + miss
     off_ratio = (fast + slow) / max(total, 1)
-    step = max(1, min(CAL_STEP_MS, round(off_ratio * 40)))
+    step = max(1, min(CAL_STEP_MS, round(off_ratio * 50)))
 
     direction = 1 if bias > 0 else -1
     new_ms = current_ms + direction * step
@@ -181,6 +182,7 @@ class AutodoriGUI:
         self.proc = None
         self.q = queue.Queue()
         self._style = ttk.Style()
+        self._last_cal_direction = 0  # 上次校准的 FAST/SLOW 方向:+1 增大 / -1 减小 / 0 未知
 
         # 读取 GUI 偏好设置
         self.gui_cfg = self._load_gui_config()
@@ -403,6 +405,14 @@ class AutodoriGUI:
         if not self.auto_cal_var.get():
             return
         try:
+            fast_c = int(data.get("fast", 0) or 0)
+            slow_c = int(data.get("slow", 0) or 0)
+            self._last_cal_direction = (
+                1 if fast_c > slow_c else (-1 if slow_c > fast_c else 0)
+            )
+        except Exception:
+            self._last_cal_direction = 0
+        try:
             cur = int(self.gate_var.get())
         except ValueError:
             cur = 30
@@ -421,6 +431,35 @@ class AutodoriGUI:
         self._apply_photogate(new_val)
         self.cal_status.configure(
             text="自动校准: photogate {} → {} ms · {}".format(cur, new_val, verb)
+        )
+
+    def _on_life_exhausted(self):
+        """打歌中途生命耗尽(无结算):自动校准时按上一次 FAST/SLOW 方向继续调。
+
+        崩溃说明当前 photogate 偏差仍大,用大步长;若无历史方向信号则提示手动。
+        """
+        if not self.auto_cal_var.get():
+            return
+        try:
+            cur = int(self.gate_var.get())
+        except ValueError:
+            cur = 30
+        if self._last_cal_direction == 0:
+            self.cal_status.configure(
+                text="打歌中途崩了且无方向信号,请手动调整 photogate"
+            )
+            return
+        direction = self._last_cal_direction
+        new_val = max(
+            CAL_RANGE[0],
+            min(CAL_RANGE[1], cur + direction * CAL_COLLAPSE_STEP),
+        )
+        verb = "增大(上次偏FAST按早)" if direction > 0 else "减小(上次偏SLOW按晚)"
+        self._apply_photogate(new_val)
+        self.cal_status.configure(
+            text="打歌中途崩,按上次方向{}: photogate {} → {} ms".format(
+                verb, cur, new_val
+            )
         )
 
     def _apply_photogate(self, new_val):
@@ -545,6 +584,9 @@ class AutodoriGUI:
                 data = _parse_play_result(line)
                 if data is not None:
                     self._on_play_result(data)
+                elif "打歌中生命值耗尽" in line:
+                    self._on_life_exhausted()
+                    self._log(line)
                 elif self._should_show(line):
                     self._log(line)
         except queue.Empty:
