@@ -625,6 +625,13 @@ def wait_first_note():
     CHANGE_THRESHOLD = 3.0
     _freeze_t0 = None    # 冻结期开始时刻(用于统计采集帧率)
 
+    # 问题A修复(2026-08-28 日志实证):崩掉的歌,冻结完成后 50-100ms 内就有
+    # 前奏残留元素(计数动画/"GO!")扫过检测带被当首音 → 图表比真首音早 ~1.5s
+    # 开始 → 整首错位全 MISS → 崩。这里在冻结完成后给一段宽限期,期内越阈值
+    # 一律视为前奏残留忽略;真首音通常要 1.5s+ 才到,不受影响。
+    FIRST_NOTE_GRACE_MS = 500
+    _freeze_done_t = None
+
     # 注意:曾尝试"越阈值后持续变化 CONFIRM_MS 毫秒确认再触发"(问题A 防误触发),
     # 但真音符进入检测带只产生一帧大变化(音符进入),之后带内下移帧间变化 <3.0,
     # 会被确认逻辑当成"候选掉落"丢弃 → 首音被拖后数秒 → 整首全 MISS。已撤回,
@@ -677,6 +684,7 @@ def wait_first_note():
                         waited_frames = 0
                     if waited_frames >= 200:
                         freezed = True
+                        _freeze_done_t = frame_t
                         _log_t = 0.0  # 进入触发期,重置节流以便逐帧记录
                         fps = (
                             200.0 / max((frame_t - _freeze_t0) * 1000.0, 1e-6) * 1000.0
@@ -698,7 +706,22 @@ def wait_first_note():
                 if last_avg is not None
                 else 0.0
             )
-            if last_avg is not None and prev_change is not None:
+            now_t = time.perf_counter()
+            if (
+                _freeze_done_t is not None
+                and (now_t - _freeze_done_t) * 1000.0 < FIRST_NOTE_GRACE_MS
+            ):
+                # 冻结后宽限期内:前奏残留 UI(计数/"GO!"等)常在此窗口扫过检测带,
+                # 一律忽略不触发,等真首音(通常 1.5s+ 后)
+                if change_score >= CHANGE_THRESHOLD:
+                    _maybe_log(
+                        change_score,
+                        band_avg,
+                        "ignored(prelude {:.0f}ms)".format(
+                            (now_t - _freeze_done_t) * 1000.0
+                        ),
+                    )
+            elif last_avg is not None and prev_change is not None:
                 if prev_change < CHANGE_THRESHOLD <= change_score:
                     # change crossed the threshold between the last two frames
                     frac = (CHANGE_THRESHOLD - prev_change) / max(
