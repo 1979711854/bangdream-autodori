@@ -147,7 +147,8 @@
  "wait_live_start": {
   "recognition": "TemplateMatch",
   "template": "live/button/pause.png",
-  "next": "playsong"
+  "next": "playsong",
+  "on_error": "save_failed_playresult"
  },
  "playsong": {
   "action": "Custom",

@@ -61,6 +61,7 @@ def _calibrate_gate(data, current_ms):
     """根据本曲 FAST/SLOW 判定,返回建议的 photogate 值;信号不足返回 None。
 
     语义:FAST 偏多=按早了=photogate 偏小→增大;SLOW 偏多=按晚了→减小。
+    步长按"歪曲比例"自适应:歪得多大步快速收敛,歪得少小步精调,不再固定 ±10。
     任何核心字段 <0(OCR 失败)或信号太弱(|FAST-SLOW|<CAL_MIN_DIFF)都跳过。
     """
     try:
@@ -68,17 +69,27 @@ def _calibrate_gate(data, current_ms):
         slow = int(data.get("slow", 0) or 0)
         great = int(data.get("great", 0) or 0)
         perfect = int(data.get("perfect", 0) or 0)
+        good = int(data.get("good", 0) or 0)
+        bad = int(data.get("bad", 0) or 0)
+        miss = int(data.get("miss", 0) or 0)
     except Exception:
         return None
-    if min(fast, slow, great, perfect) < 0:
+    if min(fast, slow, great, perfect, good, bad, miss) < 0:
         return None
     if fast + slow == 0:
         return None  # 没有 FAST/SLOW,无需调整
     bias = fast - slow
     if abs(bias) < CAL_MIN_DIFF:
         return None  # 信号太弱,暂不调整
+
+    # 误差量级估计:FAST+SLOW 占全部判定的比例越高,photogate 偏离越大。
+    # 经验系数 40ms/100%:2% 歪→步长 ~1ms 精调,10%→~4ms,30%→~10ms(封顶)。
+    total = perfect + great + good + bad + miss
+    off_ratio = (fast + slow) / max(total, 1)
+    step = max(1, min(CAL_STEP_MS, round(off_ratio * 40)))
+
     direction = 1 if bias > 0 else -1
-    new_ms = current_ms + direction * CAL_STEP_MS
+    new_ms = current_ms + direction * step
     return max(CAL_RANGE[0], min(CAL_RANGE[1], new_ms))
 
 # 注意事项内容(只读)
@@ -516,6 +527,9 @@ class AutodoriGUI:
         "CRITICAL",
         "Traceback",
         "退出",
+        "生命值耗尽",
+        "演出失败",
+        "提前结束",
     )
 
     def _should_show(self, line):

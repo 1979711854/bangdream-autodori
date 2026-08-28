@@ -394,12 +394,62 @@ class SavePlayResult(CustomAction):
             return CustomAction.RunResult(False)
 
 
+class LifeExhaustedDetected(Exception):
+    """打歌中生命值耗尽,游戏弹出「演出失败」窗口,提前结束本次演出。"""
+
+
+# 打歌中生命耗尽检测:
+#  MAA 在自定义动作(Play)阻塞运行期间不会检查 pipeline 的 interrupt,所以
+#  playsong 的 live_failed 中断在打歌中实际不生效,只会等整首打完才轮到。
+#  这里在 play_song 循环里直接检测弹窗,命中即抛异常让 Play 返回失败,走
+#  on_error 的生命耗尽处理链。
+#  roi 与 live_failed 一致,覆盖弹窗左上「演出失败」标题(实测文字在 x266-372,
+#  y236-259,roi 取稍大保证 OCR 读到完整四字)。
+_LIFE_ROI = [256, 227, 155, 38]
+_LIFE_PIPELINE = {
+    "life_check": {
+        "recognition": "OCR",
+        "only_rec": True,
+        "expected": ["演出失败"],
+        "roi": _LIFE_ROI,
+    },
+}
+
+
+def _life_exhausted_on_screen(context) -> bool:
+    """检测当前画面是否出现「演出失败」弹窗(生命值耗尽)。
+
+    先做廉价亮度预检:弹窗标题区是白底深字(实测平均亮度 ~224),普通打歌
+    画面该区域几乎不会是大块白,先滤掉绝大部分帧,只有预检通过才跑 OCR,
+    避免打歌中频繁 OCR 占用 CPU。检测耗时由调用方从 sleep 里补偿,不影响
+    打歌时机。
+    """
+    try:
+        screen = np.ascontiguousarray(
+            current_player.ipc_capture_display(), dtype=np.uint8
+        )
+        x, y, w, h = _LIFE_ROI
+        region = screen[y : y + h, x : x + w]
+        if float(region.mean()) < 150:
+            return False
+        reco = context.run_recognition("life_check", screen, _LIFE_PIPELINE)
+        text = (reco.best_result.text if reco and reco.best_result else "") or ""
+        logging.debug("life check ocr: {}".format(text))
+        return bool(text)
+    except Exception as e:
+        logging.debug("life check error: {}".format(e))
+        return False
+
+
 @maaresource.custom_action("Play")
 class Play(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         try:
-            play_song()
+            play_song(context)
             return CustomAction.RunResult(True)
+        except LifeExhaustedDetected:
+            # 打歌中生命耗尽:返回失败,playsong 的 on_error 接管(记录+退出)
+            return CustomAction.RunResult(False)
         except Exception as e:
             logging.error(f"Failed when play song: {e}", stack_info=True)
             return CustomAction.RunResult(False)
@@ -477,7 +527,7 @@ def _reload_photogate():
         logging.debug("Failed to reload photogate: {}".format(e))
 
 
-def play_song():
+def play_song(context=None):
     logging.info("Start play")
     _reload_photogate()
     cmd_log_list.clear()
@@ -507,10 +557,32 @@ def play_song():
 
     wait_first_note()
 
+    # 打歌中生命耗尽检测:每 ≥LIFE_CHECK_INTERVAL 秒检查一次「演出失败」弹窗。
+    # 弹窗出现后游戏会一直等待,检测不用太密;检测耗时从本次 sleep 里扣除
+    # (仅在 sleep 预算充足时执行),保证下一批音符按谱面时间线准时发布,不会
+    # 因检测而整体提前/延后。命中即抛异常,由 Play 返回失败走 on_error。
+    last_life_check = 0.0
+    LIFE_CHECK_INTERVAL = 1.0  # 秒
+
     while True:
         current_chart.command_builder.publish(mnt, block=False)
         wait_time = _get_wait_time()
-        time.sleep(max(0, wait_time - 3) / 1000)
+        sleep_s = max(0, wait_time - 3) / 1000.0
+
+        now = time.perf_counter()
+        if (
+            context is not None
+            and now - last_life_check >= LIFE_CHECK_INTERVAL
+            and sleep_s >= 0.2
+        ):
+            check_t0 = time.perf_counter()
+            if _life_exhausted_on_screen(context):
+                logging.info("打歌中生命值耗尽,提前结束本次演出")
+                raise LifeExhaustedDetected()
+            sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+            last_life_check = time.perf_counter()
+
+        time.sleep(sleep_s)
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:
@@ -541,6 +613,33 @@ def wait_first_note():
     prev_frame_t = None
     CHANGE_THRESHOLD = 3.0
 
+    # 注意:曾尝试"越阈值后持续变化 CONFIRM_MS 毫秒确认再触发"(问题A 防误触发),
+    # 但真音符进入检测带只产生一帧大变化(音符进入),之后带内下移帧间变化 <3.0,
+    # 会被确认逻辑当成"候选掉落"丢弃 → 首音被拖后数秒 → 整首全 MISS。已撤回,
+    # 恢复"越阈值即触发"。问题A 复现靠下面的每帧 wfT 日志定位。
+    _log_t = 0.0
+
+    def _maybe_log(change_score, band_avg, note=""):
+        """每帧 change_score 日志(问题A 复现用):静默期 ≤10 行/秒,变化显著或
+        有事件时逐帧记录。复现问题后看 debug/autodori-*.log 里 wfF/wfT 行,
+        change 越大说明检测带里变化越剧烈,结合 band 颜色可判断是不是真音符。"""
+        nonlocal _log_t
+        now_t = time.perf_counter()
+        if not note and change_score <= 1.0 and (now_t - _log_t) < 0.1:
+            return
+        _log_t = now_t
+        logging.debug(
+            "wf{}{} change={:.2f} band=({:.1f},{:.1f},{:.1f}) waited={}".format(
+                "T" if freezed else "F",
+                (" " + note) if note else "",
+                change_score,
+                band_avg[0],
+                band_avg[1],
+                band_avg[2],
+                waited_frames,
+            )
+        )
+
     while True:
         try:
             screen = current_player.ipc_capture_display()
@@ -552,54 +651,69 @@ def wait_first_note():
             band_avg = rows.mean(axis=0)
 
             if not freezed:
+                change_score = (
+                    float(np.sum(np.abs(band_avg - last_avg)))
+                    if last_avg is not None
+                    else 0.0
+                )
                 if last_avg is not None:
-                    change_score = float(np.sum(np.abs(band_avg - last_avg)))
                     if change_score <= CHANGE_THRESHOLD:
                         waited_frames += 1
                     else:
                         waited_frames = 0
                     if waited_frames >= 200:
                         freezed = True
+                        _log_t = 0.0  # 进入触发期,重置节流以便逐帧记录
                         logging.debug("Picture freezed, waiting for the first note...")
                 last_avg = band_avg
+                _maybe_log(change_score, band_avg)
                 continue
 
-            # freezed: detect the first note moving into the band, interpolated
-            if last_avg is not None:
-                change_score = float(np.sum(np.abs(band_avg - last_avg)))
-                if prev_change is not None:
-                    if prev_change < CHANGE_THRESHOLD <= change_score:
-                        # change crossed the threshold between the last two frames
-                        frac = (CHANGE_THRESHOLD - prev_change) / max(
-                            change_score - prev_change, 1e-9
-                        )
-                        cross_t = prev_frame_t + frac * (frame_t - prev_frame_t)
-                        wait_ms = PHOTOGATE_LATENCY - (
-                            time.perf_counter() - cross_t
-                        ) * 1000.0
-                        logging.debug(
-                            "First note change interpolated ({:.2f}->{:.2f}), wait {:.1f}ms".format(
-                                prev_change, change_score, wait_ms
-                            )
-                        )
-                        time.sleep(max(0, wait_ms) / 1000)
-                        break
-                    elif change_score >= CHANGE_THRESHOLD:
-                        # Already above threshold on both frames: the entry happened
-                        # at or before this frame; compensate the elapsed time.
-                        wait_ms = PHOTOGATE_LATENCY - (
-                            time.perf_counter() - frame_t
-                        ) * 1000.0
-                        logging.debug(
-                            "First note change direct ({:.2f}), wait {:.1f}ms".format(
-                                change_score, wait_ms
-                            )
-                        )
-                        time.sleep(max(0, wait_ms) / 1000)
-                        break
-                prev_change = change_score
-                prev_frame_t = frame_t
+            # freezed: detect the first note moving into the band, interpolated.
+            # (曾尝试"持续变化确认"防误触发,但真音符进入检测带只产生一帧大变化,
+            # 之后带内下移帧间变化 <3.0 会被误判掉落 → 首音拖后 → 整首全 MISS,
+            # 已撤回。若问题A 仍复现,靠 wfT 日志定位误触发来源。)
+            change_score = (
+                float(np.sum(np.abs(band_avg - last_avg)))
+                if last_avg is not None
+                else 0.0
+            )
+            if last_avg is not None and prev_change is not None:
+                if prev_change < CHANGE_THRESHOLD <= change_score:
+                    # change crossed the threshold between the last two frames
+                    frac = (CHANGE_THRESHOLD - prev_change) / max(
+                        change_score - prev_change, 1e-9
+                    )
+                    cross_t = prev_frame_t + frac * (frame_t - prev_frame_t)
+                    wait_ms = PHOTOGATE_LATENCY - (
+                        time.perf_counter() - cross_t
+                    ) * 1000.0
+                    _maybe_log(
+                        change_score,
+                        band_avg,
+                        "trigger(interp {:.2f}->{:.2f})".format(
+                            prev_change, change_score
+                        ),
+                    )
+                    time.sleep(max(0, wait_ms) / 1000)
+                    break
+                elif change_score >= CHANGE_THRESHOLD:
+                    # Already above threshold on both frames: the entry happened
+                    # at or before this frame; compensate the elapsed time.
+                    wait_ms = PHOTOGATE_LATENCY - (
+                        time.perf_counter() - frame_t
+                    ) * 1000.0
+                    _maybe_log(
+                        change_score,
+                        band_avg,
+                        "trigger(direct {:.2f})".format(change_score),
+                    )
+                    time.sleep(max(0, wait_ms) / 1000)
+                    break
+            prev_change = change_score
+            prev_frame_t = frame_t
             last_avg = band_avg
+            _maybe_log(change_score, band_avg)
         except Exception as e:
             logging.error(f"Failed to get screen: {e}")
 
