@@ -11,6 +11,14 @@ import util
 from api import BestdoriAPI
 import yaml
 
+# 打歌中闭环时基校准(resync)的补偿注入量,由 autodori.play_song 的观测器写入。
+#   PENDING_SHIFT_MS: 待注入时间轴的补偿(ms)。正值=延长 wait(整体按晚),
+#                     负值=缩短 wait(整体按早)。
+#   APPLIED_SHIFT_MS: 本首歌已累计注入的补偿(ms),供观测器修正期望值。
+# 每首新歌开始前由 play_song 归零。
+PENDING_SHIFT_MS = 0.0
+APPLIED_SHIFT_MS = 0.0
+
 
 class PlayRecord(Model):
     class Meta:
@@ -359,6 +367,7 @@ class Chart:
         self.actions = actions_with_wait
 
     def actions_to_MNTcmd(self, resolution, orientation, offset_info, size=50):
+        global PENDING_SHIFT_MS, APPLIED_SHIFT_MS
         self.command_builder = CommandBuilder()
         builder = self.command_builder
         actions = self.actions[
@@ -425,6 +434,17 @@ class Chart:
             elif action_type == "wait":
                 self._a2c_offset += wait_offset
                 wait_for = action["length"]
+
+                # 闭环时基校准补偿: 把 PENDING_SHIFT_MS 摊入本批 wait。
+                # 单个 wait 最多吸收 25ms,避免局部时间轴失真;负补偿受 wait 长度限制。
+                if PENDING_SHIFT_MS and wait_for > 2:
+                    if PENDING_SHIFT_MS > 0:
+                        adj = min(25.0, PENDING_SHIFT_MS)
+                    else:
+                        adj = max(-min(25.0, wait_for - 1.0), PENDING_SHIFT_MS)
+                    wait_for += adj
+                    PENDING_SHIFT_MS -= adj
+                    APPLIED_SHIFT_MS += adj
 
                 OFFSET_LIMIT = 1
                 offset_adjust = min(

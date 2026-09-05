@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import re
+import statistics
 import string
 import subprocess
 import sys
@@ -46,11 +47,14 @@ from minitouchpy import (
 import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
+import chart as chart_mod
 from util import *
 
 MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
 DIFFICULTY = "hard"
+# 触控偏移:固定初始全 0,打歌途中不再校准(见 play_song 说明)。
+# 时间轴完全由谱面 wait 命令推进,仅靠 photogate 在开局对齐首音。
 OFFSET = {"up": 0, "down": 0, "move": 0, "wait": 0.0, "interval": 0.0}
 PHOTOGATE_LATENCY = 30
 DEFAULT_MOVE_SLICE_SIZE = 10
@@ -103,12 +107,40 @@ def reset_callback_data():
 reset_callback_data()
 
 
+def reset_offset_and_callbacks():
+    """打歌中断（生命耗尽）后清空回调数据。
+
+    触控偏移 OFFSET 已改为「全程固定初始值、打歌途中不校准」策略(见 play_song),
+    因此这里不再复位 OFFSET(它恒为初始全 0)。只清空回调数据,丢弃悬空指令 /
+    延迟回调,避免这些脏数据影响后续批次。
+    """
+    reset_callback_data()
+    logging.debug("打歌中断: 回调数据已清空")
+
+
 # Song selection preference, in priority order:
 #   0 = never played at this difficulty
 #   1 = played but not full-combo
 #   2 = full-combo but not all-perfect
 #   3 = all-perfect (done, don't replay)
 _selection_rejections = 0
+
+
+def _cfg_get(key, default=None):
+    """读 data/config.yml 顶层配置项，文件为空/非 dict 时回退默认值。"""
+    if isinstance(config, dict):
+        return config.get(key, default)
+    return default
+
+
+def _song_strategy() -> str:
+    """选歌策略（由 GUI 写入 data/config.yml）。
+
+    mine   = 挖矿为主：优先没打过 / 没全连 / 没全完美，抽到已达标歌曲就重抽；
+    random = 随机选歌：无指定偏好，抽到什么打什么。
+    """
+    val = str(_cfg_get("song_strategy", "mine") or "mine").strip().lower()
+    return "random" if val in ("random", "随机选歌") else "mine"
 
 
 def _song_tier(chart_id: str, difficulty: str) -> int:
@@ -154,8 +186,12 @@ def _current_target_tier(difficulty: str) -> int:
 
 
 def check_song_available(name, id_, difficulty):
+    # [FULL] 为完整版曲目，脚本不支持，任何策略下都跳过
     if name.startswith("[FULL]"):
         return False
+    if _song_strategy() == "random":
+        # 随机选歌：无指定偏好，抽到什么打什么（含已全连/全完美的歌）
+        return True
     global _selection_rejections
     tier = _song_tier(id_, difficulty)
     if tier >= 3:
@@ -291,6 +327,10 @@ class HandleLifeExhausted(CustomAction):
             if isinstance(config, dict)
             else "auto"
         )
+        # 生命耗尽说明打歌中断：当前批次的触控回调数据不完整。清空回调数据,
+        # 丢弃悬空指令/延迟回调,避免脏数据影响后续批次(触控偏移 OFFSET 已固定
+        # 初始值、打歌途中不校准,无需复位)。
+        reset_offset_and_callbacks()
         if mode == "wait":
             logging.info("生命值耗尽,已退出到主页,等待手动操作")
             context.run_action("stop")
@@ -448,7 +488,9 @@ class Play(CustomAction):
             play_song(context)
             return CustomAction.RunResult(True)
         except LifeExhaustedDetected:
-            # 打歌中生命耗尽:返回失败,playsong 的 on_error 接管(记录+退出)
+            # 打歌中生命耗尽:返回失败,playsong 的 on_error 接管(记录+退出)。
+            # 清空残缺回调数据(悬空指令/延迟回调),避免影响后续批次。
+            reset_offset_and_callbacks()
             return CustomAction.RunResult(False)
         except Exception as e:
             logging.error(f"Failed when play song: {e}", stack_info=True)
@@ -527,11 +569,24 @@ def _reload_photogate():
         logging.debug("Failed to reload photogate: {}".format(e))
 
 
+def _band_avg_of(screen, from_row, to_row):
+    """检测带 (from_row~to_row) 的 RGB 行均值，与 wait_first_note 同口径。"""
+    row_count = to_row - from_row + 1
+    rows = np.empty((row_count, 3), dtype=np.float64)
+    for r in range(from_row, to_row + 1):
+        avg, _ = evaluate_row_color(screen, r)
+        rows[r - from_row] = avg
+    return rows.mean(axis=0)
+
+
 def play_song(context=None):
     logging.info("Start play")
     _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
+    # 每首新歌归零闭环时基补偿(见 chart.py / 下方 resync 观测器)
+    chart_mod.PENDING_SHIFT_MS = 0.0
+    chart_mod.APPLIED_SHIFT_MS = 0.0
     wait_first = get_runtime_info(current_player.resolution)["wait_first"]
     logging.info(
         "打歌: %s (#%s-%s), 动作%s, photogate=%sms, 检测带y=%s-%s",
@@ -552,20 +607,6 @@ def play_song(context=None):
                 wait_for += action["length"]
         return wait_for
 
-    def _adjust_offset():
-        global callback_data
-        total_cost = 0.0
-        for type_ in ["up", "down", "move", "wait", "interval"]:
-            type_data = callback_data[type_]
-            total = type_data["total"]
-            if total != 0:
-                total_cost += type_data["total_offset"] - OFFSET[type_] * total
-                OFFSET[type_] = type_data["total_offset"] / total
-
-        current_chart._a2c_offset += total_cost
-        logging.debug("Adjust offset: {}".format(OFFSET))
-        logging.debug("Adjust _actions_to_cmd_offset: {}".format(total_cost))
-
     wait_first_note()
 
     # 打歌中生命耗尽检测:每 ≥LIFE_CHECK_INTERVAL 秒检查一次「演出失败」弹窗。
@@ -575,7 +616,139 @@ def play_song(context=None):
     last_life_check = 0.0
     LIFE_CHECK_INTERVAL = 1.0  # 秒
 
+    # ===== 打歌中闭环时基校准 (per-lane photogate resync) =====
+    # 背景: minitouch 服务端 wait 计时实测误差 <0.1%,脚本时间轴本身是精确的;
+    # 但游戏侧判定时钟在负载下会逐步滞后真实时间(结算 fast 恒正、slow 恒 0,
+    # 同一首歌时好时坏),固定时间轴无法应对。
+    # 原理: 每个音符头到达判定线前 PHOTOGATE_LATENCY ms 会穿过检测带
+    # (y=510-535)。打歌中按 7 条轨道分别观测过带时刻,与同轨道谱面期望时刻
+    # 对比得到时基偏移 delta;delta 相对开局基线的中位数漂移 >=35ms 时,向
+    # 后续 wait 注入反向补偿(chart.PENDING_SHIFT_MS),把剩余时间轴重新对齐。
+    # 只校正"漂移":常量偏差由基线吸收,仍归 photogate 校准负责。
+    # 可用 data/config.yml 的 timing.resync: false 关闭。
+    _rs_timing = _cfg_get("timing", {})
+    _rs_enabled = not (isinstance(_rs_timing, dict) and _rs_timing.get("resync") is False)
+    _rs_lane_expected = {}   # lane -> 该轨道音符头的谱面时刻列表(ms, 升序)
+    _rs_lane_x = []          # lane -> 检测带采样窗口中心 x
+    _rs_band_y = (0, 0)
+    _rs_anchor = None        # 首批命令发布的墙钟(perf_counter)
+    _rs_first_t = 0.0
+    _rs_last = None          # (7, 3) 上一帧各轨道检测带均值
+    _rs_refr_until = [0.0] * 7
+    _rs_samples = []         # 匹配成功的 delta(ms)样本
+    _rs_baseline = None
+    _rs_last_eval = 0.0
+    _rs_lane_ptr = {}        # lane -> 下一个待匹配期望点的下标(已消费音符不再匹配)
+    _rs_last_t = 0.0         # 谱面最后一个动作的谱面时刻(ms)
+    _RS_CHANGE_TH = 25.0     # 单轨道过带变化阈值(全带阈值 3.0 按宽度换算)
+    _RS_MATCH_WINDOW = 150.0
+    _RS_DRIFT_TH = 35.0      # 触发补偿的最小漂移
+    _RS_STEP_CAP = 80.0      # 单次补偿上限
+    _RS_TOTAL_CAP = 500.0    # 单首累计补偿上限(安全网)
+    if _rs_enabled:
+        _ri = get_runtime_info(current_player.resolution)
+        _lc = _ri["lane"]
+        _rs_lane_x = [_lc["start_x"] + (i + 0.5) * _lc["w"] for i in range(7)]
+        _rs_band_y = (_ri["wait_first"]["from"], _ri["wait_first"]["to"])
+        for _a in current_chart.actions:
+            if _a["type"] == "down":
+                _x = _a["pos"][0]
+                _lane = min(range(7), key=lambda i: abs(_rs_lane_x[i] - _x))
+                _rs_lane_expected.setdefault(_lane, []).append(_a["time"])
+        _rs_first_t = current_chart.actions[0]["time"] if current_chart.actions else 0.0
+        _rs_lane_ptr = {lane: 0 for lane in _rs_lane_expected}
+        logging.debug(
+            "resync: enabled, lanes=%d, heads=%d",
+            len(_rs_lane_expected),
+            sum(len(v) for v in _rs_lane_expected.values()),
+        )
+
+    def _rs_on_frame(screen):
+        """对一帧画面做 7 轨道过带检测与样本匹配。"""
+        nonlocal _rs_last, _rs_baseline, _rs_last_eval
+        y0, y1 = _rs_band_y
+        cols = np.empty((7, 3), dtype=np.float64)
+        for i, cx in enumerate(_rs_lane_x):
+            x0 = int(round(cx)) - 20
+            cols[i] = screen[y0 : y1 + 1, x0 : x0 + 40].mean(axis=(0, 1))
+        wall = time.perf_counter()
+        if _rs_last is not None and _rs_anchor is not None:
+            changes = np.abs(cols - _rs_last).sum(axis=1)
+            fired = [i for i in range(7) if changes[i] >= _RS_CHANGE_TH and wall >= _rs_refr_until[i]]
+            if len(fired) < 4:  # >=4 轨道同帧触发=全屏特效(技能/fever),整帧丢弃
+                for lane in fired:
+                    _rs_refr_until[lane] = wall + 0.06
+                    # 实测过带墙钟 -> 换算成谱面时刻坐标
+                    obs_chart = (
+                        (wall - _rs_anchor) * 1000.0
+                        + _rs_first_t
+                        + PHOTOGATE_LATENCY
+                        - chart_mod.APPLIED_SHIFT_MS
+                    )
+                    exp_list = _rs_lane_expected.get(lane)
+                    if not exp_list:
+                        continue
+                    # 指针式消费匹配: 跳过已过期(漏检)的期望点,命中后消费该音符。
+                    # 同一音符过带会产生 ~100ms 的多次触发(前缘/主体/尾缘),
+                    # 消费语义保证一个音符只贡献一个样本,否则尾缘样本会虚增 delta。
+                    ptr = _rs_lane_ptr[lane]
+                    while ptr < len(exp_list) and exp_list[ptr] < obs_chart - _RS_MATCH_WINDOW:
+                        ptr += 1
+                    _rs_lane_ptr[lane] = ptr
+                    if ptr >= len(exp_list):
+                        continue
+                    delta = obs_chart - exp_list[ptr]
+                    if abs(delta) <= _RS_MATCH_WINDOW:
+                        _rs_lane_ptr[lane] = ptr + 1
+                        _rs_samples.append(delta)
+                        logging.debug(
+                            "resync sample: lane=%d delta=%+.1fms n=%d",
+                            lane, delta, len(_rs_samples),
+                        )
+            # 定期评估漂移并注入补偿
+            if wall - _rs_last_eval >= 2.0:
+                _rs_last_eval = wall
+                _rs_evaluate()
+        _rs_last = cols
+
+    def _rs_evaluate():
+        nonlocal _rs_baseline
+        n = len(_rs_samples)
+        if n < 10:
+            return
+        if _rs_baseline is None:
+            _rs_baseline = statistics.median(_rs_samples[:10])
+            logging.debug("resync baseline: %+.1fms", _rs_baseline)
+            return
+        recent = statistics.median(_rs_samples[-8:])
+        drift = recent - _rs_baseline
+        if abs(drift) < _RS_DRIFT_TH:
+            return
+        # 样本离散度门控: 中位绝对偏差过大说明匹配不可靠,放弃本轮
+        mad = statistics.median([abs(s - recent) for s in _rs_samples[-8:]])
+        if mad > 40:
+            logging.debug("resync: mad=%.1f too noisy, skip", mad)
+            return
+        # 目标: 让(已注入+待注入)总量追上漂移量,差额驱动,避免过冲振荡
+        commanded = chart_mod.APPLIED_SHIFT_MS + chart_mod.PENDING_SHIFT_MS
+        adjust = drift - commanded
+        if abs(adjust) < 15:
+            return
+        adjust = max(-_RS_STEP_CAP, min(_RS_STEP_CAP, adjust))
+        if abs(commanded + adjust) > _RS_TOTAL_CAP:
+            logging.warning("resync: total cap reached (%+.0fms)", commanded)
+            return
+        chart_mod.PENDING_SHIFT_MS += adjust
+        logging.info(
+            "时基补偿: 检测到游戏时基漂移 %+.0fms,本次注入 %+.0fms,累计 %+.0fms",
+            drift, adjust, commanded + adjust,
+        )
+
+    # ===== 闭环时基校准结束 =====
+
     while True:
+        if _rs_enabled and _rs_anchor is None:
+            _rs_anchor = time.perf_counter()
         current_chart.command_builder.publish(mnt, block=False)
         wait_time = _get_wait_time()
         sleep_s = max(0, wait_time - 3) / 1000.0
@@ -593,12 +766,33 @@ def play_song(context=None):
             sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
             last_life_check = time.perf_counter()
 
-        time.sleep(sleep_s)
+        if _rs_enabled:
+            # 在本批 sleep 预算内做检测带观测。严格时序纪律:剩余 <30ms 就
+            # 不再抓帧(单帧采集 ~6-15ms),保证下一批命令准时发布,观测本身
+            # 绝不扰动时间轴。
+            deadline = time.perf_counter() + sleep_s
+            while True:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0.030:
+                    time.sleep(max(0.0, remaining))
+                    break
+                try:
+                    _rs_on_frame(current_player.ipc_capture_display())
+                except Exception as e:
+                    logging.debug("resync capture error: %s", e)
+                    break
+                time.sleep(0.004)
+        else:
+            time.sleep(sleep_s)
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:
+            # 不再打歌途中做 OFFSET 实时校准:中途修改偏移会扰动时间轴,
+            # 导致整段音符提前/滞后(日志实证 fast 极多、slow 恒 0 = 系统性按早)。
+            # 全程用 save_song 时确定的 OFFSET(初始全 0),时间轴完全由谱面 wait
+            # 命令推进,仅靠 photogate 在开局对齐首音。回调数据仍每批清空,避免
+            # 悬空指令/延迟回调污染下一批(即使不再消费它们)。
             with callback_data_lock:
-                _adjust_offset()
                 reset_callback_data()
             current_chart.actions_to_MNTcmd(
                 (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
@@ -1036,6 +1230,7 @@ def _log_environment():
         gate = PHOTOGATE_LATENCY
         life = (config or {}).get("on_life_exhausted", "auto")
         boost = (config or {}).get("play_at_zero_boost", True)
+        strategy = _song_strategy()
         wf = get_runtime_info(current_player.resolution)["wait_first"]
         logging.info("===== 环境诊断 =====")
         logging.info("版本: %s", version)
@@ -1049,8 +1244,8 @@ def _log_environment():
             res[0], res[1], orient, wf["from"], wf["to"],
         )
         logging.info(
-            "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
-            gate, life, boost, DIFFICULTY, LIVEMODE,
+            "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s, 打歌策略=%s",
+            gate, life, boost, DIFFICULTY, LIVEMODE, strategy,
         )
         logging.info("===== 环境诊断结束 =====")
     except Exception as e:
