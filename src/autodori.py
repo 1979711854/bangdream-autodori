@@ -622,6 +622,10 @@ def play_song(context=None):
         isinstance(_fb_timing, dict)
         and _fb_timing.get("judgement_feedback") is False
     )
+    _wcc_enabled = not (
+        isinstance(_fb_timing, dict)
+        and _fb_timing.get("wait_cost_compensate") is False
+    )
     _fb_detector = None
     _fb_controller = None
     _fb_anchor = None        # 首批命令发布的墙钟(perf_counter)
@@ -676,7 +680,10 @@ def play_song(context=None):
 
     # ===== 判定反馈闭环结束 =====
 
-    while True:
+    _wcc_total_n = 0      # 本首已结算 wait 数(统计用)
+    _wcc_total_ms = 0.0   # 本首 wait 超发累计(ms)
+    try:
+      while True:
         if _fb_enabled and _fb_anchor is None:
             _fb_anchor = time.perf_counter()
         current_chart.command_builder.publish(mnt, block=False)
@@ -712,18 +719,39 @@ def play_song(context=None):
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:
-            # 不再打歌途中做 OFFSET 实时校准:中途修改偏移会扰动时间轴,
-            # 导致整段音符提前/滞后(日志实证 fast 极多、slow 恒 0 = 系统性按早)。
-            # 全程用 save_song 时确定的 OFFSET(初始全 0),时间轴完全由谱面 wait
-            # 命令推进,仅靠 photogate 在开局对齐首音。回调数据仍每批清空,避免
-            # 悬空指令/延迟回调污染下一批(即使不再消费它们)。
+            # wait 超发闭环补偿(修正原作者的 EMA 方案):
+            # minitouch 服务端跑在模拟器里,负载下 wait 会超发(实际等待 > 请求),
+            # 时间轴越拖越晚(结算 slow 增长)。EvATive7 会回读每条指令的实测
+            # 耗时,这里每批把「实测-请求」的累计差值精确扣回后续 wait
+            # (PENDING_SHIFT 负向注入)。这是自校正积分闭环——测多少扣多少,
+            # 不做参数估计,结构上不会振荡;单批限幅 ±50ms 防异常尖峰。
+            # 与判定条反馈(C 层,管游戏时钟滞后=fast)正交:本机制只管执行层
+            # (指令流贴合谱面墙钟=slow)。可用 timing.wait_cost_compensate:
+            # false 关闭。
             with callback_data_lock:
+                _w = callback_data["wait"]
+                _over_n, _over_ms = _w["total"], _w["total_offset"]
                 reset_callback_data()
+            _wcc_total_n += _over_n
+            _wcc_total_ms += _over_ms
+            if _wcc_enabled and _over_n > 0 and abs(_over_ms) >= 3.0:
+                _adj = -max(-50.0, min(50.0, _over_ms))
+                chart_mod.PENDING_SHIFT_MS += _adj
+                logging.info(
+                    "wait超发补偿: 上批 %d 个 wait 超发 %+.1fms, 注入 %+.1fms",
+                    _over_n, _over_ms, _adj,
+                )
             current_chart.actions_to_MNTcmd(
                 (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
             )
         else:
             break
+    finally:
+        if _wcc_total_n:
+            logging.info(
+                "wait耗时统计: 本首 %d 个 wait, 超发合计 %+.1fms (均值 %+.2fms/个)",
+                _wcc_total_n, _wcc_total_ms, _wcc_total_ms / _wcc_total_n,
+            )
     time.sleep(2)
 
 
