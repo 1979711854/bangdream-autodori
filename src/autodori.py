@@ -4,7 +4,6 @@ import json
 import logging
 import random
 import re
-import statistics
 import string
 import subprocess
 import sys
@@ -48,6 +47,7 @@ import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
 import chart as chart_mod
+from timing_feedback import AdaptiveTimingController, TimingFeedbackDetector
 from util import *
 
 MIN_LIVEBOOST = 1
@@ -456,18 +456,19 @@ _LIFE_PIPELINE = {
 }
 
 
-def _life_exhausted_on_screen(context) -> bool:
+def _life_exhausted_on_screen(context, screen=None) -> bool:
     """检测当前画面是否出现「演出失败」弹窗(生命值耗尽)。
 
     先做廉价亮度预检:弹窗标题区是白底深字(实测平均亮度 ~224),普通打歌
     画面该区域几乎不会是大块白,先滤掉绝大部分帧,只有预检通过才跑 OCR,
     避免打歌中频繁 OCR 占用 CPU。检测耗时由调用方从 sleep 里补偿,不影响
-    打歌时机。
+    打歌时机。可传入已有帧,避免重复抓屏。
     """
     try:
-        screen = np.ascontiguousarray(
-            current_player.ipc_capture_display(), dtype=np.uint8
-        )
+        if screen is None:
+            screen = np.ascontiguousarray(
+                current_player.ipc_capture_display(), dtype=np.uint8
+            )
         x, y, w, h = _LIFE_ROI
         region = screen[y : y + h, x : x + w]
         if float(region.mean()) < 150:
@@ -569,22 +570,12 @@ def _reload_photogate():
         logging.debug("Failed to reload photogate: {}".format(e))
 
 
-def _band_avg_of(screen, from_row, to_row):
-    """检测带 (from_row~to_row) 的 RGB 行均值，与 wait_first_note 同口径。"""
-    row_count = to_row - from_row + 1
-    rows = np.empty((row_count, 3), dtype=np.float64)
-    for r in range(from_row, to_row + 1):
-        avg, _ = evaluate_row_color(screen, r)
-        rows[r - from_row] = avg
-    return rows.mean(axis=0)
-
-
 def play_song(context=None):
     logging.info("Start play")
     _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
-    # 每首新歌归零闭环时基补偿(见 chart.py / 下方 resync 观测器)
+    # 每首新歌归零局内时基补偿(见 chart.py / 下方判定反馈闭环)
     chart_mod.PENDING_SHIFT_MS = 0.0
     chart_mod.APPLIED_SHIFT_MS = 0.0
     wait_first = get_runtime_info(current_player.resolution)["wait_first"]
@@ -609,181 +600,115 @@ def play_song(context=None):
 
     wait_first_note()
 
-    # 打歌中生命耗尽检测:每 ≥LIFE_CHECK_INTERVAL 秒检查一次「演出失败」弹窗。
-    # 弹窗出现后游戏会一直等待,检测不用太密;检测耗时从本次 sleep 里扣除
-    # (仅在 sleep 预算充足时执行),保证下一批音符按谱面时间线准时发布,不会
-    # 因检测而整体提前/延后。命中即抛异常,由 Play 返回失败走 on_error。
+    # 打歌中观测(生命耗尽 + 判定反馈)统一低频节流: ≤OBS_INTERVAL 一次抓帧,
+    # 两种检测共用同一帧; 全部耗时从本次 sleep 里扣除, 且仅当 sleep 预算充足
+    # (≥0.15s)时才执行——预算不足(密集段落)直接跳过。打歌时间轴完全由
+    # minitouch 服务端 wait 推进, 高频抓屏会偶发阻塞发布循环、把音符越按越
+    # 晚(slow), 因此观测必须让位于发布时序。
     last_life_check = 0.0
     LIFE_CHECK_INTERVAL = 1.0  # 秒
+    last_obs = 0.0
+    OBS_INTERVAL = 0.25  # 秒
 
-    # ===== 打歌中闭环时基校准 (per-lane photogate resync) =====
-    # 背景: minitouch 服务端 wait 计时实测误差 <0.1%,脚本时间轴本身是精确的;
-    # 但游戏侧判定时钟在负载下会逐步滞后真实时间(结算 fast 恒正、slow 恒 0,
-    # 同一首歌时好时坏),固定时间轴无法应对。
-    # 原理: 每个音符头到达判定线前 PHOTOGATE_LATENCY ms 会穿过检测带
-    # (y=510-535)。打歌中按 7 条轨道分别观测过带时刻,与同轨道谱面期望时刻
-    # 对比得到时基偏移 delta;delta 相对开局基线的中位数漂移 >=35ms 时,向
-    # 后续 wait 注入反向补偿(chart.PENDING_SHIFT_MS),把剩余时间轴重新对齐。
-    # 只校正"漂移":常量偏差由基线吸收,仍归 photogate 校准负责。
-    # 可用 data/config.yml 的 timing.resync: false 关闭。
-    _rs_timing = _cfg_get("timing", {})
-    _rs_enabled = not (isinstance(_rs_timing, dict) and _rs_timing.get("resync") is False)
-    _rs_lane_expected = {}   # lane -> 该轨道音符头的谱面时刻列表(ms, 升序)
-    _rs_lane_x = []          # lane -> 检测带采样窗口中心 x
-    _rs_band_y = (0, 0)
-    _rs_anchor = None        # 首批命令发布的墙钟(perf_counter)
-    _rs_first_t = 0.0
-    _rs_last = None          # (7, 3) 上一帧各轨道检测带均值
-    _rs_refr_until = [0.0] * 7
-    _rs_samples = []         # 匹配成功的 delta(ms)样本
-    _rs_baseline = None
-    _rs_last_eval = 0.0
-    _rs_lane_ptr = {}        # lane -> 下一个待匹配期望点的下标(已消费音符不再匹配)
-    _rs_last_t = 0.0         # 谱面最后一个动作的谱面时刻(ms)
-    _RS_CHANGE_TH = 25.0     # 单轨道过带变化阈值(全带阈值 3.0 按宽度换算)
-    _RS_MATCH_WINDOW = 150.0
-    _RS_DRIFT_TH = 35.0      # 触发补偿的最小漂移
-    _RS_STEP_CAP = 80.0      # 单次补偿上限
-    _RS_TOTAL_CAP = 500.0    # 单首累计补偿上限(安全网)
-    if _rs_enabled:
-        _ri = get_runtime_info(current_player.resolution)
-        _lc = _ri["lane"]
-        _rs_lane_x = [_lc["start_x"] + (i + 0.5) * _lc["w"] for i in range(7)]
-        _rs_band_y = (_ri["wait_first"]["from"], _ri["wait_first"]["to"])
-        for _a in current_chart.actions:
-            if _a["type"] == "down":
-                _x = _a["pos"][0]
-                _lane = min(range(7), key=lambda i: abs(_rs_lane_x[i] - _x))
-                _rs_lane_expected.setdefault(_lane, []).append(_a["time"])
-        _rs_first_t = current_chart.actions[0]["time"] if current_chart.actions else 0.0
-        _rs_lane_ptr = {lane: 0 for lane in _rs_lane_expected}
-        logging.debug(
-            "resync: enabled, lanes=%d, heads=%d",
-            len(_rs_lane_expected),
-            sum(len(v) for v in _rs_lane_expected.values()),
+    # ===== 打歌中判定反馈闭环 (移植自 MaaBanGDream v1.2.0 timing_feedback) =====
+    # 游戏每次判定 (GREAT/GOOD/BAD) 会在判定文字正下方显示 FAST/SLOW 彩条。
+    # 直接读取游戏自己的判定反馈,以 ±1ms 小步长、2s 冷却、±12ms 硬上限调整
+    # 时基(经 chart.PENDING_SHIFT_MS 摊入后续 wait)。只修正常量/缓变偏差,
+    # 绝不追逐瞬时波动,结构上不可能振荡。弃用了此前的检测带 resync 方案
+    # (视觉推算过带时刻噪声大,末段失稳时会过冲)。
+    # 可用 data/config.yml 的 timing.judgement_feedback: false 关闭。
+    _fb_timing = _cfg_get("timing", {})
+    _fb_enabled = not (
+        isinstance(_fb_timing, dict)
+        and _fb_timing.get("judgement_feedback") is False
+    )
+    _fb_detector = None
+    _fb_controller = None
+    _fb_anchor = None        # 首批命令发布的墙钟(perf_counter)
+    _fb_first_t = 0.0
+    _fb_action_ptr = 0
+    _fb_last_down_t = None   # 最近一个 down 动作的谱面时刻(ms)
+    _fb_last_up_t = None     # 最近一个 up 动作的谱面时刻(ms)
+    _fb_last_offset = 0
+    if _fb_enabled:
+        _fb_detector = TimingFeedbackDetector()
+        _fb_controller = AdaptiveTimingController(0)
+        _fb_first_t = current_chart.actions[0]["time"] if current_chart.actions else 0.0
+        logging.debug("judgement feedback: enabled")
+
+    def _fb_on_frame(screen):
+        nonlocal _fb_action_ptr, _fb_last_down_t, _fb_last_up_t, _fb_last_offset
+        feedback = _fb_detector.detect(screen)
+        if _fb_anchor is None:
+            return
+        now = time.perf_counter()
+        pos_chart = (now - _fb_anchor) * 1000.0 + _fb_first_t
+        acts = current_chart.actions
+        while _fb_action_ptr < len(acts) and acts[_fb_action_ptr]["time"] <= pos_chart:
+            _t = acts[_fb_action_ptr]["type"]
+            if _t == "down":
+                _fb_last_down_t = acts[_fb_action_ptr]["time"]
+            elif _t == "up":
+                _fb_last_up_t = acts[_fb_action_ptr]["time"]
+            _fb_action_ptr += 1
+        # 与上游一致的门控: 松开(hold 尾等)150ms 内的判定条是假信号;
+        # 600ms 内没有任何按下动作时判定条不可归因,均不采纳。
+        if _fb_last_up_t is not None and pos_chart - _fb_last_up_t <= 150:
+            eligible, reason = False, "recent_hold_release"
+        elif _fb_last_down_t is None or pos_chart - _fb_last_down_t > 600:
+            eligible, reason = False, "no_recent_transient_input"
+        else:
+            eligible, reason = True, ""
+        adjusted = _fb_controller.update(
+            feedback, now, eligible=eligible, ignored_reason=reason
         )
+        if adjusted is not None and adjusted != _fb_last_offset:
+            # 上游约定正偏移=按更早; PENDING_SHIFT_MS 正=按晚,故取负
+            delta = -(adjusted - _fb_last_offset)
+            _fb_last_offset = adjusted
+            chart_mod.PENDING_SHIFT_MS += delta
+            logging.info(
+                "判定反馈校准: 时基偏移 %dms (FAST %d / SLOW %d)",
+                adjusted,
+                _fb_controller.fast_samples,
+                _fb_controller.slow_samples,
+            )
 
-    def _rs_on_frame(screen):
-        """对一帧画面做 7 轨道过带检测与样本匹配。"""
-        nonlocal _rs_last, _rs_baseline, _rs_last_eval
-        y0, y1 = _rs_band_y
-        cols = np.empty((7, 3), dtype=np.float64)
-        for i, cx in enumerate(_rs_lane_x):
-            x0 = int(round(cx)) - 20
-            cols[i] = screen[y0 : y1 + 1, x0 : x0 + 40].mean(axis=(0, 1))
-        wall = time.perf_counter()
-        if _rs_last is not None and _rs_anchor is not None:
-            changes = np.abs(cols - _rs_last).sum(axis=1)
-            fired = [i for i in range(7) if changes[i] >= _RS_CHANGE_TH and wall >= _rs_refr_until[i]]
-            if len(fired) < 4:  # >=4 轨道同帧触发=全屏特效(技能/fever),整帧丢弃
-                for lane in fired:
-                    _rs_refr_until[lane] = wall + 0.06
-                    # 实测过带墙钟 -> 换算成谱面时刻坐标
-                    obs_chart = (
-                        (wall - _rs_anchor) * 1000.0
-                        + _rs_first_t
-                        + PHOTOGATE_LATENCY
-                        - chart_mod.APPLIED_SHIFT_MS
-                    )
-                    exp_list = _rs_lane_expected.get(lane)
-                    if not exp_list:
-                        continue
-                    # 指针式消费匹配: 跳过已过期(漏检)的期望点,命中后消费该音符。
-                    # 同一音符过带会产生 ~100ms 的多次触发(前缘/主体/尾缘),
-                    # 消费语义保证一个音符只贡献一个样本,否则尾缘样本会虚增 delta。
-                    ptr = _rs_lane_ptr[lane]
-                    while ptr < len(exp_list) and exp_list[ptr] < obs_chart - _RS_MATCH_WINDOW:
-                        ptr += 1
-                    _rs_lane_ptr[lane] = ptr
-                    if ptr >= len(exp_list):
-                        continue
-                    delta = obs_chart - exp_list[ptr]
-                    if abs(delta) <= _RS_MATCH_WINDOW:
-                        _rs_lane_ptr[lane] = ptr + 1
-                        _rs_samples.append(delta)
-                        logging.debug(
-                            "resync sample: lane=%d delta=%+.1fms n=%d",
-                            lane, delta, len(_rs_samples),
-                        )
-            # 定期评估漂移并注入补偿
-            if wall - _rs_last_eval >= 2.0:
-                _rs_last_eval = wall
-                _rs_evaluate()
-        _rs_last = cols
-
-    def _rs_evaluate():
-        nonlocal _rs_baseline
-        n = len(_rs_samples)
-        if n < 10:
-            return
-        if _rs_baseline is None:
-            _rs_baseline = statistics.median(_rs_samples[:10])
-            logging.debug("resync baseline: %+.1fms", _rs_baseline)
-            return
-        recent = statistics.median(_rs_samples[-8:])
-        drift = recent - _rs_baseline
-        if abs(drift) < _RS_DRIFT_TH:
-            return
-        # 样本离散度门控: 中位绝对偏差过大说明匹配不可靠,放弃本轮
-        mad = statistics.median([abs(s - recent) for s in _rs_samples[-8:]])
-        if mad > 40:
-            logging.debug("resync: mad=%.1f too noisy, skip", mad)
-            return
-        # 目标: 让(已注入+待注入)总量追上漂移量,差额驱动,避免过冲振荡
-        commanded = chart_mod.APPLIED_SHIFT_MS + chart_mod.PENDING_SHIFT_MS
-        adjust = drift - commanded
-        if abs(adjust) < 15:
-            return
-        adjust = max(-_RS_STEP_CAP, min(_RS_STEP_CAP, adjust))
-        if abs(commanded + adjust) > _RS_TOTAL_CAP:
-            logging.warning("resync: total cap reached (%+.0fms)", commanded)
-            return
-        chart_mod.PENDING_SHIFT_MS += adjust
-        logging.info(
-            "时基补偿: 检测到游戏时基漂移 %+.0fms,本次注入 %+.0fms,累计 %+.0fms",
-            drift, adjust, commanded + adjust,
-        )
-
-    # ===== 闭环时基校准结束 =====
+    # ===== 判定反馈闭环结束 =====
 
     while True:
-        if _rs_enabled and _rs_anchor is None:
-            _rs_anchor = time.perf_counter()
+        if _fb_enabled and _fb_anchor is None:
+            _fb_anchor = time.perf_counter()
         current_chart.command_builder.publish(mnt, block=False)
         wait_time = _get_wait_time()
         sleep_s = max(0, wait_time - 3) / 1000.0
 
         now = time.perf_counter()
-        if (
-            context is not None
-            and now - last_life_check >= LIFE_CHECK_INTERVAL
-            and sleep_s >= 0.2
-        ):
-            check_t0 = time.perf_counter()
-            if _life_exhausted_on_screen(context):
-                logging.info("打歌中生命值耗尽,提前结束本次演出")
-                raise LifeExhaustedDetected()
-            sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
-            last_life_check = time.perf_counter()
+        want_life = (
+            context is not None and now - last_life_check >= LIFE_CHECK_INTERVAL
+        )
+        want_fb = _fb_enabled and now - last_obs >= OBS_INTERVAL
+        if (want_life or want_fb) and sleep_s >= 0.15:
+            obs_t0 = time.perf_counter()
+            try:
+                frame = np.ascontiguousarray(
+                    current_player.ipc_capture_display(), dtype=np.uint8
+                )
+            except Exception as e:
+                frame = None
+                logging.debug("observe capture error: %s", e)
+            if frame is not None:
+                if want_fb:
+                    _fb_on_frame(frame)
+                if want_life and _life_exhausted_on_screen(context, frame):
+                    logging.info("打歌中生命值耗尽,提前结束本次演出")
+                    raise LifeExhaustedDetected()
+            if want_life:
+                last_life_check = time.perf_counter()
+            last_obs = time.perf_counter()
+            sleep_s = max(0.0, sleep_s - (last_obs - obs_t0))
 
-        if _rs_enabled:
-            # 在本批 sleep 预算内做检测带观测。严格时序纪律:剩余 <30ms 就
-            # 不再抓帧(单帧采集 ~6-15ms),保证下一批命令准时发布,观测本身
-            # 绝不扰动时间轴。
-            deadline = time.perf_counter() + sleep_s
-            while True:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0.030:
-                    time.sleep(max(0.0, remaining))
-                    break
-                try:
-                    _rs_on_frame(current_player.ipc_capture_display())
-                except Exception as e:
-                    logging.debug("resync capture error: %s", e)
-                    break
-                time.sleep(0.004)
-        else:
-            time.sleep(sleep_s)
+        time.sleep(sleep_s)
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:

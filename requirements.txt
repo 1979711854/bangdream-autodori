@@ -6,6 +6,7 @@ mumuipc.py>=0.0.2
 ld-ipc.py
 maafw==4.4.0
 numpy
+opencv-python-headless
 pyyaml
 python-levenshtein
 playhouse
