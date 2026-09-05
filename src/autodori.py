@@ -608,7 +608,10 @@ def play_song(context=None):
     last_life_check = 0.0
     LIFE_CHECK_INTERVAL = 1.0  # 秒
     last_obs = 0.0
-    OBS_INTERVAL = 0.25  # 秒
+    # 判定条只持续 2-3 帧(~33-50ms),采样间隔必须远低于此才能捕获;
+    # 0.1s 是捕获率与开销的折中。预算门控(sleep_s>=0.15)保证密集段落
+    # 自动跳过,观测绝不拖延发布。
+    OBS_INTERVAL = 0.1  # 秒
 
     # ===== 打歌中判定反馈闭环 (移植自 MaaBanGDream v1.2.0 timing_feedback) =====
     # 游戏每次判定 (GREAT/GOOD/BAD) 会在判定文字正下方显示 FAST/SLOW 彩条。
