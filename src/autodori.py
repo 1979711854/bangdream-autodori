@@ -46,15 +46,11 @@ from minitouchpy import (
 import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
-import chart as chart_mod
-from timing_feedback import AdaptiveTimingController, TimingFeedbackDetector
 from util import *
 
 MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
 DIFFICULTY = "hard"
-# 触控偏移:固定初始全 0,打歌途中不再校准(见 play_song 说明)。
-# 时间轴完全由谱面 wait 命令推进,仅靠 photogate 在开局对齐首音。
 OFFSET = {"up": 0, "down": 0, "move": 0, "wait": 0.0, "interval": 0.0}
 PHOTOGATE_LATENCY = 30
 DEFAULT_MOVE_SLICE_SIZE = 10
@@ -107,40 +103,12 @@ def reset_callback_data():
 reset_callback_data()
 
 
-def reset_offset_and_callbacks():
-    """打歌中断（生命耗尽）后清空回调数据。
-
-    触控偏移 OFFSET 已改为「全程固定初始值、打歌途中不校准」策略(见 play_song),
-    因此这里不再复位 OFFSET(它恒为初始全 0)。只清空回调数据,丢弃悬空指令 /
-    延迟回调,避免这些脏数据影响后续批次。
-    """
-    reset_callback_data()
-    logging.debug("打歌中断: 回调数据已清空")
-
-
 # Song selection preference, in priority order:
 #   0 = never played at this difficulty
 #   1 = played but not full-combo
 #   2 = full-combo but not all-perfect
 #   3 = all-perfect (done, don't replay)
 _selection_rejections = 0
-
-
-def _cfg_get(key, default=None):
-    """读 data/config.yml 顶层配置项，文件为空/非 dict 时回退默认值。"""
-    if isinstance(config, dict):
-        return config.get(key, default)
-    return default
-
-
-def _song_strategy() -> str:
-    """选歌策略（由 GUI 写入 data/config.yml）。
-
-    mine   = 挖矿为主：优先没打过 / 没全连 / 没全完美，抽到已达标歌曲就重抽；
-    random = 随机选歌：无指定偏好，抽到什么打什么。
-    """
-    val = str(_cfg_get("song_strategy", "mine") or "mine").strip().lower()
-    return "random" if val in ("random", "随机选歌") else "mine"
 
 
 def _song_tier(chart_id: str, difficulty: str) -> int:
@@ -186,12 +154,8 @@ def _current_target_tier(difficulty: str) -> int:
 
 
 def check_song_available(name, id_, difficulty):
-    # [FULL] 为完整版曲目，脚本不支持，任何策略下都跳过
     if name.startswith("[FULL]"):
         return False
-    if _song_strategy() == "random":
-        # 随机选歌：无指定偏好，抽到什么打什么（含已全连/全完美的歌）
-        return True
     global _selection_rejections
     tier = _song_tier(id_, difficulty)
     if tier >= 3:
@@ -327,10 +291,6 @@ class HandleLifeExhausted(CustomAction):
             if isinstance(config, dict)
             else "auto"
         )
-        # 生命耗尽说明打歌中断：当前批次的触控回调数据不完整。清空回调数据,
-        # 丢弃悬空指令/延迟回调,避免脏数据影响后续批次(触控偏移 OFFSET 已固定
-        # 初始值、打歌途中不校准,无需复位)。
-        reset_offset_and_callbacks()
         if mode == "wait":
             logging.info("生命值耗尽,已退出到主页,等待手动操作")
             context.run_action("stop")
@@ -456,19 +416,18 @@ _LIFE_PIPELINE = {
 }
 
 
-def _life_exhausted_on_screen(context, screen=None) -> bool:
+def _life_exhausted_on_screen(context) -> bool:
     """检测当前画面是否出现「演出失败」弹窗(生命值耗尽)。
 
     先做廉价亮度预检:弹窗标题区是白底深字(实测平均亮度 ~224),普通打歌
     画面该区域几乎不会是大块白,先滤掉绝大部分帧,只有预检通过才跑 OCR,
     避免打歌中频繁 OCR 占用 CPU。检测耗时由调用方从 sleep 里补偿,不影响
-    打歌时机。可传入已有帧,避免重复抓屏。
+    打歌时机。
     """
     try:
-        if screen is None:
-            screen = np.ascontiguousarray(
-                current_player.ipc_capture_display(), dtype=np.uint8
-            )
+        screen = np.ascontiguousarray(
+            current_player.ipc_capture_display(), dtype=np.uint8
+        )
         x, y, w, h = _LIFE_ROI
         region = screen[y : y + h, x : x + w]
         if float(region.mean()) < 150:
@@ -489,9 +448,7 @@ class Play(CustomAction):
             play_song(context)
             return CustomAction.RunResult(True)
         except LifeExhaustedDetected:
-            # 打歌中生命耗尽:返回失败,playsong 的 on_error 接管(记录+退出)。
-            # 清空残缺回调数据(悬空指令/延迟回调),避免影响后续批次。
-            reset_offset_and_callbacks()
+            # 打歌中生命耗尽:返回失败,playsong 的 on_error 接管(记录+退出)
             return CustomAction.RunResult(False)
         except Exception as e:
             logging.error(f"Failed when play song: {e}", stack_info=True)
@@ -575,9 +532,6 @@ def play_song(context=None):
     _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
-    # 每首新歌归零局内时基补偿(见 chart.py / 下方判定反馈闭环)
-    chart_mod.PENDING_SHIFT_MS = 0.0
-    chart_mod.APPLIED_SHIFT_MS = 0.0
     wait_first = get_runtime_info(current_player.resolution)["wait_first"]
     logging.info(
         "打歌: %s (#%s-%s), 动作%s, photogate=%sms, 检测带y=%s-%s",
@@ -598,163 +552,59 @@ def play_song(context=None):
                 wait_for += action["length"]
         return wait_for
 
+    def _adjust_offset():
+        global callback_data
+        total_cost = 0.0
+        for type_ in ["up", "down", "move", "wait", "interval"]:
+            type_data = callback_data[type_]
+            total = type_data["total"]
+            if total != 0:
+                total_cost += type_data["total_offset"] - OFFSET[type_] * total
+                OFFSET[type_] = type_data["total_offset"] / total
+
+        current_chart._a2c_offset += total_cost
+        logging.debug("Adjust offset: {}".format(OFFSET))
+        logging.debug("Adjust _actions_to_cmd_offset: {}".format(total_cost))
+
     wait_first_note()
 
-    # 打歌中观测(生命耗尽 + 判定反馈)统一低频节流: ≤OBS_INTERVAL 一次抓帧,
-    # 两种检测共用同一帧; 全部耗时从本次 sleep 里扣除, 且仅当 sleep 预算充足
-    # (≥0.15s)时才执行——预算不足(密集段落)直接跳过。打歌时间轴完全由
-    # minitouch 服务端 wait 推进, 高频抓屏会偶发阻塞发布循环、把音符越按越
-    # 晚(slow), 因此观测必须让位于发布时序。
+    # 打歌中生命耗尽检测:每 ≥LIFE_CHECK_INTERVAL 秒检查一次「演出失败」弹窗。
+    # 弹窗出现后游戏会一直等待,检测不用太密;检测耗时从本次 sleep 里扣除
+    # (仅在 sleep 预算充足时执行),保证下一批音符按谱面时间线准时发布,不会
+    # 因检测而整体提前/延后。命中即抛异常,由 Play 返回失败走 on_error。
     last_life_check = 0.0
     LIFE_CHECK_INTERVAL = 1.0  # 秒
-    last_obs = 0.0
-    # 判定条只持续 2-3 帧(~33-50ms),采样间隔必须远低于此才能捕获;
-    # 0.1s 是捕获率与开销的折中。预算门控(sleep_s>=0.15)保证密集段落
-    # 自动跳过,观测绝不拖延发布。
-    OBS_INTERVAL = 0.1  # 秒
 
-    # ===== 打歌中判定反馈闭环 (移植自 MaaBanGDream v1.2.0 timing_feedback) =====
-    # 游戏每次判定 (GREAT/GOOD/BAD) 会在判定文字正下方显示 FAST/SLOW 彩条。
-    # 直接读取游戏自己的判定反馈,以 ±1ms 小步长、2s 冷却、±12ms 硬上限调整
-    # 时基(经 chart.PENDING_SHIFT_MS 摊入后续 wait)。只修正常量/缓变偏差,
-    # 绝不追逐瞬时波动,结构上不可能振荡。弃用了此前的检测带 resync 方案
-    # (视觉推算过带时刻噪声大,末段失稳时会过冲)。
-    # 可用 data/config.yml 的 timing.judgement_feedback: false 关闭。
-    _fb_timing = _cfg_get("timing", {})
-    _fb_enabled = not (
-        isinstance(_fb_timing, dict)
-        and _fb_timing.get("judgement_feedback") is False
-    )
-    _wcc_enabled = not (
-        isinstance(_fb_timing, dict)
-        and _fb_timing.get("wait_cost_compensate") is False
-    )
-    _fb_detector = None
-    _fb_controller = None
-    _fb_anchor = None        # 首批命令发布的墙钟(perf_counter)
-    _fb_first_t = 0.0
-    _fb_action_ptr = 0
-    _fb_last_down_t = None   # 最近一个 down 动作的谱面时刻(ms)
-    _fb_last_up_t = None     # 最近一个 up 动作的谱面时刻(ms)
-    _fb_last_offset = 0
-    if _fb_enabled:
-        _fb_detector = TimingFeedbackDetector()
-        _fb_controller = AdaptiveTimingController(0)
-        _fb_first_t = current_chart.actions[0]["time"] if current_chart.actions else 0.0
-        logging.debug("judgement feedback: enabled")
-
-    def _fb_on_frame(screen):
-        nonlocal _fb_action_ptr, _fb_last_down_t, _fb_last_up_t, _fb_last_offset
-        feedback = _fb_detector.detect(screen)
-        if _fb_anchor is None:
-            return
-        now = time.perf_counter()
-        pos_chart = (now - _fb_anchor) * 1000.0 + _fb_first_t
-        acts = current_chart.actions
-        while _fb_action_ptr < len(acts) and acts[_fb_action_ptr]["time"] <= pos_chart:
-            _t = acts[_fb_action_ptr]["type"]
-            if _t == "down":
-                _fb_last_down_t = acts[_fb_action_ptr]["time"]
-            elif _t == "up":
-                _fb_last_up_t = acts[_fb_action_ptr]["time"]
-            _fb_action_ptr += 1
-        # 与上游一致的门控: 松开(hold 尾等)150ms 内的判定条是假信号;
-        # 600ms 内没有任何按下动作时判定条不可归因,均不采纳。
-        if _fb_last_up_t is not None and pos_chart - _fb_last_up_t <= 150:
-            eligible, reason = False, "recent_hold_release"
-        elif _fb_last_down_t is None or pos_chart - _fb_last_down_t > 600:
-            eligible, reason = False, "no_recent_transient_input"
-        else:
-            eligible, reason = True, ""
-        adjusted = _fb_controller.update(
-            feedback, now, eligible=eligible, ignored_reason=reason
-        )
-        if adjusted is not None and adjusted != _fb_last_offset:
-            # 上游约定正偏移=按更早; PENDING_SHIFT_MS 正=按晚,故取负
-            delta = -(adjusted - _fb_last_offset)
-            _fb_last_offset = adjusted
-            chart_mod.PENDING_SHIFT_MS += delta
-            logging.info(
-                "判定反馈校准: 时基偏移 %dms (FAST %d / SLOW %d)",
-                adjusted,
-                _fb_controller.fast_samples,
-                _fb_controller.slow_samples,
-            )
-
-    # ===== 判定反馈闭环结束 =====
-
-    _wcc_total_n = 0      # 本首已结算 wait 数(统计用)
-    _wcc_total_ms = 0.0   # 本首 wait 超发累计(ms)
-    try:
-      while True:
-        if _fb_enabled and _fb_anchor is None:
-            _fb_anchor = time.perf_counter()
+    while True:
         current_chart.command_builder.publish(mnt, block=False)
         wait_time = _get_wait_time()
         sleep_s = max(0, wait_time - 3) / 1000.0
 
         now = time.perf_counter()
-        want_life = (
-            context is not None and now - last_life_check >= LIFE_CHECK_INTERVAL
-        )
-        want_fb = _fb_enabled and now - last_obs >= OBS_INTERVAL
-        if (want_life or want_fb) and sleep_s >= 0.15:
-            obs_t0 = time.perf_counter()
-            try:
-                frame = np.ascontiguousarray(
-                    current_player.ipc_capture_display(), dtype=np.uint8
-                )
-            except Exception as e:
-                frame = None
-                logging.debug("observe capture error: %s", e)
-            if frame is not None:
-                if want_fb:
-                    _fb_on_frame(frame)
-                if want_life and _life_exhausted_on_screen(context, frame):
-                    logging.info("打歌中生命值耗尽,提前结束本次演出")
-                    raise LifeExhaustedDetected()
-            if want_life:
-                last_life_check = time.perf_counter()
-            last_obs = time.perf_counter()
-            sleep_s = max(0.0, sleep_s - (last_obs - obs_t0))
+        if (
+            context is not None
+            and now - last_life_check >= LIFE_CHECK_INTERVAL
+            and sleep_s >= 0.2
+        ):
+            check_t0 = time.perf_counter()
+            if _life_exhausted_on_screen(context):
+                logging.info("打歌中生命值耗尽,提前结束本次演出")
+                raise LifeExhaustedDetected()
+            sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+            last_life_check = time.perf_counter()
 
         time.sleep(sleep_s)
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:
-            # wait 超发闭环补偿(修正原作者的 EMA 方案):
-            # minitouch 服务端跑在模拟器里,负载下 wait 会超发(实际等待 > 请求),
-            # 时间轴越拖越晚(结算 slow 增长)。EvATive7 会回读每条指令的实测
-            # 耗时,这里每批把「实测-请求」的累计差值精确扣回后续 wait
-            # (PENDING_SHIFT 负向注入)。这是自校正积分闭环——测多少扣多少,
-            # 不做参数估计,结构上不会振荡;单批限幅 ±50ms 防异常尖峰。
-            # 与判定条反馈(C 层,管游戏时钟滞后=fast)正交:本机制只管执行层
-            # (指令流贴合谱面墙钟=slow)。可用 timing.wait_cost_compensate:
-            # false 关闭。
             with callback_data_lock:
-                _w = callback_data["wait"]
-                _over_n, _over_ms = _w["total"], _w["total_offset"]
+                _adjust_offset()
                 reset_callback_data()
-            _wcc_total_n += _over_n
-            _wcc_total_ms += _over_ms
-            if _wcc_enabled and _over_n > 0 and abs(_over_ms) >= 3.0:
-                _adj = -max(-50.0, min(50.0, _over_ms))
-                chart_mod.PENDING_SHIFT_MS += _adj
-                logging.info(
-                    "wait超发补偿: 上批 %d 个 wait 超发 %+.1fms, 注入 %+.1fms",
-                    _over_n, _over_ms, _adj,
-                )
             current_chart.actions_to_MNTcmd(
                 (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
             )
         else:
             break
-    finally:
-        if _wcc_total_n:
-            logging.info(
-                "wait耗时统计: 本首 %d 个 wait, 超发合计 %+.1fms (均值 %+.2fms/个)",
-                _wcc_total_n, _wcc_total_ms, _wcc_total_ms / _wcc_total_n,
-            )
     time.sleep(2)
 
 
@@ -1186,7 +1036,6 @@ def _log_environment():
         gate = PHOTOGATE_LATENCY
         life = (config or {}).get("on_life_exhausted", "auto")
         boost = (config or {}).get("play_at_zero_boost", True)
-        strategy = _song_strategy()
         wf = get_runtime_info(current_player.resolution)["wait_first"]
         logging.info("===== 环境诊断 =====")
         logging.info("版本: %s", version)
@@ -1200,8 +1049,8 @@ def _log_environment():
             res[0], res[1], orient, wf["from"], wf["to"],
         )
         logging.info(
-            "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s, 打歌策略=%s",
-            gate, life, boost, DIFFICULTY, LIVEMODE, strategy,
+            "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
+            gate, life, boost, DIFFICULTY, LIVEMODE,
         )
         logging.info("===== 环境诊断结束 =====")
     except Exception as e:
