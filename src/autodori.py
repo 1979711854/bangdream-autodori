@@ -153,15 +153,32 @@ def _current_target_tier(difficulty: str) -> int:
     return 3
 
 
+def _song_strategy() -> str:
+    """从 data/config.yml 读打歌策略:mine(挖矿为主,默认)/random(随机,抽到就打)。
+
+    每次实时读文件,让 GUI 在运行中切换也能在下一首生效(与 photogate 一样)。
+    """
+    try:
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        val = str(cfg.get("song_strategy", "mine") or "mine").strip().lower()
+        return val if val in ("mine", "random") else "mine"
+    except Exception:
+        return "mine"
+
+
 def check_song_available(name, id_, difficulty):
-    if name.startswith("[FULL]"):
-        return False
+    if _song_strategy() == "random":
+        # 随机选歌:第一次抽到什么就打什么,不再重抽(含已 AP / [FULL] 的歌)
+        return True
     global _selection_rejections
     tier = _song_tier(id_, difficulty)
     if tier >= 3:
         return False  # already all-perfect
     target = _current_target_tier(difficulty)
-    if tier <= target:
+    # 挖矿为主:未打过(0)与打过未全连(1)都是可接受的——抽到就打,别一直重抽。
+    # 只有抽到已全连(2)而仍存更低 tier 歌时才重抽(但 30 次后放宽,避免死循环)。
+    accept_threshold = max(target, 1)
+    if tier <= accept_threshold:
         _selection_rejections = 0
         return True
     # Prefer a higher-priority tier that still has songs; reject this one so the

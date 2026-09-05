@@ -1219,16 +1219,18 @@ class FitLabel(tk.Frame):
         if not self.winfo_exists():
             return
         w = self.winfo_width()
-        if w <= 2:
-            # 宽度尚未完成布局(初始 width=1,或窗口/布局正被重算)。此时直接
-            # return 会让 set() 静默失败、歌名停留旧值(第二首歌名不切换的根因)。
-            # 延迟重试,直到布局就绪后按 _full 正确渲染。
+        full = self._full
+        if w > 2:
+            shown = self._truncate(full, w)
+        else:
+            # 宽度尚未完成布局(初始 width=1,或布局正被重算)。此时若直接 return
+            # 会让 set() 静默失败、文本停留旧值(歌名不切换)。先把文本更新上
+            # (即使暂时被裁),再延迟重试等布局就绪后按真实宽度截断。
+            shown = full
             try:
                 self.after(50, self._fit)
             except Exception:
                 pass
-            return
-        shown = self._truncate(self._full, w)
         if self._lbl.cget("text") != shown:
             self._lbl.configure(text=shown)
 

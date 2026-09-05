@@ -52,9 +52,9 @@ STRATEGY_HINT = {
     "随机选歌": "无指定偏好,抽到哪首就打哪首",
 }
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
-DEFAULT_WINDOW = "1120x720"
+DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -67,6 +67,9 @@ LOG_RE = re.compile(
     r"^(?:\d{4}-\d{2}-\d{2} )?(\d{2}:\d{2}:\d{2}),\d+\[(\w+)\](?:\[[^\]]*\])?\s?(.*)$"
 )
 SONG_RE = re.compile(r"Save song:\s*(.+)$")
+# v1.1.2 bot 在每首开打前还会打 INFO 行:「打歌: {歌名} (#{id}-{难度}), 动作N, ...」。
+# 作为歌名更新的第二条来源,避免依赖单一行偶发漏读。
+PLAY_RE = re.compile(r"打歌:\s*(.+?)\s*\(#\d+-\w+\)")
 
 # 左栏选项树:(分组名, ((key, 标签, 图标), ...))
 OPTION_TREE = (
@@ -170,7 +173,11 @@ NOTES = """【模拟器设置】
 
 
 # 常见问题(只读)
-FAQ = """Q:为什么无法正常打歌?
+FAQ = """Q:打歌总是 FAST(狂爆 FAST / 整体按早),怎么办?
+A:先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选——若勾选请取消
+(允许系统声音),这是 FAST 偏移最常见的原因,关闭后即完全正常;若还不行,再在「时基校准」里开自动校准 photogate。
+
+Q:为什么无法正常打歌?
 A:请查看注意事项和 README.md,检查游戏和模拟器设置是否正确。
 
 Q:为什么有些歌会爆很多 GREAT 和 MISS?
@@ -196,7 +203,11 @@ A:代码本身暂不支持直接指定某首歌,但可以手动把想打的歌�
 
 
 # 用前必读:photogate 校准说明(只读)
-PRE_READ = """【photogate 是什么】
+PRE_READ = """【先看这里 · 狂爆 FAST / 整体按早?】
+先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选,
+若勾选请取消(允许系统声音)。这是 FAST 偏移最常见的原因,关闭后即完全正常。
+
+【photogate 是什么】
 bot 以光闸确定打歌起点:第一个音符进入屏幕检测带时按下秒表,
 再等 photogate(毫秒)后开始整首歌。
 这个值代表音符从检测带到判定线的耗时,还和每台电脑的截屏/触控延迟有关,
@@ -221,6 +232,8 @@ bot 以光闸确定打歌起点:第一个音符进入屏幕检测带时按下秒
 提示:(SLOW偏多则减小,FAST偏多则增大)
 
 【注意】
+• 本脚本并不保证每次都能 AP(全完美),目标是尽量稳定 FC(全连);个别难歌或
+  电脑偶发波动出现 GREAT / 少量 MISS 属正常现象,不用反复纠结。
 • 自动校准值会在下一首歌开始前生效,无需重启;
 • 校准和每台机器绑定,换模拟器/电脑后建议重新校准;
 • 打歌期间别动电脑,性能波动也会造成 GREAT。
@@ -236,7 +249,7 @@ DOCS = {
 class AutodoriGUI:
     def __init__(self, root):
         self.root = root
-        root.title("autodori · BanG Dream · 邦邦自动挖矿助手")
+        root.title("BanG Dream · 邦邦自动挖矿助手")
         root.minsize(1080, 600)
 
         self.proc = None
@@ -366,11 +379,11 @@ class AutodoriGUI:
                             fill=th["accent_soft"], outline="")
         W.draw_icon(logo, "live", 7, 7, th["accent"])
 
-        tk.Label(bar, text="autodori", bg=th["surface"], fg=th["text"],
+        tk.Label(bar, text="BanG Dream", bg=th["surface"], fg=th["text"],
                  font=(T._FONT, self.font_size + 5, "bold")).pack(side="left")
-        tk.Label(bar, text="BanG Dream 自动挖矿助手", bg=th["surface"],
+        tk.Label(bar, text="· 邦邦自动挖矿助手", bg=th["surface"],
                  fg=th["text_2"], font=T.font(self.font_size)).pack(
-            side="left", padx=(10, 0))
+            side="left", padx=(8, 0))
 
         chip = tk.Frame(bar, bg=th["accent_soft"])
         chip.pack(side="left", padx=10)
@@ -524,6 +537,10 @@ class AutodoriGUI:
         self.m_time.pack(side="left", padx=(0, 48))
         self.m_songs = W.Metric(metrics, "已完成", "%d 首" % self.songs_done)
         self.m_songs.pack(side="left")
+
+        tk.Label(card.body, text="提示:若「开始演出」首次点击无反应,关闭窗口重新打开一次即可",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w", pady=(12, 0))
         return card
 
     @staticmethod
@@ -658,7 +675,9 @@ class AutodoriGUI:
             card.body,
             text="界面只显示关键事件（选歌 / 开演 / 结算 / 错误），完整调试信息在「导出日志」"
                  "与 debug 目录的 autodori-YYYYMMDD-HHMMSS.log 中，遇到问题请一并上传 "
-                 "autodori-*.log 和 maa.log。",
+                 "autodori-*.log 和 maa.log。\n"
+                 "提示:长期使用后 debug 目录会积累很多历史日志,请定期点「打开日志目录」"
+                 "清理没用的 autodori-*.log(全部删除不影响运行)。",
             bg=th["surface"], fg=th["text_3"], font=T.font(self.font_size - 1),
             justify="left", anchor="w",
         )
@@ -728,7 +747,7 @@ class AutodoriGUI:
         card = W.Card(master)
         W.SectionTitle(card.body, "关于").pack(fill="x", pady=(0, 10))
         for k, v in (
-            ("项目", "autodori · BanG Dream 自动挖矿助手"),
+            ("项目", "BanG Dream · 邦邦自动挖矿助手"),
             ("版本", "v" + self._version()),
             ("演出模式", "自由演出 (freelive)"),
             ("分辨率", "1280 × 720 · MuMu Player 12"),
@@ -1092,6 +1111,8 @@ class AutodoriGUI:
             return
 
         song = SONG_RE.search(msg)
+        if not song:
+            song = PLAY_RE.search(msg)  # 兜底:「打歌: {歌名}」INFO 行
         if song:
             self.current_song = song.group(1).strip()
             if getattr(self, "m_song", None):
@@ -1200,6 +1221,9 @@ class AutodoriGUI:
 def main():
     root = tk.Tk()
     AutodoriGUI(root)
+    # Windows 下新开的 Tk 窗口若不主动获得焦点,第一次点击只激活窗口、
+    # 不触发按钮(表现为"首次点开始演出没反应")。等窗口映射后提一前到前台并抢焦点。
+    root.after(150, lambda: (root.lift(), root.focus_force()))
     root.mainloop()
 
 
