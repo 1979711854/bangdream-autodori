@@ -891,8 +891,15 @@ class AutodoriGUI:
         item = (stamp, level, message)
         self._log_buf.append(item)
         console = getattr(self, "full_log", None)
+        # 切走「运行日志」页再切回时,full_log 可能指向已被重建销毁的旧控件;
+        # 若在销毁窗口里对它 .line() 会抛 TclError 并连带杀死 _poll_log 轮询。
+        # 这里只写入缓存,真正渲染交给 _replay/下一次 _detail_logs 重建。
         if console is not None:
-            console.line(*item)
+            try:
+                if console.winfo_exists():
+                    console.line(*item)
+            except Exception:
+                pass
 
     # ---------- photogate 自动校准 ----------
     def _on_life_exhausted(self):
@@ -1094,7 +1101,13 @@ class AutodoriGUI:
                 if line == "__EOF__":
                     self._on_finished()
                     continue
-                self._handle_line(line)
+                try:
+                    self._handle_line(line)
+                except Exception as e:
+                    # 单行处理出错绝不致命:任何控件异常都不能中断轮询,
+                    # 否则之后的歌名/日志都不再更新(打歌中途歌名卡死的根因)。
+                    self._log_buf.append(("", "WARN",
+                                          "处理日志行出错(已跳过): %r" % (e,)))
         except queue.Empty:
             pass
         self.root.after(120, self._poll_log)
@@ -1115,8 +1128,15 @@ class AutodoriGUI:
             song = PLAY_RE.search(msg)  # 兜底:「打歌: {歌名}」INFO 行
         if song:
             self.current_song = song.group(1).strip()
-            if getattr(self, "m_song", None):
-                self.m_song.set(self._fmt_song(self.current_song))
+            m = getattr(self, "m_song", None)
+            # 视图重建窗口里 m_song 可能已被销毁,set 会抛 TclError;
+            # 此时只更新状态,重建后的卡片会用 current_song 渲染。
+            if m is not None:
+                try:
+                    if m.winfo_exists():
+                        m.set(self._fmt_song(self.current_song))
+                except Exception:
+                    pass
 
         data = _parse_play_result(line)
         if data is not None:
@@ -1138,10 +1158,16 @@ class AutodoriGUI:
             self._emit(stamp, lvl, msg)
 
     def _tick(self):
-        if self.started_at is not None and getattr(self, "m_time", None):
-            secs = int(time.time() - self.started_at)
-            self.m_time.set("%02d:%02d:%02d" % (secs // 3600, secs // 60 % 60,
-                                                secs % 60))
+        if self.started_at is not None:
+            m = getattr(self, "m_time", None)
+            if m is not None:
+                try:
+                    if m.winfo_exists():
+                        secs = int(time.time() - self.started_at)
+                        m.set("%02d:%02d:%02d" % (secs // 3600, secs // 60 % 60,
+                                                  secs % 60))
+                except Exception:
+                    pass
         self.root.after(1000, self._tick)
 
     def _sync_run_state(self):
