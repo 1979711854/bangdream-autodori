@@ -926,8 +926,9 @@ class AutodoriGUI:
     def _on_play_result(self, data):
         """结算 OCR 到达:展示判定汇总;开启自动校准时按 FAST/SLOW 微调 photogate。"""
         self.songs_done += 1
-        if getattr(self, "m_songs", None):
-            self.m_songs.set("%d 首" % self.songs_done)
+        ms = getattr(self, "m_songs", None)
+        if ms is not None and ms.winfo_exists():
+            ms.set("%d 首" % self.songs_done)
         self._emit(
             "", "OK",
             "结算 · 分数 {} · COMBO {} · PERFECT {} · GREAT {}(FAST {}/SLOW {}) · GOOD {}/BAD {}/MISS {}".format(
@@ -962,8 +963,11 @@ class AutodoriGUI:
             cur, new_val, verb))
 
     def _set_cal(self, text):
-        if getattr(self, "cal_label", None):
-            self.cal_label.configure(text=text)
+        # 切走 live.gate 页后,cal_label 指向的旧控件已被销毁,仅判非空会命中死控件
+        # 而抛 TclError;必须再用 winfo_exists() 确认窗口仍存在。
+        lbl = getattr(self, "cal_label", None)
+        if lbl is not None and lbl.winfo_exists():
+            lbl.configure(text=text)
 
     def _apply_photogate(self, new_val):
         """写新 photogate 到 config(保留 life/boost 设置),并更新界面。
@@ -972,10 +976,12 @@ class AutodoriGUI:
         """
         old = self.gate
         self.gate = new_val
-        if getattr(self, "gate_step", None):
-            self.gate_step.set(new_val)
-        if getattr(self, "status_gate", None):
-            self.status_gate.configure(text="photogate %d ms" % self.gate)
+        step = getattr(self, "gate_step", None)
+        if step is not None and step.winfo_exists():
+            step.set(new_val)
+        sg = getattr(self, "status_gate", None)
+        if sg is not None and sg.winfo_exists():
+            sg.configure(text="photogate %d ms" % self.gate)
         try:
             cfg = {}
             try:
