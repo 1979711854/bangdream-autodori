@@ -21,14 +21,26 @@ import re
 import subprocess
 from pathlib import Path
 
-# Windows 电源计划 GUID(常见三种 + 卓越性能)
-POWER_PLANS = {
-    "381b4222-f694-41f0-9685-ff5bb260df2e": "平衡",
-    "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c": "高性能",
-    "a1841308-3541-4fab-bc81-f71556f20b4a": "节能",
-    "e9a42b02-d5df-448d-aa00-03f14749eb61": "卓越性能",
+# Windows 电源计划 GUID -> 性能档位(按 GUID 判定, 不依赖显示名, 跨语言/自定义改名均稳)
+# 档位: good=高性能类(无需警告); balanced=平衡(建议改); saver=省电/能效类(建议改);
+#       unknown=GUID 不在下表(中性提示, 建议人工确认)
+POWER_PLAN_TIER = {
+    "381b4222-f694-41f0-9685-ff5bb260df2e": "balanced",  # 平衡
+    "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c": "good",      # 高性能
+    "a1841308-3541-4fab-bc81-f71556f20b4a": "saver",      # 节能(部分系统改名: 最佳效能)
+    "e9a42b02-d5df-448d-aa00-03f14749eb61": "good",      # 卓越性能
 }
-_GOOD_PLANS = {"高性能", "卓越性能"}
+# 显示名兜底档位(仅当 GUID 不在上表时使用, 覆盖 OEM/自定义改名:
+# "最佳效能"="最佳能效"类省电计划, "最佳性能"=高性能类)
+_NAME_TIER_HINT = {
+    "最佳性能": "good",
+    "高性能": "good",
+    "卓越性能": "good",
+    "最佳能效": "saver",
+    "最佳效能": "saver",
+    "节能": "saver",
+    "平衡": "balanced",
+}
 
 
 def _mumu_config_path(emulator_path) -> Path | None:
@@ -77,14 +89,25 @@ def _memory_load_percent() -> int:
         return -1
 
 
-def active_power_plan() -> str:
-    """返回当前电源计划名称; 无法获取时返回空串。"""
+_GUID_RE = re.compile(
+    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+)
+_NAME_RE = re.compile(r"\(([^()]*)\)")  # powercfg 输出中计划名在括号内, 如 "(平衡)"
+
+
+def active_power_plan() -> tuple[str, str]:
+    """返回 (显示名, 档位)。
+
+    显示名直接取自 powercfg /getactivescheme 的真实输出(你的系统可能显示为
+    "最佳效能"/"平衡"/"最佳性能" 等), 档位按 GUID 判定, 不受改名影响。
+    无法获取时显示名为空串、档位为 ''。
+    """
     try:
         raw = subprocess.check_output(
             ["powercfg", "/getactivescheme"], timeout=5
         )
     except Exception:
-        return ""
+        return "", ""
     # 中文 Windows 下 powercfg 输出为 GBK, 不能直接按 utf-8 解码
     out = ""
     for enc in ("utf-8", "gbk"):
@@ -95,14 +118,16 @@ def active_power_plan() -> str:
             continue
     if not out:
         out = raw.decode("utf-8", "ignore")
-    match = re.search(
-        r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})",
-        out,
-    )
-    if match:
-        guid = match.group(1).lower()
-        return POWER_PLANS.get(guid, "自定义(%s)" % guid[:8])
-    return out.strip()
+    m = _GUID_RE.search(out)
+    if m:
+        guid = m.group(1).lower()
+        nm = _NAME_RE.search(out)
+        name = nm.group(1).strip() if nm else ""
+        tier = POWER_PLAN_TIER.get(guid)
+        if tier is None and name:
+            tier = _NAME_TIER_HINT.get(name, "unknown")
+        return (name or "自定义", tier or "unknown")
+    return out.strip(), ""
 
 
 def check(emulator_path=None) -> list[tuple[str, str]]:
@@ -127,9 +152,17 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
                     "该选项后重启模拟器。",
                 )
             )
-        fps_limit = renderer.get("fps_limit")
+        # 真实生效帧率优先取 fps_limit_real: 高帧率模式下它与 fps_limit 不同
+        # (如 fps_limit=45 实际渲染 90), 缺失时退回 fps_limit
+        fps_real = renderer.get("fps_limit_real")
+        fps_base = renderer.get("fps_limit")
         try:
-            fps = int(float(fps_limit)) if fps_limit is not None else 0
+            if fps_real not in (None, "", "0"):
+                fps = int(float(fps_real))
+            elif fps_base is not None:
+                fps = int(float(fps_base))
+            else:
+                fps = 0
         except (TypeError, ValueError):
             fps = 0
         if 0 < fps < 60:
@@ -141,18 +174,31 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
                 )
             )
 
-    # 2. Windows 电源计划
-    plan = active_power_plan()
-    if plan and plan not in _GOOD_PLANS and not plan.startswith("自定义"):
+    # 2. Windows 电源计划(按 GUID 判档位, 显示真实计划名)
+    plan_name, plan_tier = active_power_plan()
+    if plan_tier in ("balanced", "saver"):
         findings.append(
             (
                 "WARN",
-                f"Windows 电源计划为「{plan}」, CPU 频率动态调节会造成打歌中偶发"
-                "长停顿并批量 miss。建议改用「高性能」或「卓越性能」。",
+                f"Windows 电源计划为「{plan_name}」, CPU 频率动态调节会造成打歌中"
+                "偶发长停顿并批量 miss。建议改用「高性能」/「卓越性能」"
+                "(或系统设置里的「最佳性能」)。",
             )
         )
-    elif plan:
-        findings.append(("INFO", f"Windows 电源计划: {plan}"))
+    elif plan_tier == "good":
+        findings.append(
+            ("INFO", f"Windows 电源计划: {plan_name} (高性能类, 适合打歌)")
+        )
+    elif plan_tier == "unknown":
+        findings.append(
+            (
+                "WARN",
+                f"Windows 电源计划「{plan_name}」不在已知档位表中, 无法判定是否会影响"
+                "打歌稳定性, 建议确认其为「高性能」/「最佳性能」。",
+            )
+        )
+    elif plan_name:
+        findings.append(("INFO", f"Windows 电源计划: {plan_name}"))
 
     # 3. 内存压力
     load = _memory_load_percent()
