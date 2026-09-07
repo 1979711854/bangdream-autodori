@@ -1345,7 +1345,12 @@ class LogConsole(tk.Frame):
         ):
             self.text.tag_configure(tag, foreground=color)
         self.text.configure(state="disabled")
-        self.text.bind("<Key>", lambda _e: "break")
+        # 只读靠 state="disabled" 保证; 移除会吞掉 Ctrl+C 的 <Key> 拦截, 使日志可
+        # 用鼠标选中 + Ctrl+C 复制。另加右键菜单(复制/全选)便于发现。
+        self._copy_menu = tk.Menu(self.text, tearoff=0)
+        self._copy_menu.add_command(label="复制", command=self._copy_selection)
+        self._copy_menu.add_command(label="全选", command=self._select_all)
+        self.text.bind("<Button-3>", self._popup_copy_menu)
         self._autoscroll = True
         self.text.bind("<MouseWheel>", self._on_wheel)
 
@@ -1354,6 +1359,25 @@ class LogConsole(tk.Frame):
         top, bottom = self.text.yview()
         self._autoscroll = bottom >= 0.999
         return "break"
+
+    def _popup_copy_menu(self, e):
+        try:
+            self._copy_menu.tk_popup(e.x_root, e.y_root)
+        finally:
+            self._copy_menu.grab_release()
+
+    def _copy_selection(self):
+        try:
+            self.text.event_generate("<<Copy>>")
+        except Exception:
+            pass
+
+    def _select_all(self):
+        self.text.configure(state="normal")
+        try:
+            self.text.tag_add("sel", "1.0", "end-1c")
+        finally:
+            self.text.configure(state="disabled")
 
     def clear(self):
         self.text.configure(state="normal")

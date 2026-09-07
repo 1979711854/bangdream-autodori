@@ -181,8 +181,7 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
             (
                 "WARN",
                 f"Windows 电源计划为「{plan_name}」, CPU 频率动态调节会造成打歌中"
-                "偶发长停顿并批量 miss。建议改用「高性能」/「卓越性能」"
-                "(或系统设置里的「最佳性能」)。",
+                "偶发长停顿并批量 miss。",
             )
         )
     elif plan_tier == "good":
@@ -194,7 +193,7 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
             (
                 "WARN",
                 f"Windows 电源计划「{plan_name}」不在已知档位表中, 无法判定是否会影响"
-                "打歌稳定性, 建议确认其为「高性能」/「最佳性能」。",
+                "打歌稳定性。",
             )
         )
     elif plan_name:
