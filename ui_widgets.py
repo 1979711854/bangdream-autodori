@@ -1336,8 +1336,11 @@ class LogConsole(tk.Frame):
             inner, height=height, bd=0, highlightthickness=0, relief="flat",
             wrap="word", bg=th["log_bg"], fg=th["text"], font=("Consolas", fs),
             spacing1=1, spacing3=1, cursor="arrow", insertwidth=0,
+            yscrollcommand=self._on_scroll,
         )
         self.text.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        self._vsb = tk.Scrollbar(inner, orient="vertical", command=self.text.yview)
+        self._vsb.pack(side="right", fill="y")
         for tag, color in (
             ("ts", th["text_3"]), ("info", th["text"]), ("ok", th["ok"]),
             ("warn", th["warn"]), ("err", th["danger"]),
@@ -1354,10 +1357,15 @@ class LogConsole(tk.Frame):
         self._autoscroll = True
         self.text.bind("<MouseWheel>", self._on_wheel)
 
+    def _on_scroll(self, first, last):
+        """yscrollcommand 回调: 同步滚动条, 并以视图位置判定是否自动跟随底部。"""
+        self._vsb.set(first, last)
+        self._autoscroll = float(last) >= 0.999
+
     def _on_wheel(self, e):
+        # 滚轮滚动仅调整视图, 不编辑文本(state=disabled); 真实滚动条/程序滚动
+        # 也会触发 _on_scroll 以正确更新 _autoscroll, 因此这里不再重复判定。
         self.text.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        top, bottom = self.text.yview()
-        self._autoscroll = bottom >= 0.999
         return "break"
 
     def _popup_copy_menu(self, e):
