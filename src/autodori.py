@@ -46,6 +46,7 @@ from minitouchpy import (
 import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
+import envcheck
 from util import *
 
 MIN_LIVEBOOST = 1
@@ -592,10 +593,29 @@ def play_song(context=None):
     last_life_check = 0.0
     LIFE_CHECK_INTERVAL = 1.0  # 秒
 
+    # 自适应发布余量: 时间轴由服务端 wait 推进,python 必须在服务端把本批命令
+    # 执行完之前发布下一批。固定 3ms 余量在「平衡」电源计划下会被 CPU 频率
+    # 调节造成的偶发长停顿吃掉 → 服务端空转 → 之后所有音符按晚(偶发批量 miss)。
+    # 这里按实测的「构建+发布」耗时 EMA 自适应放大余量(3~60ms),快机不变、慢机自愈。
+    pub_margin_ms = 3.0
+    overrun_ema = 0.0
+    prev_sleep_end = None
+
     while True:
+        now = time.perf_counter()
+        if prev_sleep_end is not None:
+            build_ms = (now - prev_sleep_end) * 1000.0
+            overrun = build_ms - pub_margin_ms
+            overrun_ema = 0.7 * overrun_ema + 0.3 * max(0.0, overrun)
+            pub_margin_ms = min(60.0, max(3.0, 3.0 + 2.0 * overrun_ema))
+            if pub_margin_ms >= 25.0 and int(pub_margin_ms) % 25 == 0:
+                logging.debug(
+                    "发布余量已提升到 %.0fms(主机抖动 EMA %.1fms)",
+                    pub_margin_ms, overrun_ema,
+                )
         current_chart.command_builder.publish(mnt, block=False)
         wait_time = _get_wait_time()
-        sleep_s = max(0, wait_time - 3) / 1000.0
+        sleep_s = max(0, wait_time - pub_margin_ms) / 1000.0
 
         now = time.perf_counter()
         if (
@@ -611,6 +631,7 @@ def play_song(context=None):
             last_life_check = time.perf_counter()
 
         time.sleep(sleep_s)
+        prev_sleep_end = time.perf_counter()
 
         index = current_chart.actions_to_cmd_index
         if current_chart.actions[index : index + CMD_SLICE_SIZE]:
@@ -1035,6 +1056,24 @@ def check_update():
         logging.error("failed to check for updates: {}".format(e))
 
 
+def enable_high_precision_timer():
+    """把 Windows 时钟粒度从默认 ~15.6ms 提到 1ms。
+
+    默认粒度下 time.sleep 最多会超睡 ~15ms; 平衡电源计划下 CPU 频率调节会
+    进一步放大抖动。打歌主循环靠 sleep 控制发布节奏, 超睡会让下一批命令迟到、
+    服务端空转 → 音符按晚。提到 1ms 是最直接、开销最低的时序改善。
+    """
+    try:
+        import ctypes
+        import atexit
+
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        atexit.register(ctypes.windll.winmm.timeEndPeriod, 1)
+        logging.debug("clock resolution raised to 1ms")
+    except Exception as e:
+        logging.debug("failed to raise clock resolution: %s", e)
+
+
 def _log_environment():
     """启动后打印一次环境诊断信息(版本/模拟器/分辨率/配置),便于远程排查。
     纯日志,不影响流程。若解析器/分辨率不对,这里一眼可见。"""
@@ -1069,6 +1108,17 @@ def _log_environment():
             "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
             gate, life, boost, DIFFICULTY, LIVEMODE,
         )
+        # 环境自检: 音频禁用/电源计划/帧率/内存 等会直接造成漂移或掉判定的项
+        try:
+            findings = envcheck.check(emu_path)
+        except Exception as e:  # 自检绝不阻断主流程
+            findings = [("INFO", "环境自检异常: %s" % e)]
+        if not findings:
+            logging.info("环境自检: 未发现明显风险项")
+        for level, message in findings:
+            getattr(logging, {"ERROR": "error", "WARN": "warning"}.get(level, "info"))(
+                "环境自检[%s]: %s", level, message
+            )
         logging.info("===== 环境诊断结束 =====")
     except Exception as e:
         logging.debug("环境诊断失败: %s", e)
@@ -1076,6 +1126,7 @@ def _log_environment():
 
 def main():
     configure_log()
+    enable_high_precision_timer()
 
     parser = argparse.ArgumentParser(
         description="AutoDori script with different modes."
