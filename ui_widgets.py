@@ -1332,13 +1332,17 @@ class LogConsole(tk.Frame):
         inner = tk.Frame(self, bg=th["log_bg"])
         inner.pack(fill="both", expand=True)
         fs = base_size()
+        # spacing3 控制每行下方空白, pady 是 Text 控件内的"边距"——
+        # 两者都需要: 前者让多行之间有呼吸, 后者确保最后一行下方留出
+        # 明确视觉空隙, 不会被文本控件底边裁掉下伸字母或贴底。
         self.text = tk.Text(
             inner, height=height, bd=0, highlightthickness=0, relief="flat",
             wrap="word", bg=th["log_bg"], fg=th["text"], font=("Consolas", fs),
-            spacing1=1, spacing3=1, cursor="arrow", insertwidth=0,
+            spacing1=1, spacing3=4, padx=4, pady=8,
+            cursor="arrow", insertwidth=0,
             yscrollcommand=self._on_scroll,
         )
-        self.text.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        self.text.pack(side="left", fill="both", expand=True)
         self._vsb = tk.Scrollbar(inner, orient="vertical", command=self.text.yview)
         self._vsb.pack(side="right", fill="y")
         for tag, color in (
