@@ -54,7 +54,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.2"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -888,6 +888,10 @@ class AutodoriGUI:
             console.line(*item)
 
     def _emit(self, stamp, level, message):
+        # 统一兜底时间戳:调用方若没传(空串),用当前时刻补齐,保证日志栏
+        # 每行都有「HH:MM:SS」,不会再出现时间列空白。
+        if not stamp:
+            stamp = time.strftime("%H:%M:%S")
         item = (stamp, level, message)
         self._log_buf.append(item)
         console = getattr(self, "full_log", None)
@@ -1125,24 +1129,32 @@ class AutodoriGUI:
         if m:
             stamp, level, msg = m.group(1), m.group(2), m.group(3)
         else:
-            stamp, level, msg = "", "", line.strip()
+            # 无时间戳的非标准行(如 bot 子进程崩溃时的裸输出)用当前时刻兜底,
+            # 保证每条日志都带上「HH:MM:SS」,不再出现时间栏空白。
+            stamp, level, msg = time.strftime("%H:%M:%S"), "", line.strip()
         if not msg:
             return
 
+        # 选曲确认后立即更新「当前曲目」并打一条带时间戳的选歌日志。
+        # bot 侧 save_song() 已把日志提前到谱面解算之前并升为 INFO,因此歌名
+        # 会在选曲完成的一刻到达;两条正则互为兜底,任一行到达都算选曲完成。
         song = SONG_RE.search(msg)
         if not song:
             song = PLAY_RE.search(msg)  # 兜底:「打歌: {歌名}」INFO 行
         if song:
-            self.current_song = song.group(1).strip()
-            m = getattr(self, "m_song", None)
-            # 视图重建窗口里 m_song 可能已被销毁,set 会抛 TclError;
-            # 此时只更新状态,重建后的卡片会用 current_song 渲染。
-            if m is not None:
-                try:
-                    if m.winfo_exists():
-                        m.set(self._fmt_song(self.current_song))
-                except Exception:
-                    pass
+            name = song.group(1).strip()
+            if name and name != self.current_song:
+                self.current_song = name
+                m = getattr(self, "m_song", None)
+                # 视图重建窗口里 m_song 可能已被销毁,set 会抛 TclError;
+                # 此时只更新状态,重建后的卡片会用 current_song 渲染。
+                if m is not None:
+                    try:
+                        if m.winfo_exists():
+                            m.set(self._fmt_song(self.current_song))
+                    except Exception:
+                        pass
+                self._emit(stamp, "INFO", "选曲 · {}".format(name))
 
         data = _parse_play_result(line)
         if data is not None:
