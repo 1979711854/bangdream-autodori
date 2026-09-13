@@ -39,15 +39,12 @@ jobs:
           pip install pyinstaller
           python build.py --os ${{ runner.os }} --arch ${{ runner.arch }} --version ${{ github.ref_name }}
 
-      - name: Generate Changelog
-        run: |
-          python -m pip install evative7-changeloggen
-          changelog .
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          # 仓库内的 CHANGELOG.md 由维护者手写,直接作为 release 正文。
+          # 上游模板里的 evative7-changeloggen 步骤会覆写该文件,已移除。
           body_path: CHANGELOG.md
           files: |
             dist/*.zip
