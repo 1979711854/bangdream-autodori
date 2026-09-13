@@ -104,54 +104,78 @@ def reset_callback_data():
 reset_callback_data()
 
 
-# Song selection preference, in priority order:
-#   0 = never played at this difficulty
-#   1 = played but not full-combo
-#   2 = full-combo but not all-perfect
-#   3 = all-perfect (done, don't replay)
+# 选歌档位(以"历史最好成绩"判定,成就不会倒退):
+#   0 = 未通关(从未打过,或打过但都失败) —— 仍有首通奖励
+#   1 = 已通关但未 FULL COMBO            —— 仍有 FC 奖励
+#   2 = 已 FC 但未 ALL PERFECT            —— 仍有 AP 奖励
+#   3 = 已 ALL PERFECT                    —— 无新奖励,不再选
+# 「挖矿为主」= 优先 0/1/2 三种(都还有奖励可拿),仅排除 3(已 ALL PERFECT)。
+# 池内优先级 0 > 1 > 2,用有界重抽实现。
+MINED_MAX_TIER = 2
+# 软优先的重抽上限:调大 = 更执着地优先未打过,但抽歌耗时上升;
+# 可用 data/config.yml 的 song_strategy_reject_limit 覆盖。
+DEFAULT_REJECT_LIMIT = 10
+# 排除已 AP 时的重抽上限:远大于软优先,表示"确实没有可挖的了"才让步。
+AP_REROLL_STREAK_MAX = 30
 _selection_rejections = 0
+_ap_reroll_streak = 0
+# 档位表按难度缓存,避免每次识别都全表重算;保存新战绩后失效。
+_tier_map_cache: dict = {}
+
+
+def _tier_from_records(records) -> int:
+    """把一组打歌记录折算成"历史最好档位"。
+
+    关键:只认成功的、且 result 非空的记录。失败记录(result={})若参与计算,
+    miss/bad/good/great 会全部取默认 0,从而被误判成 ALL PERFECT —— 这正是
+    旧实现把仅失败过的歌永久排除的原因。
+    """
+    best = 0
+    for rec in records:
+        if not rec.succeed:
+            continue
+        r = rec.result if isinstance(rec.result, dict) else None
+        if not r:
+            continue
+        miss = int(r.get("miss", 0) or 0)
+        bad = int(r.get("bad", 0) or 0)
+        good = int(r.get("good", 0) or 0)
+        great = int(r.get("great", 0) or 0)
+        if miss == 0 and bad == 0 and good == 0:
+            t = 3 if great == 0 else 2
+        else:
+            t = 1
+        if t > best:
+            best = t
+    return best
+
+
+def _build_tier_map(difficulty: str) -> dict:
+    grouped: dict = {}
+    for rec in PlayRecord.select().where(PlayRecord.difficulty == difficulty):
+        grouped.setdefault(str(rec.chart_id), []).append(rec)
+    return {
+        str(sid): _tier_from_records(grouped.get(str(sid), []))
+        for sid in all_songs
+    }
+
+
+def _tier_map(difficulty: str) -> dict:
+    """该难度下全曲库的档位表。选曲判定与目标档位共用同一份,保证口径唯一 ——
+    旧实现两处各算各的(一处取首条、一处取末条),实测 93 组结果互相矛盾。"""
+    if difficulty not in _tier_map_cache:
+        _tier_map_cache[difficulty] = _build_tier_map(difficulty)
+    return _tier_map_cache[difficulty]
 
 
 def _song_tier(chart_id: str, difficulty: str) -> int:
-    rec = PlayRecord.get_or_none(chart_id=chart_id, difficulty=difficulty)
-    if rec is None or rec.result is None:
-        return 0
-    r = rec.result if isinstance(rec.result, dict) else {}
-    miss = int(r.get("miss", 0) or 0)
-    bad = int(r.get("bad", 0) or 0)
-    good = int(r.get("good", 0) or 0)
-    great = int(r.get("great", 0) or 0)
-    if miss == 0 and bad == 0 and good == 0:
-        if great == 0:
-            return 3
-        return 2
-    return 1
+    return _tier_map(difficulty).get(str(chart_id), 0)
 
 
 def _current_target_tier(difficulty: str) -> int:
-    """Highest-priority tier (0=unplayed) that still has songs; 3 if all done."""
-    recs = {}
-    for r in PlayRecord.select():
-        recs[(r.chart_id, r.difficulty)] = r
-    counts = {0: 0, 1: 0, 2: 0, 3: 0}
-    for sid in all_songs:
-        r = recs.get((str(sid), difficulty))
-        if r is None or r.result is None:
-            counts[0] += 1
-            continue
-        rr = r.result if isinstance(r.result, dict) else {}
-        miss = int(rr.get("miss", 0) or 0)
-        bad = int(rr.get("bad", 0) or 0)
-        good = int(rr.get("good", 0) or 0)
-        great = int(rr.get("great", 0) or 0)
-        if miss == 0 and bad == 0 and good == 0:
-            counts[2 if great else 3] += 1
-        else:
-            counts[1] += 1
-    for t in (0, 1, 2, 3):
-        if counts[t] > 0:
-            return t
-    return 3
+    """当前最该打的档位(0 最优)。全部 AP 时返回 3,表示已无可挖。"""
+    tiers = _tier_map(difficulty)
+    return min(tiers.values()) if tiers else 0
 
 
 def _song_strategy() -> str:
@@ -167,29 +191,54 @@ def _song_strategy() -> str:
         return "mine"
 
 
+def _reject_limit() -> int:
+    """连续重抽上限,可用 data/config.yml 的 song_strategy_reject_limit 覆盖。
+    调大 = 更严格地优先未打过的歌,但抽歌耗时上升。"""
+    try:
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        v = cfg.get("song_strategy_reject_limit")
+        if v is not None:
+            return max(1, int(v))
+    except Exception:
+        pass
+    return DEFAULT_REJECT_LIMIT
+
+
 def check_song_available(name, id_, difficulty):
     if _song_strategy() == "random":
         # 随机选歌:第一次抽到什么就打什么,不再重抽(含已 AP / [FULL] 的歌)
         return True
-    global _selection_rejections
+    global _selection_rejections, _ap_reroll_streak
     tier = _song_tier(id_, difficulty)
-    if tier >= 3:
-        return False  # already all-perfect
     target = _current_target_tier(difficulty)
-    # 挖矿为主:未打过(0)与打过未全连(1)都是可接受的——抽到就打,别一直重抽。
-    # 只有抽到已全连(2)而仍存更低 tier 歌时才重抽(但 30 次后放宽,避免死循环)。
-    accept_threshold = max(target, 1)
-    if tier <= accept_threshold:
-        _selection_rejections = 0
+
+    # 全曲库都已 AP:已无可挖,无条件接受,否则会永远抽不到可打的歌
+    if target > MINED_MAX_TIER:
+        _selection_rejections = _ap_reroll_streak = 0
         return True
-    # Prefer a higher-priority tier that still has songs; reject this one so the
-    # flow re-rolls random selection, but relax after enough rejections so we
-    # never loop forever (e.g. when the visible song list has no preferred songs).
-    _selection_rejections += 1
-    if _selection_rejections >= 30:
-        _selection_rejections = 0
-        return True
-    return False
+
+    # 硬规则:已 ALL PERFECT 无新奖励可取,重抽。判定基数是 Bestdori 全曲库,
+    # 不等于账号实际可选曲目,故留 AP_REROLL_STREAK_MAX 次兜底:连续这么多
+    # 次都只抽到已 AP 的歌,就认为确实没得挖了,让步接受。
+    if tier > MINED_MAX_TIER:
+        _ap_reroll_streak += 1
+        if _ap_reroll_streak >= AP_REROLL_STREAK_MAX:
+            _ap_reroll_streak = 0
+            _selection_rejections = 0
+            return True
+        return False
+
+    # 软优先:0/1/2 都有效,但优先更低档(0>1>2)。重抽有上限,超限即放宽,
+    # 避免账号真实可选池里没有更低档歌时无限重抽。
+    _ap_reroll_streak = 0
+    if tier > target:
+        _selection_rejections += 1
+        if _selection_rejections >= _reject_limit():
+            _selection_rejections = 0
+            return True
+        return False
+    _selection_rejections = 0
+    return True
 
 
 @maaresource.custom_recognition("SongRecognition")
@@ -293,9 +342,17 @@ class HandleLiveBoost(CustomAction):
             if play_at_zero:
                 logging.debug("Live boost is 0, continue playing")
             else:
-                logging.debug("Live boost not enough, ready to exit")
-                context.run_action("close_app")
-                context.run_action("stop")
+                # 火罐不足且配置为「退出游戏」。
+                # 注意:在自定义动作里直接 run_action("stop") 不可靠 —— 动作返回
+                # True 后节点仍会执行 next 继续打歌,stop 不会被触发。因此这里
+                # 返回 False 让节点失败,由 ensure_liveboost 的 on_error("stop")
+                # 真正终止任务。
+                logging.info("Live boost not enough, ready to exit")
+                try:
+                    context.run_action("close_app")
+                except Exception as e:
+                    logging.warning("close_app failed: %s", e)
+                return CustomAction.RunResult(False)
         return CustomAction.RunResult(True)
 
 
@@ -399,13 +456,18 @@ class SavePlayResult(CustomAction):
                     chart_id=current_song_id,
                     difficulty=DIFFICULTY,
                 )
+                # 战绩变了,档位表缓存失效,下一首选歌时重算(否则提升不被承认)
+                _tier_map_cache.pop(DIFFICULTY, None)
             else:
                 # 启动时游戏已在演出失败界面,没有选中过歌曲,跳过保存记录
                 logging.debug("No song selected, skip saving play result")
             if play_failed_times >= MAX_FAILED_TIMES:
-                logging.error("Failed attempts exceed max failed times")
-                context.run_action("close_app")
-                context.run_action("stop")
+                logging.error("Failed attempts exceed max failed times, stop")
+                try:
+                    context.run_action("close_app")
+                except Exception as e:
+                    logging.warning("close_app failed: %s", e)
+                return CustomAction.RunResult(False)
             return CustomAction.RunResult(True)
         except Exception as e:
             logging.error(f"Failed to save play result: {e}")
@@ -519,13 +581,17 @@ def save_song(name):
     global current_song_name, current_song_id, current_chart, current_orientation
     current_song_name = name
     current_song_id = all_song_name_indexes[current_song_name]
+    # 歌名一确定就立刻打日志:下面 Chart()/notes_to_actions()/actions_to_MNTcmd()
+    # 是重活(要拉取谱面、把上万个 note 解算成触控指令,实测耗时 5~15s),
+    # 若把日志放在它们之后,GUI 要到"打歌即将开始"才收到歌名 —— 这正是
+    # "选好歌后日志不显示歌名、打完才补上"的根因。用 INFO 级确保不被过滤。
+    logging.info("Save song: {}".format(name))
     current_chart = Chart((current_song_id, DIFFICULTY), current_song_name)
     current_chart.notes_to_actions(current_player.resolution, DEFAULT_MOVE_SLICE_SIZE)
     current_orientation = _get_orientation()
     current_chart.actions_to_MNTcmd(
         (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
     )
-    logging.debug("Save song: {}".format(name))
 
 
 def _reload_photogate():

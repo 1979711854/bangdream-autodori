@@ -104,7 +104,8 @@
   "action": "Custom",
   "custom_action": "HandleLiveBoost",
   "next": "ensure_live_mode",
-  "interrupt": "exit_rehearsal_mode"
+  "interrupt": "exit_rehearsal_mode",
+  "on_error": "stop"
  },
  "switch_liveplay_mode": {
   "action": "Click",
@@ -276,7 +277,8 @@
   "custom_action_param": {
    "succeed": false
   },
-  "next": "life_exhausted_exit"
+  "next": "life_exhausted_exit",
+  "on_error": "stop"
  },
  "life_exhausted_exit": {
   "recognition": "OCR",
