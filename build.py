@@ -153,25 +153,34 @@ shutil.copytree(
         ["misc", "MaaCommonAssets"] if os.path.basename(dirname) else []
     ),
 )
-# 删除OCR模型
-ocr_model_path = os.path.join(assets_dest_path, "resource", "model", "ocr")
-if os.path.exists(ocr_model_path):
-    shutil.rmtree(ocr_model_path)
 # 复制OCR模型
-shutil.copytree(
-    os.path.join(current_dir, "assets", "MaaCommonAssets", "OCR", "ppocr_v4", "zh_cn"),
-    ocr_model_path,
-    ignore=lambda *_: ["README.md"],
-    dirs_exist_ok=True,
-)
-shutil.copytree(
-    os.path.join(current_dir, "assets", "MaaCommonAssets", "OCR", "ppocr_v3", "ja_jp"),
-    os.path.join(ocr_model_path, "ppocr_v3", "ja_jp"),
-    ignore=lambda dirname, _: (
-        ["misc", "MaaCommonAssets"] if os.path.basename(dirname) else []
-    ),
-    dirs_exist_ok=True,
-)
+ocr_model_path = os.path.join(assets_dest_path, "resource", "model", "ocr")
+ocr_src_v4 = os.path.join(current_dir, "assets", "MaaCommonAssets", "OCR", "ppocr_v4", "zh_cn")
+if os.path.isdir(ocr_src_v4) and os.listdir(ocr_src_v4):
+    # 子模块已递归检出：使用其中的 OCR 模型（原作者意图）
+    if os.path.exists(ocr_model_path):
+        shutil.rmtree(ocr_model_path)
+    shutil.copytree(
+        ocr_src_v4,
+        ocr_model_path,
+        ignore=lambda *_: ["README.md"],
+        dirs_exist_ok=True,
+    )
+    shutil.copytree(
+        os.path.join(current_dir, "assets", "MaaCommonAssets", "OCR", "ppocr_v3", "ja_jp"),
+        os.path.join(ocr_model_path, "ppocr_v3", "ja_jp"),
+        dirs_exist_ok=True,
+    )
+    print("OCR model copied from MaaCommonAssets submodule.")
+else:
+    # 子模块未检出（如 CI 未递归拉取）：保留 assets/resource/model/ocr 中已提交的模型。
+    # 该目录的模型与子模块内容一致，且已随仓库提交，因此无需网络/子模块即可构建。
+    if not os.path.exists(ocr_model_path):
+        raise FileNotFoundError(
+            "OCR model not found: neither the MaaCommonAssets submodule nor the "
+            "committed assets/resource/model/ocr directory is present."
+        )
+    print("MaaCommonAssets OCR submodule not found; using committed OCR model under assets/resource/model/ocr")
 temp_dir = download_and_extract_minitouch()
 move_minitouch_to_assets(temp_dir)
 json.dump(

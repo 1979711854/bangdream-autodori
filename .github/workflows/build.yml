@@ -9,6 +9,9 @@ on:
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    # softprops/action-gh-release 需要写权限;仓库默认为 read,不声明会 403
+    permissions:
+      contents: write
     strategy:
       matrix:
         os: [windows-2022]
@@ -17,7 +20,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v2
         with:
-          submodules: true
+          submodules: false
           fetch-depth: 0
 
       - name: Set up Python
@@ -47,4 +50,4 @@ jobs:
         with:
           body_path: CHANGELOG.md
           files: |
-            dist/**
+            dist/*.zip

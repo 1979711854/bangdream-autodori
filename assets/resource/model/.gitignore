@@ -1,1 +1,3 @@
-ocr
+# OCR models (det.onnx / rec.onnx / keys.txt / ppocr_v3) are committed to the
+# repo so the CI build does not depend on the MaaCommonAssets submodule being
+# recursively checked out. Keep them tracked.
