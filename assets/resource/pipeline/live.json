@@ -155,6 +155,10 @@
   "action": "Custom",
   "custom_action": "Play",
   "next": "wait_playresult",
+  "on_error": [
+   "save_failed_playresult",
+   "life_exhausted_exit"
+  ],
   "interrupt": [
    "live_failed",
    "next_button",
@@ -181,7 +185,8 @@
    "next_button",
    "close_button",
    "ok_button",
-   "confirm_button"
+   "confirm_button",
+   "live_failed"
   ],
   "post_delay": 1000
  },
@@ -192,7 +197,10 @@
    "live/activity_scored.png"
   ],
   "pre_wait_freezes": 1000,
-  "next": "save_succeed_playresult"
+  "next": "save_succeed_playresult",
+  "interrupt": [
+   "live_failed"
+  ]
  },
  "save_succeed_playresult": {
   "recognition": "Custom",
@@ -313,6 +321,7 @@
  "handle_life_exhausted": {
   "action": "Custom",
   "custom_action": "HandleLifeExhausted",
-  "next": "main"
+  "next": "main",
+  "on_error": "stop"
  }
 }

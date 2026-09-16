@@ -78,6 +78,17 @@ all_song_name_indexes: dict[str, str] = {
     list(filter(lambda title: title is not None, sinfo["musicTitle"]))[0]: sid
     for sid, sinfo in all_songs.items()
 }
+# 再补一层简体中文标题(下标 3)。游戏客户端是简中,部分变体条目**只有中文标题带标注** ——
+# 例如 #484 中文名是「キズナミュージック♪（支持3D演出模式）」而日文名是
+# 「…（3Dライブモード対応）」,#763「熱色スターマイン(平行歌曲)」等平行曲同理。
+# 只收日文时这些条目会退化到同名的基础曲(2026-09-16 实测:按错误谱面打歌)。
+# 用 setdefault:只为上面那份索引**补空缺**,不覆盖已有键 —— Bestdori 的中文数据本身
+# 有冲突(#597 的中文名与 #486 完全同名),覆盖会改变原本正确的判定。
+for _sid, _sinfo in all_songs.items():
+    _titles = _sinfo.get("musicTitle") or []
+    _zh_title = _titles[3] if len(_titles) > 3 else None
+    if _zh_title:
+        all_song_name_indexes.setdefault(_zh_title, _sid)
 current_song_name: str = None
 current_song_id: str = None
 current_chart: Chart = None
@@ -178,25 +189,34 @@ def _current_target_tier(difficulty: str) -> int:
     return min(tiers.values()) if tiers else 0
 
 
+def _runtime_config() -> dict:
+    """实时重读 data/config.yml。
+
+    模块级 config 只在 import 时读一次,用户运行中在 GUI 改的开关不会生效。
+    凡是「改了就该在下一首/下一次判定生效」的设置,一律走这里,与
+    photogate / song_strategy 的口径保持一致。读不到就当空配置。
+    """
+    try:
+        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        return cfg if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+
 def _song_strategy() -> str:
     """从 data/config.yml 读打歌策略:mine(挖矿为主,默认)/random(随机,抽到就打)。
 
     每次实时读文件,让 GUI 在运行中切换也能在下一首生效(与 photogate 一样)。
     """
-    try:
-        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        val = str(cfg.get("song_strategy", "mine") or "mine").strip().lower()
-        return val if val in ("mine", "random") else "mine"
-    except Exception:
-        return "mine"
+    val = str(_runtime_config().get("song_strategy", "mine") or "mine").strip().lower()
+    return val if val in ("mine", "random") else "mine"
 
 
 def _reject_limit() -> int:
     """连续重抽上限,可用 data/config.yml 的 song_strategy_reject_limit 覆盖。
     调大 = 更严格地优先未打过的歌,但抽歌耗时上升。"""
     try:
-        cfg = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        v = cfg.get("song_strategy_reject_limit")
+        v = _runtime_config().get("song_strategy_reject_limit")
         if v is not None:
             return max(1, int(v))
     except Exception:
@@ -334,11 +354,7 @@ class HandleLiveBoost(CustomAction):
         if liveboost < MIN_LIVEBOOST:
             # GUI 配置 data/config.yml 的 play_at_zero_boost:
             #   True = 火罐为0也继续打歌; False = 火罐为0退出游戏
-            play_at_zero = (
-                config.get("play_at_zero_boost", True)
-                if isinstance(config, dict)
-                else True
-            )
+            play_at_zero = _runtime_config().get("play_at_zero_boost", True)
             if play_at_zero:
                 logging.debug("Live boost is 0, continue playing")
             else:
@@ -361,16 +377,15 @@ class HandleLifeExhausted(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         # GUI 配置 data/config.yml 的 on_life_exhausted:
         #   auto = 回到主页后自动继续打歌; wait = 停在主页等用户手动操作
-        mode = (
-            config.get("on_life_exhausted", "auto")
-            if isinstance(config, dict)
-            else "auto"
-        )
+        mode = str(_runtime_config().get("on_life_exhausted", "auto") or "auto")
         if mode == "wait":
+            # 同 HandleLiveBoost:自定义动作里 run_action("stop") 不可靠 ——
+            # 动作返回 True 后节点仍会沿 next(这里是 main)继续打歌,stop 不会被
+            # 触发。这里返回 False 让节点失败,由 handle_life_exhausted 的
+            # on_error("stop") 真正终止任务。
             logging.info("生命值耗尽,已退出到主页,等待手动操作")
-            context.run_action("stop")
-        else:
-            logging.info("生命值耗尽,自动继续打歌")
+            return CustomAction.RunResult(False)
+        logging.info("生命值耗尽,自动继续打歌")
         return CustomAction.RunResult(True)
 
 
@@ -496,8 +511,13 @@ _LIFE_PIPELINE = {
 }
 
 
-def _life_exhausted_on_screen(context) -> bool:
+def _life_exhausted_on_screen(context) -> str:
     """检测当前画面是否出现「演出失败」弹窗(生命值耗尽)。
+
+    返回 "hit" / "no_match" / "precheck_rejected" / "error" 而不是布尔值。
+    「卡在演出失败弹窗、脚本没反应」有好几种成因(检测没机会跑、亮度预检把
+    白底弹窗漏掉、OCR 异常),布尔值事后分不清是哪一种;调用方按状态记计数器,
+    下次复现时日志能直接指向原因。
 
     先做廉价亮度预检:弹窗标题区是白底深字(实测平均亮度 ~224),普通打歌
     画面该区域几乎不会是大块白,先滤掉绝大部分帧,只有预检通过才跑 OCR,
@@ -511,14 +531,14 @@ def _life_exhausted_on_screen(context) -> bool:
         x, y, w, h = _LIFE_ROI
         region = screen[y : y + h, x : x + w]
         if float(region.mean()) < 150:
-            return False
+            return "precheck_rejected"
         reco = context.run_recognition("life_check", screen, _LIFE_PIPELINE)
         text = (reco.best_result.text if reco and reco.best_result else "") or ""
         logging.debug("life check ocr: {}".format(text))
-        return bool(text)
+        return "hit" if text else "no_match"
     except Exception as e:
         logging.debug("life check error: {}".format(e))
-        return False
+        return "error"
 
 
 @maaresource.custom_action("Play")
@@ -543,8 +563,42 @@ class SaveSong(CustomAction):
         return CustomAction.RunResult(True)
 
 
+# 曲库里同一首歌可能有多个条目,靠标题前缀区分,而它们是**完全不同的谱面**:
+#   `[FULL] キズナミュージック♪`(#249, expert 1485 音符) 与
+#   `キズナミュージック♪`(#158, expert 436 音符)。
+# OCR 常把方括号读错(`[FULL]` → `「FULLI`,2026-09-16 实跑),而 fuzzywuzzy 的
+# WRatio 对"短标题被长查询包含"最高只给 90 分(源码:长度差 >1.5 倍时 partial 结果
+# ×0.9),于是基础曲反而以 90 分压过正确条目的 87 分 → 选到错误谱面,长版只打了
+# 前 101s 的短版谱面就停手,后半首全 miss。因此必须先按前缀标记分池再比相似度。
+_TITLE_BRACKETS = "[【「『（(［"
+_TITLE_BRACKET_TRANS = str.maketrans(
+    _TITLE_BRACKETS, "[" * len(_TITLE_BRACKETS)
+)
+# 池内最高分低于此值 → 认为"分池分错了",回退到全库再比一遍
+_POOL_SCORE_FLOOR = 60
+
+
+def _has_title_prefix(title: str) -> bool:
+    """标题是否带前缀标记(`[FULL]` / `[超高難易度 SPECIAL]` / `[原曲]` …)。
+
+    只判断"开头是不是方括号类字符",不要求配对:OCR 的闭合括号经常读错(`]`→`I`)。
+    """
+    return bool(title) and title.lstrip().translate(_TITLE_BRACKET_TRANS).startswith("[")
+
+
 def fuzzy_match_song(name):
-    return fzwzprocess.extractOne(name, list(all_song_name_indexes.keys()))
+    """OCR 歌名 → 曲库条目。
+
+    先按"标题是否带前缀标记"分池,再在同类池里比相似度。前缀标记决定的是不同的
+    谱面,跨池比较会让短的基础曲名靠"子串包含"胜出(见上面常量处的实测数据)。
+    """
+    candidates = list(all_song_name_indexes.keys())
+    same_class = [k for k in candidates if _has_title_prefix(k) == _has_title_prefix(name)]
+    if same_class and len(same_class) != len(candidates):
+        hit = fzwzprocess.extractOne(name, same_class)
+        if hit is not None and hit[1] >= _POOL_SCORE_FLOOR:
+            return hit
+    return fzwzprocess.extractOne(name, candidates)
 
 
 def _get_orientation():
@@ -658,6 +712,23 @@ def play_song(context=None):
     # 因检测而整体提前/延后。命中即抛异常,由 Play 返回失败走 on_error。
     last_life_check = 0.0
     LIFE_CHECK_INTERVAL = 1.0  # 秒
+    # 生命检测统计。检测本身一直是生效的(实测 11/11 都处理了),但「卡在演出
+    # 失败弹窗」是偶发的,靠这几个数能直接区分成因:
+    #   starved 大   = 切片太密、sleep 预算不足,检测根本没机会跑
+    #   precheck 大  = 白底弹窗被亮度预检漏掉
+    #   checks 正常却没 hit = OCR 没读出来
+    life_stats = {"checks": 0, "hit": 0, "precheck": 0, "error": 0, "starved": 0}
+    starve_since = None
+
+    def _log_life_stats():
+        logging.info(
+            "生命检测汇总: 执行 %d 次(命中 %d), 亮度预检跳过 %d, OCR 异常 %d, 因切片过密跳过 %d",
+            life_stats["checks"],
+            life_stats["hit"],
+            life_stats["precheck"],
+            life_stats["error"],
+            life_stats["starved"],
+        )
 
     # 自适应发布余量: 时间轴由服务端 wait 推进,python 必须在服务端把本批命令
     # 执行完之前发布下一批。固定 3ms 余量在「平衡」电源计划下会被 CPU 频率
@@ -684,17 +755,42 @@ def play_song(context=None):
         sleep_s = max(0, wait_time - pub_margin_ms) / 1000.0
 
         now = time.perf_counter()
-        if (
-            context is not None
-            and now - last_life_check >= LIFE_CHECK_INTERVAL
-            and sleep_s >= 0.2
-        ):
-            check_t0 = time.perf_counter()
-            if _life_exhausted_on_screen(context):
-                logging.info("打歌中生命值耗尽,提前结束本次演出")
-                raise LifeExhaustedDetected()
-            sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
-            last_life_check = time.perf_counter()
+        if context is not None and now - last_life_check >= LIFE_CHECK_INTERVAL:
+            if sleep_s >= 0.2:
+                starve_since = None
+                check_t0 = time.perf_counter()
+                life_result = _life_exhausted_on_screen(context)
+                life_stats["checks"] += 1
+                # 注意:_life_exhausted_on_screen 返回的状态名与统计键名不同名
+                # (函数给 "precheck_rejected",统计键是 "precheck"),早期写法是
+                # 直接 life_stats[life_result] 索引 → 亮度预检一拒绝就 KeyError,
+                # 整首歌被判失败(2026-09-16 11:47 实跑:6 首在首音触发后约 30ms
+                # 全部被这条分支终结)。改显式分支,新增状态也不会再炸。
+                if life_result == "hit":
+                    life_stats["hit"] += 1
+                elif life_result == "precheck_rejected":
+                    life_stats["precheck"] += 1
+                elif life_result == "error":
+                    life_stats["error"] += 1
+                if life_result == "hit":
+                    logging.info("打歌中生命值耗尽,提前结束本次演出")
+                    _log_life_stats()
+                    raise LifeExhaustedDetected()
+                sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+                last_life_check = time.perf_counter()
+            else:
+                # 本批切片太密,扣掉检测耗时会把下一批发晚,只能跳过这一轮。
+                # 偶发跳过无妨,连续跳过就意味着这段时间的弹窗不会被发现。
+                life_stats["starved"] += 1
+                if starve_since is None:
+                    starve_since = now
+                elif now - starve_since >= 3.0:
+                    logging.warning(
+                        "生命检测已连续 %.1fs 无法执行(切片过密,sleep 预算不足),"
+                        "期间若弹出「演出失败」不会被发现",
+                        now - starve_since,
+                    )
+                    starve_since = now
 
         time.sleep(sleep_s)
         prev_sleep_end = time.perf_counter()
@@ -709,16 +805,26 @@ def play_song(context=None):
             )
         else:
             break
+    _log_life_stats()
     time.sleep(2)
 
 
 def wait_first_note():
+    t_start = time.perf_counter()
     last_avg = None
     waited_frames = 0
     info = get_runtime_info(current_player.resolution)["wait_first"]
     from_row, to_row = info["from"], info["to"]
     freezed = False
     row_count = to_row - from_row + 1
+    edge_count = min(int(info.get("edge", 4)), row_count)
+    # 诊断用信号:检测带顶部 edge_count 行的平均色。它由已经算好的 rows 直接
+    # 派生,零额外采集成本;目前只记录「本来会何时触发」,不参与判定。
+    last_edge_avg = None
+    edge_cross_t = None
+    # 冻结前的静默判定被重置的次数。冻结耗时本身只看最后一段 200 帧,看不出
+    # 中间被打断过多少次;重置多说明前奏里有运动,冻结完成得比账面晚。
+    freeze_resets = 0
 
     # Sub-frame sync: keep the original reference point (the consecutive-frame
     # band-average change crossing 3.0) but interpolate the exact crossing moment
@@ -741,6 +847,22 @@ def wait_first_note():
     # 会被确认逻辑当成"候选掉落"丢弃 → 首音被拖后数秒 → 整首全 MISS。已撤回,
     # 恢复"越阈值即触发"。问题A 复现靠下面的每帧 wfT 日志定位。
     _log_t = 0.0
+
+    def _log_trigger(cross_t, change_score, kind):
+        """记录首音触发点,并把「检测带顶部若干行」这个更灵敏的判据本来会在
+        什么时候触发一并记下。两者之差就是现有判据的滞后量 —— 「前几个音符
+        miss」若出在首音判定上,这条日志能直接量化,不必先改触发逻辑去赌。"""
+        band_ms = (cross_t - t_start) * 1000.0
+        if edge_cross_t is None:
+            edge_desc, lead = "未越阈值", ""
+        else:
+            edge_ms = (edge_cross_t - t_start) * 1000.0
+            edge_desc = "%.0fms" % edge_ms
+            lead = "(灵敏判据早 %.0fms)" % (band_ms - edge_ms)
+        logging.info(
+            "首音触发[%s]: band %.0fms change=%.2f, 顶部%d行 %s %s",
+            kind, band_ms, change_score, edge_count, edge_desc, lead,
+        )
 
     def _maybe_log(change_score, band_avg, note=""):
         """每帧 change_score 日志(问题A 复现用):静默期 ≤10 行/秒,变化显著或
@@ -772,6 +894,12 @@ def wait_first_note():
                 avg, _ = evaluate_row_color(screen, r)
                 rows[r - from_row] = avg
             band_avg = rows.mean(axis=0)
+            edge_avg = rows[:edge_count].mean(axis=0)
+            edge_change = (
+                float(np.sum(np.abs(edge_avg - last_edge_avg)))
+                if last_edge_avg is not None
+                else 0.0
+            )
 
             if not freezed:
                 change_score = (
@@ -786,6 +914,7 @@ def wait_first_note():
                         waited_frames += 1
                     else:
                         waited_frames = 0
+                        freeze_resets += 1
                     if waited_frames >= 200:
                         freezed = True
                         _freeze_done_t = frame_t
@@ -793,11 +922,19 @@ def wait_first_note():
                         fps = (
                             200.0 / max((frame_t - _freeze_t0) * 1000.0, 1e-6) * 1000.0
                         )
-                        logging.debug(
-                            "Picture freezed, waiting for the first note... (freeze 200帧耗 %.0fms, 约 %.0f fps)",
-                            (frame_t - _freeze_t0) * 1000.0, fps,
+                        logging.info(
+                            "冻结完成: 等待首音总耗时 %.0fms(静默判定被重置 %d 次), "
+                            "最后 200 帧耗 %.0fms(约 %.0f fps), 检测带 y=%d-%d(顶部 %d 行作灵敏判据)",
+                            (frame_t - t_start) * 1000.0,
+                            freeze_resets,
+                            (frame_t - _freeze_t0) * 1000.0,
+                            fps,
+                            from_row,
+                            to_row,
+                            edge_count,
                         )
                 last_avg = band_avg
+                last_edge_avg = edge_avg
                 _maybe_log(change_score, band_avg)
                 continue
 
@@ -810,6 +947,14 @@ def wait_first_note():
                 if last_avg is not None
                 else 0.0
             )
+            # 灵敏判据的越阈值时刻:宽限期内的也照记 —— 真首音若正好落在宽限
+            # 窗口里会被整段忽略,这条能看出它当时到底有没有越阈值。
+            if (
+                edge_cross_t is None
+                and last_edge_avg is not None
+                and edge_change >= CHANGE_THRESHOLD
+            ):
+                edge_cross_t = frame_t
             now_t = time.perf_counter()
             if (
                 _freeze_done_t is not None
@@ -842,6 +987,7 @@ def wait_first_note():
                             prev_change, change_score
                         ),
                     )
+                    _log_trigger(cross_t, change_score, "interp")
                     time.sleep(max(0, wait_ms) / 1000)
                     break
                 elif change_score >= CHANGE_THRESHOLD:
@@ -855,11 +1001,13 @@ def wait_first_note():
                         band_avg,
                         "trigger(direct {:.2f})".format(change_score),
                     )
+                    _log_trigger(frame_t, change_score, "direct")
                     time.sleep(max(0, wait_ms) / 1000)
                     break
             prev_change = change_score
             prev_frame_t = frame_t
             last_avg = band_avg
+            last_edge_avg = edge_avg
             _maybe_log(change_score, band_avg)
         except Exception as e:
             logging.error(f"Failed to get screen: {e}")

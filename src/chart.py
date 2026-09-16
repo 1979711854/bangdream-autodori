@@ -131,6 +131,13 @@ class Chart:
             for i in range(1, 6)
         ]
 
+        # 5 指全部被占用时 get_finger 会返回 None,调用方没有做任何处理 ——
+        # 生成出来的指令要么带着 finger=None,要么被移动/长按分支直接丢弃,
+        # 结果就是这些音符不会发出点击。它们必然 MISS,而且在结算里表现为
+        # 「其余判定都正常、只有零星几个 miss,且 fast/slow 为 0」,和时序偏移
+        # 完全不同。这里记录下来,区分「判定晚了」和「压根没点」。
+        finger_missed: list[float] = []
+
         def get_finger(from_time, to_time) -> int:
             for finger in available_fingers:
                 if any(
@@ -141,6 +148,7 @@ class Chart:
                 else:
                     finger["occupied_time"].append((from_time, to_time))
                     return finger["id"]
+            finger_missed.append(from_time)
             return None
 
         def add_tap(note_index, from_time, duration, pos):
@@ -357,6 +365,15 @@ class Chart:
             for index, action in enumerate(actions_with_wait)
         ]
         self.actions = actions_with_wait
+
+        if finger_missed:
+            self._logger.warning(
+                "%d 个音符没抢到手指(5 指全被占用),这些音符不会发出点击指令 → 必然 MISS;"
+                "首次出现在 %.0fms,前几个: %s",
+                len(finger_missed),
+                finger_missed[0],
+                ", ".join("%.0f" % t for t in finger_missed[:8]),
+            )
 
     def actions_to_MNTcmd(self, resolution, orientation, offset_info, size=50):
         self.command_builder = CommandBuilder()

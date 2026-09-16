@@ -30,6 +30,11 @@ def get_runtime_info(resolution: tuple[int, int]):
         "wait_first": {
             "from": get_rounded_int_y(510),
             "to": get_rounded_int_y(535),
+            # 检测带顶部若干行。音符是从上往下掉、尖端先进入这几行,而整条带的
+            # 平均色会把「刚探头」的信号按带高稀释掉,要等音符扎进去一截才越阈值。
+            # 目前只用它做诊断:记录这个更灵敏的判据本来会在什么时候触发,与现有
+            # 触发点对比,暂不参与触发(见 autodori.wait_first_note)。
+            "edge": max(4, get_rounded_int_y(7)),
         },
     }
 
