@@ -626,3 +626,23 @@ GUI_HANDOFF.md
 
 # GUI 构建产物(本地)
 autodori_gui.exe
+
+# ---- 本地备份 / 与本项目无关的目录 ----
+# 会话备份与 exe 基线:_exe_bak_20260916/ 曾达 181MB,不忽略的话
+# 一个 `git add .` 就会把它们提交进仓库。
+_exe_bak_*/
+_*_backup_*/
+# 启动模拟器时以仓库目录为 cwd,NVIDIA 驱动会在这里写 umdlogs
+NVIDIA Corporation/
+
+# ---- 只留在本地的诊断脚本 ----
+# _test_*.py(离线回归测试)与 _diag_play.py(按歌聚合打歌诊断)会随仓库提交,
+# 不要通配掉。下面这几个只对本机环境有意义,故不入库:
+#   _chk_exe.py / _chk_keyerror.py —— 反编译本机 exe 核对装的是哪份源码
+#   _diag_maa.py                   —— 依赖本机资源目录布局
+_chk_*.py
+_diag_maa.py
+
+# ---- 会话记忆(本地) ----
+# 跨会话的工作笔记,含内部排查细节与临时路径,不进公开仓库。
+.workbuddy/
