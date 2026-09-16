@@ -213,7 +213,7 @@ json.dump(
 
 # 把发布说明与截图一并放进包内,与历史发布包的结构保持一致
 # (放在 assets 复制之后 —— PyInstaller 会以 --noconfirm 操作 dist/,不要先放东西进去)
-for _doc in ("README.md", "CHANGELOG.md"):
+for _doc in ("README.md", "CHANGELOG.md", "RELEASE_NOTES.md"):
     _doc_src = os.path.join(current_dir, _doc)
     if os.path.exists(_doc_src):
         shutil.copy(_doc_src, os.path.join(dist_dir, _doc))

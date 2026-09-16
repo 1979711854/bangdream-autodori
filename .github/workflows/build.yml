@@ -43,8 +43,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          # 仓库内的 CHANGELOG.md 由维护者手写,直接作为 release 正文。
-          # 上游模板里的 evative7-changeloggen 步骤会覆写该文件,已移除。
-          body_path: CHANGELOG.md
+          # release 正文取仓库根的 RELEASE_NOTES.md —— 它只写**当前版本**的内容。
+          # 不要用 CHANGELOG.md:那是全量历史,正文会带上所有旧版本条目。
+          # 该文件由维护者在发版前手写,排版要求「每段一行、不按列折行」——
+          # GitHub 会把单个换行渲染成 <br>,折行会让正文右侧出现大片空白。
+          # (上游模板里的 evative7-changeloggen 步骤会覆写 CHANGELOG.md,已移除。)
+          body_path: RELEASE_NOTES.md
           files: |
             dist/*.zip
