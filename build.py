@@ -2,14 +2,13 @@ import json
 import os
 import shutil
 import site
+import subprocess
 import sys
 import zipfile
 import argparse
 import requests
 from io import BytesIO
 from zipfile import ZipFile
-
-import PyInstaller.__main__
 
 
 parser = argparse.ArgumentParser()
@@ -125,24 +124,41 @@ if os.path.exists(dist_dir):
     shutil.rmtree(dist_dir)
 
 # 运行 PyInstaller 打包命令
-command = [
-    "src/autodori.py",
-    "--onefile",
-    "--name=autodori.exe",
-    f"--add-data={add_data_param}",
-    f"--add-data={add_data_param2}",
-    # "--clean",
-]
-if sys.platform == "win32":
-    command.append(
-        f'--add-binary={os.path.join(current_dir, "assets", "misc", "windows", "dll", "msvcp140.dll")}{os.pathsep}.'
-    )
-    command.append(
-        f'--add-binary={os.path.join(current_dir, "assets", "misc", "windows", "dll", "vcruntime140.dll")}{os.pathsep}.'
-    )
+# 两个入口各打一个 onefile exe:GUI 用 --noconsole(双击不弹黑框),bot 保留控制台
+# (GUI 靠 stdout 管道读它的日志)。
+# 缺了 GUI exe 用户解压后就没有可双击的启动器 —— 2026-09-16 的 v1.2.3 就是这么
+# 发出去的,只能事后手工替换 zip。两个都要打。
+# 必须用子进程逐个调用,不能用 PyInstaller.__main__.run():后者在同一进程内被
+# 调用第二次时会复用第一次的全局配置,产物不可靠。
+DLL_DIR = os.path.join(current_dir, "assets", "misc", "windows", "dll")
 
-print(" ".join(command))
-PyInstaller.__main__.run(command)
+
+def build_exe(entry: str, name: str, console: bool):
+    cmd = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        entry,
+        "--onefile",
+        "--noconfirm",
+        f"--name={name}",
+        f"--add-data={add_data_param}",
+        f"--add-data={add_data_param2}",
+    ]
+    if not console:
+        cmd.append("--noconsole")
+    if sys.platform == "win32":
+        for _dll in ("msvcp140.dll", "vcruntime140.dll"):
+            cmd.append(f"--add-binary={os.path.join(DLL_DIR, _dll)}{os.pathsep}.")
+    print(" ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+for _entry, _name, _console in (
+    (os.path.join(current_dir, "src", "autodori.py"), "autodori.exe", True),
+    (os.path.join(current_dir, "gui.py"), "autodori_gui.exe", False),
+):
+    build_exe(_entry, _name, _console)
 
 
 # 使用 shutil 复制整个文件夹
@@ -194,6 +210,23 @@ json.dump(
 #     shutil.copy(syc_bat_source_path, syc_bat_dest_path)
 # else:
 #     raise FileNotFoundError("syc.bat file not found")
+
+# 把发布说明与截图一并放进包内,与历史发布包的结构保持一致
+# (放在 assets 复制之后 —— PyInstaller 会以 --noconfirm 操作 dist/,不要先放东西进去)
+for _doc in ("README.md", "CHANGELOG.md"):
+    _doc_src = os.path.join(current_dir, _doc)
+    if os.path.exists(_doc_src):
+        shutil.copy(_doc_src, os.path.join(dist_dir, _doc))
+    else:
+        print(f"warning: {_doc} not found, skipped")
+if os.path.isdir(os.path.join(current_dir, "screenshots")):
+    shutil.copytree(
+        os.path.join(current_dir, "screenshots"),
+        os.path.join(dist_dir, "screenshots"),
+        dirs_exist_ok=True,
+    )
+else:
+    print("warning: screenshots/ not found, skipped")
 
 # 压缩 dist 文件夹为 zip 文件，并保存在 dist 目录中
 zip_filepath = os.path.join(dist_dir, ZIP_FILENAME)
