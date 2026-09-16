@@ -78,7 +78,8 @@
   - `autodori_gui.exe` — 图形界面启动器
   - `autodori.exe` — 打歌核心程序(由 GUI 自动拉起)
   - `assets/` — 识别资源、谱面模型、minitouch 触控二进制
-  - `README.md` / `screenshots/` — 说明文档与界面截图
+  - `README.md` / `CHANGELOG.md` / `RELEASE_NOTES.md` — 说明文档与更新日志
+  - `screenshots/` — 界面截图
 
 ### 升级方式
 
@@ -97,7 +98,14 @@
 - 新增 / 保留离线回归测试 4 组(生命检测状态映射、歌名匹配 44 条真实 OCR
   样本、挖矿档位判定、GUI 日志处理),共 44 项断言,全部通过。
 - 流水线资源校验通过(`Resource.loaded = True`),节点列表无重复元素。
-- GUI / 打歌核心程序启动均通过冒烟测试。
+- 发布包已逐项核对:
+  - 反编译 `autodori.exe`,主脚本含本次全部修复与诊断标记
+    (`_runtime_config`、`fuzzy_match_song`、`_has_title_prefix`、
+    `_POOL_SCORE_FLOOR`、`wait_first_note`、生命检测汇总 / 冻结完成 /
+    首音触发),`finger_missed` 位于 `chart` 模块;
+  - 反编译 `autodori_gui.exe`,读出版本号 `1.2.3`;
+  - 包内 `assets/` 与源码仓库逐文件比对一致,`assets/resource/pipeline/
+    live.json` 与仓库版本 md5 相同。
 
 ---
 
