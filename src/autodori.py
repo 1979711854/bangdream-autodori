@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Optional, Union
 
@@ -26,7 +27,7 @@ if not config_path.exists():
 
 
 import numpy as np
-from fuzzywuzzy import process as fzwzprocess
+from fuzzywuzzy import fuzz as fzwzfuzz
 from maa.context import Context
 from maa.controller import AdbController
 from maa.custom_action import CustomAction, CustomRecognitionResult
@@ -89,8 +90,50 @@ for _sid, _sinfo in all_songs.items():
     _zh_title = _titles[3] if len(_titles) > 3 else None
     if _zh_title:
         all_song_name_indexes.setdefault(_zh_title, _sid)
+
+# 标题 -> 同名条目列表(仅保留 ≥2 个的)。曲库 818 首里只有 8 组同名不同 id。
+# 旧索引对同名键只留最后一个,另一首直接不可达 —— 2026-09-17 实测 `閃光` 只剩
+# #467(Afterglow×レイヤ,EXPERT 27),Roselia 版 #410(EXPERT 26)被丢掉,
+# 抽到 Roselia 版就必然按 #467 的谱面打,整首对不上。
+#
+# 8 组里 4 组(優勝 feat.Afterglow / HELL! or HELL? / 六兆年と一夜物語 /
+# Mystic Light Quest)五档等级全同 —— 逐档 md5 比对确认它们本就是**同一份谱面**,
+# 选谁都对;ときめきエクスペリエンス！(月島まりなver.) 只有 SPECIAL 差 1 级;
+# 其余 3 组(閃光 / オレンジ / シル・ヴ・プレジデント)等级不同 = 谱面不同。
+#
+# 所以判据不是标题而是屏幕上的「乐曲等级」:该数字 = 高亮曲目在当前难度下的
+# playLevel,而"等级可区分"与"谱面不同"实测完全等价。等级相同的组随便选一个,
+# 等级不同的组按屏上数字挑;挑不出来就放弃本次选曲,绝不猜。
+_title_to_ids: dict[str, list[str]] = {}
+for _sid, _sinfo in all_songs.items():
+    for _t in _sinfo.get("musicTitle") or []:
+        # 只看能真正出现在索引里的标题:匹配只可能返回索引的键
+        if _t and _t in all_song_name_indexes:
+            _ids = _title_to_ids.setdefault(_t, [])
+            if _sid not in _ids:
+                _ids.append(_sid)
+ambiguous_titles: dict[str, list[str]] = {
+    _t: _ids for _t, _ids in _title_to_ids.items() if len(_ids) > 1
+}
+# 把索引里的默认值排到最前,保证"无法区分时"选中的和改动前是同一个
+for _t, _ids in ambiguous_titles.items():
+    _default = all_song_name_indexes.get(_t)
+    if _default in _ids:
+        _ids.remove(_default)
+        _ids.insert(0, _default)
+
+# 选歌界面上「乐曲等级」数字的位置(1280x720 绝对像素,未缩放)。
+# 依据 debug/maa.log:该数字的框稳定落在 (1204,456,30,23) 附近,标签「乐曲等级」
+# 在 (1092,455,77,24);用 debug/_exp_eval_match.py 复核,有等级数字的 48 轮样本
+# 全部落在匹配到的曲目在该难度下的等级集合内。
+_SONG_LEVEL_ROI = [1196, 450, 48, 32]
+_DIFFICULTY_ORDER = ["easy", "normal", "hard", "expert", "special"]
+
 current_song_name: str = None
 current_song_id: str = None
+# SongRecognition 选定的 (标题, 曲目 id)。同名多条目时标题无法反查唯一 id,
+# 由识别阶段写入、紧随其后的 SaveSong 动作读取(PipelineTask 内同线程顺序执行)。
+_resolved_song_id: Optional[tuple] = None
 current_chart: Chart = None
 play_failed_times: int = 0
 callback_data: dict = {}
@@ -261,6 +304,76 @@ def check_song_available(name, id_, difficulty):
     return True
 
 
+def _song_level(song_id: str, difficulty: str):
+    """曲库记录里该曲目在指定难度下的等级(选歌界面「乐曲等级」显示的就是它)。"""
+    if difficulty not in _DIFFICULTY_ORDER:
+        return None
+    sinfo = all_songs.get(str(song_id)) or {}
+    entry = (sinfo.get("difficulty") or {}).get(str(_DIFFICULTY_ORDER.index(difficulty)))
+    return (entry or {}).get("playLevel")
+
+
+def _candidate_ids(name: str) -> list:
+    """标题 -> 可能的曲目 id 列表(重名时多个,默认项在最前)。"""
+    if name in ambiguous_titles:
+        return list(ambiguous_titles[name])
+    sid = all_song_name_indexes.get(name)
+    return [sid] if sid else []
+
+
+def _read_screen_song_level(context: Context, image) -> Optional[int]:
+    """读选歌界面右下「乐曲等级」的数字。读不到返回 None。
+
+    只识别一个 2 位数字,约 100ms;位置见 `_SONG_LEVEL_ROI` 处的实测数据。
+    """
+    pipeline = {
+        "song_level_ocr": {
+            "recognition": "OCR",
+            "only_rec": True,
+            "roi": _SONG_LEVEL_ROI,
+        }
+    }
+    try:
+        text = context.run_recognition(
+            "song_level_ocr", image, pipeline
+        ).best_result.text
+    except Exception:
+        return None
+    m = re.search(r"\d{1,2}", text or "")
+    return int(m.group()) if m else None
+
+
+def _pick_song_id(context: Context, image, name: str, ids: list) -> Optional[str]:
+    """重名标题下挑出正确的曲目 id。挑不出返回 None(调用方按"识别失败"处理)。
+
+    先用曲库里的等级筛:
+      * 候选在当前难度下等级**全相同** → 实测这些条目谱面字节级一致,选默认项即可;
+      * 等级不同 → 读屏上的「乐曲等级」,唯一命中的那个就是它;
+      * 读不到 / 没有唯一命中 → 返回 None。宁可重抽,也不要拿错谱面打整首。
+    """
+    if not ids:
+        return None
+    if len(ids) == 1:
+        return ids[0]
+    levels = [_song_level(i, DIFFICULTY) for i in ids]
+    if len(set(levels)) == 1:
+        return ids[0]
+    screen_level = _read_screen_song_level(context, image)
+    if screen_level is not None:
+        hit = [i for i, lv in zip(ids, levels) if lv == screen_level]
+        if len(hit) == 1:
+            logging.debug(
+                "重名曲目 %r 按屏上等级 %s 选定 #%s(候选 %s / 等级 %s)",
+                name, screen_level, hit[0], ids, levels,
+            )
+            return hit[0]
+    logging.warning(
+        "重名曲目无法区分,跳过本次选曲: %r 候选=%s 期望等级=%s 屏上等级=%r",
+        name, ids, levels, screen_level,
+    )
+    return None
+
+
 @maaresource.custom_recognition("SongRecognition")
 class SongRecognition(CustomRecognition):
     def analyze(
@@ -269,7 +382,7 @@ class SongRecognition(CustomRecognition):
 
         roi = [200, 332, 368, 29]
 
-        def match(model=None):
+        def ocr(model=None):
             pplname = "_ocrsong_" + "".join(random.choices(string.ascii_lowercase, k=7))
             pipeline = {
                 pplname: {
@@ -281,32 +394,41 @@ class SongRecognition(CustomRecognition):
             if model != None:
                 pipeline[pplname]["model"] = model
             try:
-                song_fuzzyname = context.run_recognition(
+                return context.run_recognition(
                     pplname,
                     argv.image,
                     pipeline,
                 ).best_result.text
-            except:
-                song_fuzzyname = ""
-            return fuzzy_match_song(song_fuzzyname)
+            except Exception:
+                return ""
 
-        jpmatch = match("ppocr_v3/ja_jp")
-        commonmatch = match()  # , "ppocr_v4/zh_cn")
+        # 两个模型各读一次:日文模型对日文歌名更准,默认模型对拉丁标题更准。
+        # **两个读数一起**交给 matcher,不要各匹配一次再比分数 —— OCR 丢字很常见,
+        # 而残留片段可能恰好是**另一首歌的完整标题**(2026-09-17 实测:`ぎゅっDAYS♪`
+        # 被默认模型读成 `DAYS`,对 #120「DAYS」是满分 100,直接压过日文模型对正确
+        # 条目的 53 分 → 按另一张谱面打整首)。合并后可用"长度一致性"识别这种截断。
+        ja_name = ocr("ppocr_v3/ja_jp")
+        default_name = ocr()  # , "ppocr_v4/zh_cn")
         logging.debug(
-            "Match result with ppocr_v3/ja_jp: {}, Match result with default: {}".format(
-                jpmatch, commonmatch
-            )
+            "Song OCR with ppocr_v3/ja_jp: %r, with default: %r", ja_name, default_name
         )
-        result = sorted([jpmatch, commonmatch], key=lambda x: x[1], reverse=True)
-        if all([r[1] < 50 for r in result]):
+        matched = fuzzy_match_song(ja_name, [default_name])
+        if matched is None or matched[1] < 50:
             return CustomRecognition.AnalyzeResult(None, "")
-        result_music_name = result[0][0]
+        result_music_name, score = matched
 
-        if not check_song_available(
-            result_music_name, all_song_name_indexes[result_music_name], DIFFICULTY
-        ):
+        song_id = _pick_song_id(
+            context, argv.image, result_music_name, _candidate_ids(result_music_name)
+        )
+        if song_id is None:
             return CustomRecognition.AnalyzeResult(None, "")
 
+        if not check_song_available(result_music_name, song_id, DIFFICULTY):
+            return CustomRecognition.AnalyzeResult(None, "")
+
+        # 把选中的 id 交给紧随其后的 SaveSong 动作(同名多条目时不能再靠标题查表)
+        global _resolved_song_id
+        _resolved_song_id = (result_music_name, song_id)
         return CustomRecognition.AnalyzeResult(roi, result_music_name)
 
 
@@ -347,6 +469,31 @@ class LiveBoostEnoughRecognition(CustomRecognition):
         return CustomRecognition.AnalyzeResult(roi, str(live_boost))
 
 
+def _run_node_once(context, entry: str) -> None:
+    """执行单个 pipeline 节点,出错只记日志不抛。
+
+    注意 MaaContext.run_action 只执行该节点的识别+动作, **不会沿它的 next
+    链继续**,所以多步操作必须把节点名逐个列出 —— 例如 close_app 自带的
+    next("stop") 在这里不会生效,要再显式跑一次 "stop"。
+    """
+    try:
+        context.run_action(entry)
+    except Exception as e:
+        logging.warning("run node %s failed: %s", entry, e)
+
+
+def _exit_game_and_stop_task(context) -> None:
+    """关闭游戏并终止当前任务。
+
+    "stop" 节点是 StopTask,它的作用是把**当前 Context** 的 need_to_stop
+    置位;而 run_action 与外层任务共享同一个 Context(getptr()),外层
+    PipelineTask 会在下一个节点边界检查到该标志并直接正常返回,任务随即
+    结束,不会继续走 next / on_error。
+    """
+    _run_node_once(context, "close_app")
+    _run_node_once(context, "stop")
+
+
 @maaresource.custom_action("HandleLiveBoost")
 class HandleLiveBoost(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
@@ -359,15 +506,16 @@ class HandleLiveBoost(CustomAction):
                 logging.debug("Live boost is 0, continue playing")
             else:
                 # 火罐不足且配置为「退出游戏」。
-                # 注意:在自定义动作里直接 run_action("stop") 不可靠 —— 动作返回
-                # True 后节点仍会执行 next 继续打歌,stop 不会被触发。因此这里
-                # 返回 False 让节点失败,由 ensure_liveboost 的 on_error("stop")
-                # 真正终止任务。
+                # 这里必须显式终止任务,不能只靠 ensure_liveboost 的
+                # on_error("stop"): ensure_liveboost 是 comfirm_song 的 next
+                # 节点,它返回 False 时 MaaFramework 会把错误归到**父节点**
+                # comfirm_song 上,走的是 comfirm_song.on_error
+                # (= random_choice_song) —— 任务并不会停。后果是游戏被关掉后
+                # bot 还在跑,main 的 next 全不命中,最终落到 interrupt 里的
+                # start_app(无 recognition = 必定命中)把游戏重新拉起来,
+                # 表现为「退出游戏后又自动重启」。
                 logging.info("Live boost not enough, ready to exit")
-                try:
-                    context.run_action("close_app")
-                except Exception as e:
-                    logging.warning("close_app failed: %s", e)
+                _exit_game_and_stop_task(context)
                 return CustomAction.RunResult(False)
         return CustomAction.RunResult(True)
 
@@ -379,11 +527,11 @@ class HandleLifeExhausted(CustomAction):
         #   auto = 回到主页后自动继续打歌; wait = 停在主页等用户手动操作
         mode = str(_runtime_config().get("on_life_exhausted", "auto") or "auto")
         if mode == "wait":
-            # 同 HandleLiveBoost:自定义动作里 run_action("stop") 不可靠 ——
-            # 动作返回 True 后节点仍会沿 next(这里是 main)继续打歌,stop 不会被
-            # 触发。这里返回 False 让节点失败,由 handle_life_exhausted 的
-            # on_error("stop") 真正终止任务。
+            # 同样不依赖 on_error 冒泡(handle_life_exhausted 的父节点
+            # life_exhausted_confirm 现在恰好也配了 on_error("stop"),但那是巧合;
+            # 一旦上游 next/on_error 被改动就会退化成沿 next("main")继续打歌)。
             logging.info("生命值耗尽,已退出到主页,等待手动操作")
+            _run_node_once(context, "stop")
             return CustomAction.RunResult(False)
         logging.info("生命值耗尽,自动继续打歌")
         return CustomAction.RunResult(True)
@@ -478,10 +626,7 @@ class SavePlayResult(CustomAction):
                 logging.debug("No song selected, skip saving play result")
             if play_failed_times >= MAX_FAILED_TIMES:
                 logging.error("Failed attempts exceed max failed times, stop")
-                try:
-                    context.run_action("close_app")
-                except Exception as e:
-                    logging.warning("close_app failed: %s", e)
+                _exit_game_and_stop_task(context)
                 return CustomAction.RunResult(False)
             return CustomAction.RunResult(True)
         except Exception as e:
@@ -586,19 +731,76 @@ def _has_title_prefix(title: str) -> bool:
     return bool(title) and title.lstrip().translate(_TITLE_BRACKET_TRANS).startswith("[")
 
 
-def fuzzy_match_song(name):
-    """OCR 歌名 → 曲库条目。
+def _normalize_title(title: str) -> str:
+    """标题归一:NFKC(全角→半角、兼容字符拆解)。
 
-    先按"标题是否带前缀标记"分池,再在同类池里比相似度。前缀标记决定的是不同的
-    谱面,跨池比较会让短的基础曲名靠"子串包含"胜出(见上面常量处的实测数据)。
+    OCR 会把半角读成全角(`DAYS` → `ＤＡYＳ`),而模糊匹配逐字符比,
+    不归一的话正确的 `ぎゅっDAYS♪` 对 `ぎゅっＤＡYＳト` 只有 53 分(归一后 93 分)。
+
+    这里**刻意不做** fuzzywuzzy `process.extractOne` 默认的 `full_process`(去标点):
+    那一步会把 `[FULL]` 的方括号也抹掉,而方括号正是"前缀池"的判据;同时它会抹掉
+    `♪`/`〜` 这类区分性字符,反而削弱正确条目。
+
+    注意归一化**不能**单独解决问题:默认模型读出的 `DAYS` 本身就是干净的半角,
+    那类截断要靠下面的读数权重。
     """
+    return unicodedata.normalize("NFKC", title or "")
+
+
+def fuzzy_match_song(name, other_names=()):
+    """OCR 读数(可传多个模型的读数) → 曲库条目,返回 `(标题, 分数)`;无候选返回 None。
+
+    三条判据,都对应一次实跑事故:
+
+    1. **按前缀标记分池** —— 前缀不同就是不同的谱面(`[FULL] キズナミュージック♪`
+       1485 音符 vs `キズナミュージック♪` 436 音符,见上方常量注释)。
+    2. **NFKC 归一** —— 见 `_normalize_title`。
+    3. **读数权重** = `len(读数) / 最长读数长度` —— 把"丢字多的那个读数"降权。
+
+       为什么需要它:`ぎゅっDAYS♪` 在真实日志里,日文模型读成 `ぎゅっＤＡYＳト`,
+       默认模型读成 `DAYS`。`DAYS` 恰好是 #120 的**完整标题**,满分 100;而正确条目
+       `ぎゅっDAYS♪` 只有 93 分 —— 光看分数就会选到另一首曲子。默认模型这次**丢了
+       4 个字符**,它的读数只解释了标题的一部分,证据强度本就应该打折。
+
+       注意权重必须加在**读数**上、不能加在候选上:OCR 截断是双向的,`季節次死`
+       (真值 `季節は次々死んでいく`)这种"只读出片段"的样本里,正确的长标题才是被
+       候选长度系数冤枉的那个 —— 用候选长度会把这 7 条原本正确的样本改坏。
+
+    用真实日志做过对照(`debug/_exp_eval_match.py`,以选歌界面「乐曲等级」数字为
+    ground truth):现状 46/48,加 1+2 仍 46/48,加上第 3 条 → **48/48**,无回归。
+    """
+    readings = [r for r in (_normalize_title(t) for t in (name,) + tuple(other_names)) if r]
+    if not readings:
+        return None
     candidates = list(all_song_name_indexes.keys())
-    same_class = [k for k in candidates if _has_title_prefix(k) == _has_title_prefix(name)]
+    longest = max(len(r) for r in readings)
+    # 前缀池用**原始**读数判定(归一化理论上不动方括号,但别依赖这一点)
+    query_has_prefix = _has_title_prefix(name) or (
+        bool(other_names) and _has_title_prefix(other_names[0])
+    )
+
+    def best_of(pool):
+        """池内取最高分。**同分时保持索引顺序**(与 `process.extractOne` 的
+        `max()` 语义一致)—— 平行曲那类"只共享 `(平行歌曲)` 后缀"的读数会出现
+        五路同分,换用别的平分判据会让结果在几条同分候选间漂移。"""
+        best = None
+        for key in pool:
+            key_norm = _normalize_title(key)
+            score = 0.0
+            for r in readings:
+                # 读数越短 = 丢的字越多 = 证据越弱
+                score = max(score, fzwzfuzz.WRatio(r, key_norm) * len(r) / longest)
+            if best is None or score > best[1]:
+                best = (key, score)
+        return best
+
+    same_class = [k for k in candidates if _has_title_prefix(k) == query_has_prefix]
     if same_class and len(same_class) != len(candidates):
-        hit = fzwzprocess.extractOne(name, same_class)
+        hit = best_of(same_class)
         if hit is not None and hit[1] >= _POOL_SCORE_FLOOR:
-            return hit
-    return fzwzprocess.extractOne(name, candidates)
+            return (hit[0], hit[1])
+    hit = best_of(candidates)
+    return (hit[0], hit[1]) if hit is not None else None
 
 
 def _get_orientation():
@@ -634,7 +836,12 @@ def _get_orientation():
 def save_song(name):
     global current_song_name, current_song_id, current_chart, current_orientation
     current_song_name = name
-    current_song_id = all_song_name_indexes[current_song_name]
+    # 同名多条目(閃光 / オレンジ …)时标题查不到唯一 id,用识别阶段选定的那个。
+    # 只有当记录与本次标题一致时才采信,避免跨首歌残留。
+    if _resolved_song_id and _resolved_song_id[0] == name:
+        current_song_id = _resolved_song_id[1]
+    else:
+        current_song_id = all_song_name_indexes[current_song_name]
     # 歌名一确定就立刻打日志:下面 Chart()/notes_to_actions()/actions_to_MNTcmd()
     # 是重活(要拉取谱面、把上万个 note 解算成触控指令,实测耗时 5~15s),
     # 若把日志放在它们之后,GUI 要到"打歌即将开始"才收到歌名 —— 这正是

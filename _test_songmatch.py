@@ -22,14 +22,19 @@
 # 被测代码用 AST 从 src/autodori.py 直接提取(不是复制),改实现后本测试自动跟随。
 
 import ast
+import logging
+import re
 import sys
+import unicodedata
 import warnings
 from pathlib import Path
+from typing import Optional
 
 warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
+from fuzzywuzzy import fuzz as fzwzfuzz  # noqa: E402
 from fuzzywuzzy import process as fzwzprocess  # noqa: E402
 from api import BestdoriAPI  # noqa: E402
 
@@ -43,26 +48,37 @@ def check(ok, msg):
 
 
 def load_under_test():
-    """从 src/autodori.py 提取歌名索引构造 + 匹配函数,在干净命名空间里执行。"""
+    """从 src/autodori.py 提取歌名索引构造 + 匹配函数,在干净命名空间里执行。
+
+    提取方式:凡是源码里出现下列"种子名"的赋值/循环语句都收进来(保持源码顺序),
+    再补上三个函数。这样改实现时只要种子名不变,本测试自动跟随。
+    """
     source = (ROOT / "src" / "autodori.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
-    wanted_names = {"all_song_name_indexes"}
-    wanted_consts = {"_TITLE_BRACKETS", "_TITLE_BRACKET_TRANS", "_POOL_SCORE_FLOOR"}
+    seeds = ("all_song_name_indexes", "_title_to_ids", "ambiguous_titles")
+    wanted_consts = {
+        "_TITLE_BRACKETS", "_TITLE_BRACKET_TRANS", "_POOL_SCORE_FLOOR",
+        "_SONG_LEVEL_ROI", "_DIFFICULTY_ORDER",
+    }
     segments = []
     for node in tree.body:
         seg = ast.get_source_segment(source, node)
-        if isinstance(node, ast.Assign):
-            targets = {t.id for t in node.targets if isinstance(t, ast.Name)}
-        elif isinstance(node, ast.AnnAssign):
-            targets = {node.target.id} if isinstance(node.target, ast.Name) else set()
-        else:
-            targets = set()
-        if targets & wanted_names or targets & wanted_consts:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                {t.id for t in node.targets if isinstance(t, ast.Name)}
+                if isinstance(node, ast.Assign)
+                else ({node.target.id} if isinstance(node.target, ast.Name) else set())
+            )
+            if targets & wanted_consts:
+                segments.append(seg)
+                continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.For)) and any(
+            s in seg for s in seeds
+        ):
             segments.append(seg)
-        elif isinstance(node, ast.For) and "all_song_name_indexes" in seg:
-            segments.append(seg)
-    for fn in ("_has_title_prefix", "fuzzy_match_song"):
+    for fn in ("_has_title_prefix", "_normalize_title", "fuzzy_match_song",
+               "_song_level", "_candidate_ids", "_pick_song_id"):
         node = next(
             n
             for n in tree.body
@@ -71,12 +87,27 @@ def load_under_test():
         segments.append(ast.get_source_segment(source, node))
 
     all_songs = BestdoriAPI.get_song_list()
-    ns = {"fzwzprocess": fzwzprocess, "all_songs": all_songs}
+    ns = {
+        "fzwzfuzz": fzwzfuzz,
+        "unicodedata": unicodedata,
+        "re": re,
+        "logging": logging,
+        "Optional": Optional,
+        "Context": object,
+        "DIFFICULTY": "hard",
+        "all_songs": all_songs,
+    }
     exec("\n".join(segments), ns)
-    return ns["all_song_name_indexes"], ns["fuzzy_match_song"], ns["_has_title_prefix"], all_songs
+    return ns
 
 
-INDEX, match_song, has_prefix, SONGS = load_under_test()
+NS = load_under_test()
+INDEX = NS["all_song_name_indexes"]
+match_song = NS["fuzzy_match_song"]
+has_prefix = NS["_has_title_prefix"]
+AMBIGUOUS = NS["ambiguous_titles"]
+SONGS = NS["all_songs"]
+
 
 
 def baseline_index(all_songs):
@@ -239,11 +270,100 @@ def test_self_consistency():
     check(wrong == 0, "日文键抽样 %d 条全部回到自己" % len(sample))
 
 
+def test_two_model_readings():
+    print("\n[7] 两个模型读数合并(本次报告的 ぎゅっDAYS♪ 截断)")
+    # 真实日志 2026-09-16 12:56:13:日文模型读出全角残字,默认模型只读出片段,
+    # 而那个片段恰好是 **另一首歌(#120 DAYS)** 的完整标题 → 旧逻辑按 100 分选中它。
+    hit = match_song("ぎゅっＤＡYＳト", ["DAYS"])
+    check(
+        song_id(hit[0]) == "169",
+        "「ぎゅっＤＡYＳト + DAYS」-> #%s (%r, %.0f 分)" % (song_id(hit[0]), hit[0], hit[1]),
+    )
+    hit = match_song("ぎゅっDAYS♪", ["DAYS"])
+    check(song_id(hit[0]) == "169", "读数完整时仍为 #169")
+    # 不能矫枉过正:真的抽到 DAYS 时必须还是 #120
+    hit = match_song("DAYS")
+    check(song_id(hit[0]) == "120", "单个读数 'DAYS' 仍命中 #%s" % song_id(hit[0]))
+    hit = match_song("DAYS", ["DAYS"])
+    check(song_id(hit[0]) == "120", "两个读数都是 'DAYS' 时仍是 #120")
+    # 截断:只读出片段时,正确的长标题不该被"候选长度"冤枉
+    hit = match_song("季節次死")
+    check(song_id(hit[0]) == "727", "截断读数 '季節次死' -> #%s" % song_id(hit[0]))
+
+
+def test_ambiguous_resolution():
+    print("\n[5] 重名曲目消歧(按选歌界面「乐曲等级」数字)")
+    pick = NS["_pick_song_id"]
+    cand = NS["_candidate_ids"]
+    song_level = NS["_song_level"]
+    calls = {"n": 0}
+
+    def resolve(title, level, difficulty):
+        NS["DIFFICULTY"] = difficulty
+        NS["_read_screen_song_level"] = lambda context, image: (
+            calls.__setitem__("n", calls["n"] + 1) or level
+        )
+        calls["n"] = 0
+        return pick(None, None, title, cand(title))
+
+    # 报告的场景:閃光 有 Roselia(#410,EXPERT 26)与 Afterglow×レイヤ(#467,EXPERT 27)
+    # 两版,谱面完全不同
+    ids = cand("閃光")
+    check(set(ids) == {"410", "467"}, "閃光 认出两条同名: %s" % sorted(ids))
+    for diff, a, b in (("expert", "410", "467"), ("hard", "410", "467")):
+        la, lb = song_level(a, diff), song_level(b, diff)
+        check(la != lb, "閃光 在 %s 下两条等级不同(%s vs %s)" % (diff, la, lb))
+        check(resolve("閃光", la, diff) == a, "閃光 屏上等级 %s -> #%s" % (la, a))
+        check(resolve("閃光", lb, diff) == b, "閃光 屏上等级 %s -> #%s" % (lb, b))
+    check(resolve("閃光", None, "expert") is None, "閃光 读不到等级 -> 拒绝(不赌)")
+    check(resolve("閃光", 99, "expert") is None, "閃光 等级对不上任何一条 -> 拒绝")
+
+    # 等级相同的组:实测谱面字节级一致,直接取默认项,且不该浪费一次 OCR
+    # 注意这里必须用**重名键本身**的写法:索引里 `[超高难易度 新SPECIAL] 六兆年と一夜物語`
+    # (简中「难」)才是重名的那个键,日文「難」的写法只对应一条。
+    title = "[超高难易度 新SPECIAL] 六兆年と一夜物語"
+    ids = cand(title)
+    check(len(ids) == 2, "六兆年 认出两条同名: %s" % ids)
+    NS["DIFFICULTY"] = "expert"
+    NS["_read_screen_song_level"] = lambda context, image: calls.__setitem__(
+        "n", calls["n"] + 1
+    )
+    calls["n"] = 0
+    got = pick(None, None, title, ids)
+    check(got == ids[0], "等级无区分的组取默认项 #%s" % got)
+    check(calls["n"] == 0, "等级无区分的组不额外读屏")
+
+    # 多组同名曲一律能按等级复位到正确条目
+    pairs = [("オレンジ", "hard", "316", "676"), ("シル・ヴ・プレジデント", "expert", "389", "462")]
+    for title, diff, a, b in pairs:
+        la, lb = song_level(a, diff), song_level(b, diff)
+        if la == lb:
+            print("      跳过 %r:在 %s 下等级相同(%s)" % (title, diff, la))
+            continue
+        check(resolve(title, la, diff) == a, "%s 屏上等级 %s -> #%s" % (title, la, a))
+        check(resolve(title, lb, diff) == b, "%s 屏上等级 %s -> #%s" % (title, lb, b))
+
+
+def test_index_integrity():
+    print("\n[6] 索引完整性")
+    check(len(AMBIGUOUS) == 8, "全曲库重名标题 %d 组(预期 8)" % len(AMBIGUOUS))
+    for title, ids in AMBIGUOUS.items():
+        default = INDEX.get(title)
+        check(
+            ids[0] == default,
+            "%r 默认项 %s 排在最前(不改变原有选择)" % (title[:22], default),
+        )
+        check(all(i in SONGS for i in ids), "%r 的 id 都存在于曲库" % title[:22])
+
+
 if __name__ == "__main__":
     print("索引规模: %d (改动前 %d)" % (len(INDEX), len(BASE_INDEX)))
     test_prefix_classifier()
     test_reported_bug()
     test_corpus_table()
     test_self_consistency()
+    test_two_model_readings()
+    test_ambiguous_resolution()
+    test_index_integrity()
     print("\n通过 %d 项, 失败 %d 项" % (len(passed), len(failed)))
     sys.exit(1 if failed else 0)
