@@ -1086,6 +1086,9 @@ class AutodoriGUI:
         "生命值耗尽",
         "演出失败",
         "提前结束",
+        "游戏已退出",
+        "脚本收尾",
+        "强制停止",
         "Failed to init",
         "Traceback",
     )
@@ -1120,6 +1123,13 @@ class AutodoriGUI:
                                           "处理日志行出错(已跳过): %r" % (e,)))
         except queue.Empty:
             pass
+        # 「是否在运行」以**进程存活**为准,不能只等 stdout 的 EOF:
+        # bot 是 PyInstaller onefile,它会派生子进程;只要还有子进程持有管道的
+        # 写端,读线程就永远收不到 EOF —— 界面会一直停在「运行中 · 请勿操作电脑」,
+        # 观感上就是「游戏退出了但脚本没停」。这里用 poll() 兜住这种情况。
+        if self.proc is not None and self.proc.poll() is not None:
+            self._emit("", "INFO", "bot 进程已退出(界面状态已复位)")
+            self._on_finished()
         self.root.after(120, self._poll_log)
 
     def _handle_line(self, line):
@@ -1256,8 +1266,27 @@ class AutodoriGUI:
         }
         try:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+            # 合并写入,不要整份覆盖:data/config.yml 里还有 GUI 界面上没有、
+            # 但 bot 会实时读取的键(如 stop_when_game_exits、song_strategy_reject_limit、
+            # device.filter 等)。整份重写会在每次点「开始演出」时把它们抹掉,
+            # 让用户手改的设置悄悄失效。
+            merged = {}
+            try:
+                with open(CONFIG, "r", encoding="utf-8") as f:
+                    old = json.load(f)
+                if isinstance(old, dict):
+                    merged = old
+            except Exception:
+                merged = {}
+            # timing 也要逐键合并,别丢掉用户加的其他 timing 项
+            old_timing = merged.get("timing")
+            if isinstance(old_timing, dict):
+                timing = dict(old_timing)
+                timing.update(cfg["timing"])
+                cfg["timing"] = timing
+            merged.update(cfg)
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                json.dump(merged, f, ensure_ascii=False, indent=2)
         except Exception as e:
             self._emit("", "ERROR", "写入配置失败: {}".format(e))
 

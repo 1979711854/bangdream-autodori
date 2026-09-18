@@ -2,6 +2,7 @@ import argparse
 import datetime
 import json
 import logging
+import os
 import random
 import re
 import string
@@ -482,15 +483,315 @@ def _run_node_once(context, entry: str) -> None:
         logging.warning("run node %s failed: %s", entry, e)
 
 
-def _exit_game_and_stop_task(context) -> None:
-    """关闭游戏并终止当前任务。
+# ---------------------------------------------------------------------------
+# 退出联动:关游戏 → 停任务 → 收尾释放
+#
+# 背景(2026-09-18):火罐为 0 且配置为「退出游戏」时,游戏确实被关掉了,但脚本
+# 仍在挂机 —— 界面一直停在「运行中」,进程不退出。原因是原来的链路全靠**软保证**:
+#   1) `_exit_game_and_stop_task` 只把 need_to_stop 置位,能否真停取决于外层
+#      PipelineTask 是否在下一个节点边界检查到它(动作阻塞期间检查不到);
+#   2) main() 的收尾是 `sys.exit()`,而它只是抛 SystemExit,之后解释器还要
+#      join 所有**非 daemon 线程** —— minitouchpy 的 STDIO 读线程恰好是非
+#      daemon 的,一旦它阻塞在 readline 上,进程就永远退不掉。
+# 这里补一层「状态判定 + 兜底」的联动:后台看门狗盯着"游戏是否还在"和"退出请求
+# 是否被落实",两条都超时就带外 post_stop();最终所有退出路径都汇聚到 _shutdown()
+# 统一释放资源并**硬退出**,不再依赖任何一条软保证。
+# ---------------------------------------------------------------------------
+
+GAME_PACKAGE = "com.bilibili.star.bili"
+
+_EXIT_GRACE_S = 8.0  # 已登记退出请求后,任务仍未结束多久就带外强制停止
+_EXIT_HARD_S = 20.0  # 强制停止后仍不结束,由看门狗直接收尾硬退出
+_GAME_POLL_INTERVAL_S = 2.0  # 看门狗轮询周期
+_GAME_EXIT_GRACE_S = 25.0  # 游戏连续缺席多久判定为「已退出」
+_GAME_QUERY_FAIL_MAX = 3  # 连续多少次查不到设备状态就放弃该项判定
+
+_exit_reason: Optional[str] = None  # 非 None = 已登记退出请求
+_exit_requested_at: float = 0.0
+_exit_stop_forced = False
+_game_seen_running = False  # 见过游戏在跑之后才启用「游戏退出」判定
+_shutting_down = False
+_lifecycle_lock = threading.Lock()
+
+
+def _request_exit(reason: str) -> None:
+    """登记「关掉游戏并停止脚本」的请求(幂等)。
+
+    只登记不执行 —— 真正收尾由 _shutdown() 统一做。这样无论请求来自
+    HandleLiveBoost、HandleLifeExhausted 还是看门狗,收尾路径都只有一条。
+    """
+    global _exit_reason, _exit_requested_at
+    with _lifecycle_lock:
+        if _exit_reason is not None:
+            return
+        _exit_reason = reason
+        _exit_requested_at = time.time()
+    logging.info("已请求退出: %s", reason)
+
+
+def _force_post_stop() -> None:
+    """带外请求 MaaFramework 停止当前任务。
+
+    need_to_stop 是节点边界的软检查,遇到阻塞中的动作(打歌循环、OCR 超时)不会
+    生效;post_stop 由框架置位,是最后一道保险。
+    """
+    try:
+        if maatasker.inited:
+            maatasker.post_stop()
+    except Exception as e:
+        logging.warning("post_stop 失败: %s", e)
+
+
+def _adb_shell(args: list, timeout: float = 6.0) -> Optional[str]:
+    """在设备上执行一条 shell 命令;查不到(设备掉线/adb 报错)返回 None。
+
+    返回 None 与「命令成功但输出为空」必须区分开:前者不能用来推断"进程不存在",
+    否则一次 adb 抖动就会把脚本误停。
+    """
+    if device is None:
+        return None
+    cmd = [str(device.adb_path), "-s", str(device.address), "shell"] + list(args)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        logging.debug("adb 查询失败 %s: %s", args, e)
+        return None
+    err = (proc.stderr or "").strip()
+    if proc.returncode not in (0, 1) or err:
+        logging.debug(
+            "adb 查询异常 %s: rc=%s err=%s", args, proc.returncode, err[:200]
+        )
+        return None
+    return proc.stdout or ""
+
+
+def _game_process_running() -> Optional[bool]:
+    """游戏进程是否存活。None = 本次查不到,不参与判定。"""
+    out = _adb_shell(["pidof", GAME_PACKAGE])
+    if out is None:
+        return None
+    return bool(out.strip())
+
+
+def _wait_game_exit(timeout: float) -> bool:
+    """轮询确认游戏进程已消失,返回是否确认到。
+
+    关掉游戏后立刻查 pidof 会命中「正在退出」的进程,所以要轮询 —— 这一步就是
+    用户要的「检测到游戏已退出」,有了确认结论,后面的停止才有依据。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = _game_process_running()
+        if state is False:
+            return True
+        if state is None:
+            # 查询本身不可用(设备掉线 / adb 报错):不空等。停止脚本这件事不依赖
+            # 这个确认结论 —— 后面还有看门狗和统一收尾兜底。
+            return False
+        time.sleep(0.4)
+    return False
+
+
+def _stop_on_game_exit() -> bool:
+    """data/config.yml 的 stop_when_game_exits(默认 true)。
+
+    关掉它 = 保留旧行为(游戏没了也让 bot 靠 start_app 自愈)。
+    """
+    value = _runtime_config().get("stop_when_game_exits", True)
+    return bool(value) if isinstance(value, bool) else True
+
+
+def _release_minitouch() -> None:
+    """停掉 minitouch,并杀掉它的子进程、关掉管道。
+
+    关管道是必须的:minitouchpy 的 STDIO 读线程是**非 daemon** 线程,阻塞在
+    `p.stderr.readline()` 上。只要管道没关,解释器退出时就会一直等它 ——
+    进程永远退不掉,表现正是「脚本不自动停止」。
+    """
+    global mnt
+    target, mnt = mnt, None
+    if target is None:
+        return
+    try:
+        target.stop()
+    except Exception as e:
+        logging.debug("mnt.stop 失败: %s", e)
+    proc = getattr(target, "mnt_process", None)
+    if proc is None:
+        return
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    for stream in (
+        getattr(proc, "stdin", None),
+        getattr(proc, "stdout", None),
+        getattr(proc, "stderr", None),
+    ):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+def _shutdown(exit_code: int = 0, reason: str = "") -> None:
+    """统一收尾:停任务 → 释放 minitouch → 释放 MaaFramework → 刷日志 → 硬退出。
+
+    所有退出路径(正常结束 / 火罐不足 / 生命耗尽 / 失败超限 / 看门狗 / 异常)都
+    汇聚到这里,保证资源一定被释放,且**一定真的退出**。用 os._exit 而不是
+    sys.exit:后者只是抛 SystemExit,之后解释器还要 join 非 daemon 线程,卡住就
+    再也退不出来。本函数不会返回。
+    """
+    global _shutting_down, maacontroller, current_player
+    with _lifecycle_lock:
+        if _shutting_down:
+            return
+        _shutting_down = True
+    try:
+        logging.info("脚本收尾: %s", reason or "正常结束")
+    except Exception:
+        pass
+
+    _force_post_stop()
+    # 给框架一点时间把任务/控制器线程收干净。这只是"体面退出"的余量, 拿不到也
+    # 不影响正确性 —— 后面一定会 os._exit。实测 post_stop 会新投递一个 stop 任务,
+    # 所以 running 往往要等到停止任务被消费才转 False, 别把等待设长。
+    t_wait = time.time()
+    deadline = t_wait + 3.0
+    while time.time() < deadline:
+        try:
+            if not maatasker.running:
+                break
+        except Exception:
+            break
+        time.sleep(0.2)
+    logging.debug("框架收尾等待 %.2fs", time.time() - t_wait)
+
+    _release_minitouch()
+
+    # 显式放掉框架对象,触发 MaaControllerDestroy / MaaTaskerDestroy(正常析构会
+    # 断开 adb 并关掉 maa.log);放不掉也无所谓 —— 下面马上硬退出。
+    try:
+        maatasker._controller_holder = None
+        maacontroller = None
+        current_player = None
+        import gc as _gc
+
+        _gc.collect()
+    except Exception as e:
+        logging.debug("释放框架对象失败: %s", e)
+
+    # os._exit 会跳过 atexit,而 atexit 里挂着 timeEndPeriod(1) —— 手动补一次,
+    # 别把系统时钟粒度留在 1ms。
+    try:
+        import ctypes
+
+        ctypes.windll.winmm.timeEndPeriod(1)
+    except Exception:
+        pass
+
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(exit_code)
+
+
+def _exit_watchdog_loop() -> None:
+    global _game_seen_running, _exit_stop_forced
+    absent_since = None
+    query_fails = 0
+    while not _shutting_down:
+        time.sleep(_GAME_POLL_INTERVAL_S)
+        if _shutting_down:
+            return
+        try:
+            task_running = maatasker.running
+        except Exception:
+            task_running = False
+
+        # 1) 已登记退出请求,任务却迟迟不结束 → 带外强制停止;再拖就直接收尾。
+        if _exit_reason and task_running:
+            age = time.time() - _exit_requested_at
+            if age >= _EXIT_HARD_S:
+                logging.error("强制停止后任务仍未结束,直接收尾退出")
+                _shutdown(0, "退出请求超时,看门狗强制收尾")
+                return
+            if age >= _EXIT_GRACE_S and not _exit_stop_forced:
+                _exit_stop_forced = True
+                logging.warning(
+                    "退出请求 %.1fs 后任务仍未结束(%s),强制停止", age, _exit_reason
+                )
+                _force_post_stop()
+            continue
+
+        # 2) 游戏存活监测:见过游戏在跑之后,长时间查不到就认定它已退出。
+        if not _stop_on_game_exit():
+            continue
+        state = _game_process_running()
+        if state is None:
+            query_fails += 1
+            if query_fails == _GAME_QUERY_FAIL_MAX:
+                logging.debug("连续查不到设备状态,暂停游戏存活判定")
+            continue
+        query_fails = 0
+        if state:
+            _game_seen_running = True
+            absent_since = None
+            continue
+        if not _game_seen_running:
+            # 启动阶段游戏本来就还没起来(接下来靠 start_app 拉起),不能判退出
+            continue
+        if absent_since is None:
+            absent_since = time.time()
+            continue
+        gap = time.time() - absent_since
+        if gap >= _GAME_EXIT_GRACE_S:
+            logging.warning("游戏已退出(连续 %.0fs 未检测到进程),停止脚本", gap)
+            _game_seen_running = False
+            _request_exit("游戏已退出")
+            _force_post_stop()
+
+
+def _start_exit_watchdog() -> None:
+    """启动退出看门狗。daemon 线程,不会拖住进程退出。"""
+    threading.Thread(
+        target=_exit_watchdog_loop, name="exit-watchdog", daemon=True
+    ).start()
+
+
+def _exit_game_and_stop_task(context, reason: str = "退出游戏") -> None:
+    """关闭游戏并终止当前任务,同时登记退出请求。
 
     "stop" 节点是 StopTask,它的作用是把**当前 Context** 的 need_to_stop
     置位;而 run_action 与外层任务共享同一个 Context(getptr()),外层
     PipelineTask 会在下一个节点边界检查到该标志并直接正常返回,任务随即
     结束,不会继续走 next / on_error。
+
+    这条链是软保证(见上方注释),所以这里额外做两件事:关掉游戏后轮询确认它
+    真的退出了;登记退出请求 —— 看门狗发现任务不结束会强制 post_stop,再由
+    _shutdown() 收尾硬退出。
     """
+    global _game_seen_running
+    _request_exit(reason)
     _run_node_once(context, "close_app")
+    if _wait_game_exit(6.0):
+        logging.info("游戏已退出,停止脚本")
+        _game_seen_running = False
+    else:
+        logging.warning("关闭游戏后未确认到进程消失,仍继续停止脚本")
     _run_node_once(context, "stop")
 
 
@@ -515,7 +816,7 @@ class HandleLiveBoost(CustomAction):
                 # start_app(无 recognition = 必定命中)把游戏重新拉起来,
                 # 表现为「退出游戏后又自动重启」。
                 logging.info("Live boost not enough, ready to exit")
-                _exit_game_and_stop_task(context)
+                _exit_game_and_stop_task(context, "火罐不足,按配置退出游戏")
                 return CustomAction.RunResult(False)
         return CustomAction.RunResult(True)
 
@@ -531,6 +832,9 @@ class HandleLifeExhausted(CustomAction):
             # life_exhausted_confirm 现在恰好也配了 on_error("stop"),但那是巧合;
             # 一旦上游 next/on_error 被改动就会退化成沿 next("main")继续打歌)。
             logging.info("生命值耗尽,已退出到主页,等待手动操作")
+            # 登记退出请求:stop 走的是 need_to_stop 软检查,万一没落实,
+            # 看门狗会在 8s 后强制 post_stop 并走统一收尾。
+            _request_exit("生命值耗尽,等待手动操作")
             _run_node_once(context, "stop")
             return CustomAction.RunResult(False)
         logging.info("生命值耗尽,自动继续打歌")
@@ -626,7 +930,7 @@ class SavePlayResult(CustomAction):
                 logging.debug("No song selected, skip saving play result")
             if play_failed_times >= MAX_FAILED_TIMES:
                 logging.error("Failed attempts exceed max failed times, stop")
-                _exit_game_and_stop_task(context)
+                _exit_game_and_stop_task(context, "演出失败次数超限")
                 return CustomAction.RunResult(False)
             return CustomAction.RunResult(True)
         except Exception as e:
@@ -1529,6 +1833,10 @@ def _log_environment():
             "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
             gate, life, boost, DIFFICULTY, LIVEMODE,
         )
+        logging.info(
+            "退出联动: 游戏退出自动停止=%s, 退出请求宽限=%.0fs, 游戏缺席判定=%.0fs",
+            _stop_on_game_exit(), _EXIT_GRACE_S, _GAME_EXIT_GRACE_S,
+        )
         # 环境自检: 音频禁用/电源计划/帧率/内存 等会直接造成漂移或掉判定的项
         try:
             findings = envcheck.check(emu_path)
@@ -1604,11 +1912,19 @@ def main():
     init_player_and_mnt()
     _log_environment()
 
-    maatasker.post_task(entry, _get_override_pipeline()).wait().get()
-
-    mnt.stop()
-    logging.debug("Ready to exit")
-    sys.exit()
+    # 退出看门狗:关游戏/停任务任何一条链没落实都由它兜底,保证脚本一定停。
+    _start_exit_watchdog()
+    try:
+        maatasker.post_task(entry, _get_override_pipeline()).wait().get()
+    except KeyboardInterrupt:
+        logging.info("收到中断信号,准备退出")
+    except Exception as e:
+        logging.exception("任务异常结束: %s", e)
+    finally:
+        # 收尾只有这一条路径:释放 minitouch/MAA 并硬退出(_shutdown 不返回)。
+        # 用 finally 保证异常路径也走收尾 —— 旧写法 mnt.stop() 在异常时会被跳过。
+        logging.debug("Ready to exit")
+        _shutdown(0, _exit_reason or "任务结束")
 
 
 if __name__ == "__main__":
