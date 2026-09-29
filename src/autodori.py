@@ -54,6 +54,15 @@ from util import *
 MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
 DIFFICULTY = "hard"
+# ---- 超高难度 SPECIAL 活动(限时单曲) ----
+# 活动入口由玩家手动进入:玩家把界面停在「开演前的确认页」,脚本从那里接管
+# (见 assets/resource/pipeline/special.json 的 special_wait),打完固定的
+# **一首**就收尾停止。曲目与难度都固定,所以整条流程不选曲、不选难度 —— 这是
+# 与常规挖矿流程唯一的实质差别。SPECIAL_MODE 由 `--mode special` 打开。
+SPECIAL_MODE = False
+# 默认曲目:简中客户端标题(曲库 musicTitle 下标 3)。也可写纯数字曲目 id,
+# 见 resolve_special_song()。换活动批次时改这里或 GUI 下拉。
+DEFAULT_SPECIAL_SONG = "[超高难易度 新SPECIAL] SENSENFUKOKU"
 OFFSET = {"up": 0, "down": 0, "move": 0, "wait": 0.0, "interval": 0.0}
 PHOTOGATE_LATENCY = 30
 DEFAULT_MOVE_SLICE_SIZE = 10
@@ -841,6 +850,107 @@ class HandleLifeExhausted(CustomAction):
         return CustomAction.RunResult(True)
 
 
+# ---------------------------------------------------------------------------
+# 超高难度 SPECIAL 活动(限时单曲)
+#
+# 与常规打歌的差别只在「怎么走到开演前」这一段:曲目固定、难度固定 SPECIAL、
+# 不做选曲。玩家手动进入活动并把界面停在开演前的确认页,脚本从 special_wait
+# 开始轮询(assets/resource/pipeline/special.json):认到「演出开始」就点,
+# 认到标准确认 / OK 就先点掉,认到暂停键说明歌已经开始,直接接管打谱面。
+# 打完一首即收尾停止,不做循环。
+# ---------------------------------------------------------------------------
+_SPECIAL_IDLE_WARN_INTERVAL_S = 15.0
+_special_idle_since: Optional[float] = None
+_special_idle_warned_at: float = 0.0
+
+#: 收尾时在得分界面找「确定」的轮数与间隔(得分界面会先播一段分数动画)
+_SPECIAL_FINISH_ROUNDS = 8
+_SPECIAL_FINISH_INTERVAL_S = 0.8
+
+
+@maaresource.custom_action("SpecialIdle")
+class SpecialIdle(CustomAction):
+    """special_wait 的兜底节点:画面上没有任何已知按钮时在这里空转。
+
+    必须是 DirectHit 节点(无 recognition = 必定命中),并放在 next 列表**最后**
+    一位 —— 否则整条 next 全不命中时任务会被判失败直接终止。周期性打日志,让
+    「一直等不到界面」这件事在日志里可见,而不是静默卡住。
+    """
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        global _special_idle_since, _special_idle_warned_at
+        now = time.time()
+        if _special_idle_since is None:
+            _special_idle_since = now
+            logging.info(
+                "超高难度活动:开始等待演出界面,请确认游戏已停在开演前的确认页"
+            )
+        if now - _special_idle_warned_at >= _SPECIAL_IDLE_WARN_INTERVAL_S:
+            _special_idle_warned_at = now
+            logging.warning(
+                "超高难度活动:本次已等待 %.0fs 仍未识别到「演出开始」/确认按钮,"
+                "请检查游戏界面",
+                now - _special_idle_since,
+            )
+        return CustomAction.RunResult(True)
+
+
+@maaresource.custom_action("SpecialFinish")
+class SpecialFinish(CustomAction):
+    """活动单曲打完之后收尾:在得分界面点「确定」,再交给 next("stop") 结束任务。
+
+    得分界面(活动版)右下角并排两个键:「再次演出」与「确定」。实测
+    `live/button/liveagain.png` 在「再次演出」上命中 **0.9962**,
+    `common/button/confirm/pink.png` 在「确定」上命中 **0.9981** —— 也就是说
+    常规流程那套 `next:[event_reward_confirm, liveagain, live_home_button]`
+    会直接点「再次演出」回到选曲页,与「打完一首就停」冲突。所以这里必须
+    显式点「确定」。
+
+    点击优先级:确定 → 下一步/OK/关闭 → 获得报酬弹窗兜底。**第一个成功的点击就
+    收工** —— 需求是「点确定然后停」,不是替用户把后续界面全走完。
+
+    节点本身**不配 on_error**:MAA 里同一节点的 next / on_error 出现重复元素会让
+    整份 pipeline 失效(项目里已验证过),而这里两者都只能指向 "stop"。动作内部
+    已把所有异常吞掉并始终返回 True,真出意外也是任务正常结束收场。
+    """
+
+    #: 按优先级依次尝试,第一个命中即点,点完立即收尾
+    BUTTONS = (
+        "confirm_button",        # 得分界面的「确定」(实测 0.9981)
+        "next_button",           # 「下一步」,其它版本的结算页
+        "ok_button",
+        "close_button",
+        "event_reward_confirm",  # 「获得报酬」弹窗,若挡在确定前面先点掉
+    )
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        logging.info("超高难度活动:本首已结束,收尾(点确定后停止)")
+        clicked = None
+        idle_rounds = 0
+        for _ in range(_SPECIAL_FINISH_ROUNDS):
+            for node in self.BUTTONS:
+                try:
+                    detail = context.run_action(node)
+                except Exception as e:
+                    logging.debug("special finish run %s failed: %s", node, e)
+                    continue
+                # run_action 认不到时返回 None;只有真执行了动作才算点过
+                if detail is not None and getattr(detail, "completed", False):
+                    logging.info("活动收尾: 已点击 %s", node)
+                    clicked = node
+                    break
+            if clicked:
+                break
+            idle_rounds += 1
+            if idle_rounds >= 2:
+                break
+            # 得分界面会先播分数动画,按钮可能晚一两轮才出现
+            time.sleep(_SPECIAL_FINISH_INTERVAL_S)
+        if not clicked:
+            logging.info("超高难度活动:得分界面未出现可点按钮,直接停止")
+        return CustomAction.RunResult(True)
+
+
 @maaresource.custom_recognition("PlayResultRecognition")
 class PlayResultRecognition(CustomRecognition):
     def analyze(
@@ -1107,6 +1217,38 @@ def fuzzy_match_song(name, other_names=()):
     return (hit[0], hit[1]) if hit is not None else None
 
 
+def resolve_special_song(name: str) -> Optional[tuple]:
+    """「超高难度活动」配置的曲目 -> (标题, 曲目 id)。解析不出返回 None。
+
+    取值允许两种写法:
+      * 纯数字 —— 直接当 Bestdori 曲目 id 用;
+      * 标题 —— NFKC 归一后与曲库索引精确匹配(简中、日文标题都在索引里)。
+
+    **刻意不做模糊匹配**:这是用户写死在配置里的固定曲目,匹配错就是整首按错
+    谱面打完全程。解析不出来宁可让脚本拒绝启动并打出提示,也绝不猜。
+    """
+    raw = (name or "").strip()
+    if not raw:
+        return None
+
+    if raw.isdigit():
+        sid = str(int(raw))
+        if sid in all_songs:
+            titles = [t for t in (all_songs[sid].get("musicTitle") or []) if t]
+            return (titles[0] if titles else sid, sid)
+        logging.error("超高难度活动:曲目 id %s 不在曲库中", sid)
+        return None
+
+    key = _normalize_title(raw)
+    for title, sid in all_song_name_indexes.items():
+        if _normalize_title(title) == key:
+            return (title, sid)
+    logging.error(
+        "超高难度活动:曲名 %r 不在曲库中(标题需与曲库一致,或直接写曲目 id)", raw
+    )
+    return None
+
+
 def _get_orientation():
     """
     0, 1, 2, 3
@@ -1157,6 +1299,30 @@ def save_song(name):
     current_chart.actions_to_MNTcmd(
         (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
     )
+
+
+def _prepare_special_song(cli_value: str) -> None:
+    """超高难度活动:解析并预加载那唯一一张谱面。
+
+    必须在 post_task 之前算好 —— 常规流程是选歌节点 OCR 出曲名后才调
+    save_song();活动模式没有选歌步骤,曲目只能来自配置。提前算还顺带把
+    5~15s 的谱面解算挪到开演之前,不会拖到「玩家已经进入活动」之后才开始。
+    """
+    global _resolved_song_id
+    raw = (
+        (cli_value or "").strip()
+        or str(_runtime_config().get("special_song", "") or "").strip()
+        or DEFAULT_SPECIAL_SONG
+    )
+    resolved = resolve_special_song(raw)
+    if resolved is None:
+        logging.error("超高难度活动:无法解析曲目 %r,停止", raw)
+        _shutdown(1, "超高难度活动曲目无效")
+    title, sid = resolved
+    # 先落 _resolved_song_id,save_song 才会采信这个 id(同名曲目标题反查不到唯一 id)
+    _resolved_song_id = (title, sid)
+    logging.info("超高难度活动:曲目 %s (#%s),难度 %s", title, sid, DIFFICULTY)
+    save_song(title)
 
 
 def _reload_photogate():
@@ -1705,6 +1871,55 @@ def configure_log():
 def _get_override_pipeline():
     all_pipelines = {}
 
+    if SPECIAL_MODE:
+        # 超高难度活动:曲目与难度都固定,不需要 set_difficulty / select_live_mode。
+        # 只把「打完之后去哪」这三处从"回选歌继续挖矿"改写成"收尾并停止"。
+        # 三处都给**完整节点定义**(不依赖框架的字段级合并语义),其中
+        # wait_playresult / save_succeed_playresult 的其余字段与 live.json 逐字一致。
+        all_pipelines["wait_playresult"] = {
+            "recognition": "TemplateMatch",
+            "template": ["live/scored.png", "live/activity_scored.png"],
+            "next": "wait_playresult1",
+            "pre_wait_freezes": {"threshold": 0.65, "time": 1500},
+            # 原值还带 next_button/close_button/ok_button/confirm_button:
+            # 活动得分界面右下角就是「再次演出 + 确定」,而 confirm/pink 在该「确定」上
+            # 实测命中 0.9981 —— 留着这些按钮会把「点确定」从 SpecialFinish 手里抢走,
+            # 变成框架行为不可预期。活动模式下只保留失败识别。
+            "interrupt": ["live_failed"],
+            "post_delay": 1000,
+            # 认不出结算页时不要按"演出失败"落库(那会写进一条假战绩),
+            # 直接走收尾:点掉可能的弹窗后停止。
+            "on_error": ["special_finish"],
+        }
+        all_pipelines["save_succeed_playresult"] = {
+            "recognition": "Custom",
+            "custom_recognition": "PlayResultRecognition",
+            "action": "Custom",
+            "custom_action": "SavePlayResult",
+            "custom_action_param": {"succeed": True},
+            # 原值是 [event_reward_confirm, liveagain, live_home_button]:
+            # liveagain 会"再次演出"、live_home_button 会回到自由演出首页,
+            # 都与"打完一首就停"冲突。奖励弹窗改由 SpecialFinish 里显式点掉。
+            "next": ["special_finish"],
+            # 同样清掉按钮类 interrupt,保证「点确定」只由 SpecialFinish 执行一次。
+            "interrupt": [],
+        }
+        all_pipelines["handle_life_exhausted"] = {
+            "action": "Custom",
+            "custom_action": "HandleLifeExhausted",
+            # 原值 next="main" 会掉回自由演出的选歌流程,活动模式下必须收尾停止。
+            # 这里走 special_stop(空节点,只 next 到 "stop")而**不是** special_finish:
+            # 演出失败时画面上是失败弹窗(退出/放弃),让 SpecialFinish 去盲点粉色按钮
+            # 可能点到"重试";而失败弹窗此时已被 life_exhausted_exit/confirm 点掉,
+            # 直接停即可。
+            # 注意 on_error 不能也写 "stop":MAA 的 check_all_next_list 会把
+            # next/interrupt/on_error 三个列表并起来查重,重复即**整份资源加载失败**
+            # (已用 _diag_duprule.py 实证)。
+            "next": ["special_stop"],
+            "on_error": ["stop"],
+        }
+        return all_pipelines
+
     # set_difficulty
     difficulty: str = DIFFICULTY
     roi = {
@@ -1831,8 +2046,11 @@ def _log_environment():
         )
         logging.info(
             "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
-            gate, life, boost, DIFFICULTY, LIVEMODE,
+            gate, life, boost, DIFFICULTY,
+            "超高难度SPECIAL活动(固定单曲, 打完即停)" if SPECIAL_MODE else LIVEMODE,
         )
+        if SPECIAL_MODE:
+            logging.info("活动曲目: %s (#%s)", current_song_name or "?", current_song_id or "?")
         logging.info(
             "退出联动: 游戏退出自动停止=%s, 退出请求宽限=%.0fs, 游戏缺席判定=%.0fs",
             _stop_on_game_exit(), _EXIT_GRACE_S, _GAME_EXIT_GRACE_S,
@@ -1863,8 +2081,11 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["main"],
-        help="Specify the mode to run",
+        choices=["main", "special"],
+        help=(
+            "Specify the mode to run. 'main' = 常规挖矿;"
+            "'special' = 超高难度 SPECIAL 活动(固定单曲,玩家手动进入后接管)"
+        ),
         default="main",
     )
     parser.add_argument(
@@ -1888,28 +2109,43 @@ def main():
         help="Specify the min liveboost for main mode. If current liveboost is lower than this value, the script will exit.",
     )
     parser.add_argument(
+        "--special-song",
+        type=str,
+        default="",
+        help=(
+            "超高难度活动(--mode special)要打的曲目:曲库标题或 Bestdori 曲目 id。"
+            "留空则读 data/config.yml 的 special_song,再退回内置默认值。"
+        ),
+    )
+    parser.add_argument(
         "--skip-version-check",
         action="store_true",
         help="Specify if skip version check",
     )
     args = parser.parse_args()
 
-    if args.mode == "main":
-        entry = "main"
-    else:
-        sys.exit(1)
-
     if not args.skip_version_check:
         get_current_version()
         if current_version != None:
             check_update()
 
-    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE
-    DIFFICULTY = args.difficulty
+    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE
+    if args.mode == "special":
+        # 活动曲固定按 SPECIAL 谱面打;入口节点是 special_wait(不是 main),
+        # 因为整条流程不做选曲 —— 见 assets/resource/pipeline/special.json。
+        SPECIAL_MODE = True
+        DIFFICULTY = "special"
+        entry = "special_wait"
+    else:
+        SPECIAL_MODE = False
+        DIFFICULTY = args.difficulty
+        entry = "main"
     LIVEMODE = args.livemode
     MIN_LIVEBOOST = args.liveboost
     init_maa()
     init_player_and_mnt()
+    if SPECIAL_MODE:
+        _prepare_special_song(args.special_song)
     _log_environment()
 
     # 退出看门狗:关游戏/停任务任何一条链没落实都由它兜底,保证脚本一定停。

@@ -1,0 +1,110 @@
+{
+    "special_wait": {
+        "next": [
+            "special_click_start",
+            "special_click_start_ocr",
+            "special_click_confirm",
+            "special_click_ok",
+            "special_click_next",
+            "special_click_close",
+            "special_song_running",
+            "special_idle"
+        ],
+        "interrupt": [
+            "login_expired",
+            "connect_failed"
+        ]
+    },
+    "special_click_start": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/startlive.png",
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 2000,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_click_start_ocr": {
+        "recognition": "OCR",
+        "expected": [
+            "演出开始",
+            "开始演出"
+        ],
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_click_confirm": {
+        "recognition": "TemplateMatch",
+        "template": [
+            "common/button/confirm/pink.png",
+            "common/button/confirm/white.png"
+        ],
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_click_ok": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/ok/white.png",
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_click_next": {
+        "recognition": "OCR",
+        "expected": "下一步",
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_click_close": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/close/white.png",
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_song_running": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/pause.png",
+        "threshold": 0.8,
+        "next": [
+            "playsong"
+        ]
+    },
+    "special_idle": {
+        "action": "Custom",
+        "custom_action": "SpecialIdle",
+        "post_delay": 400,
+        "next": [
+            "special_wait"
+        ]
+    },
+    "special_stop": {
+        "next": [
+            "stop"
+        ]
+    },
+    "special_finish": {
+        "action": "Custom",
+        "custom_action": "SpecialFinish",
+        "next": [
+            "stop"
+        ]
+    }
+}

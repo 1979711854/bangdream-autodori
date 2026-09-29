@@ -346,7 +346,13 @@ def test_ambiguous_resolution():
 
 def test_index_integrity():
     print("\n[6] 索引完整性")
-    check(len(AMBIGUOUS) == 8, "全曲库重名标题 %d 组(预期 8)" % len(AMBIGUOUS))
+    # 不钉死数量:曲库会随 Bestdori 更新长大 —— 2026-09-29 新增的超高难度谱面
+    # (`[超高难易度 新SPECIAL] HELL! or HELL?` → 486/597、`…六兆年と一夜物語`
+    # → 487/598,简中标题与日文标题字符串相同)让重名组从 8 变成 9。
+    # 这里只断言"下限 + 结构",避免曲库一变就报假失败。
+    check(len(AMBIGUOUS) >= 8, "全曲库重名标题 %d 组(预期 >=8)" % len(AMBIGUOUS))
+    check(all(len(ids) > 1 for ids in AMBIGUOUS.values()),
+          "每个重名组都至少含 2 个条目")
     for title, ids in AMBIGUOUS.items():
         default = INDEX.get(title)
         check(

@@ -43,6 +43,14 @@ BUILD_META = os.path.join(BASE, "assets", "build_metadata.json")
 # 演出模式仅支持自由演出,禁止协力模式(challengelive)
 LIVE_MODE = "freelive"
 DIFFICULTIES = ["easy", "normal", "hard", "expert", "special"]
+# 超高难度 SPECIAL 活动(限时单曲):曲目固定、难度固定 SPECIAL、不打循环。
+# 标题写法必须与曲库一致(简中客户端标题),也可直接填 Bestdori 曲目 id。
+SPECIAL_SONGS = (
+    "[超高难易度 新SPECIAL] SENSENFUKOKU",
+    "[超高难易度 新SPECIAL] 六兆年と一夜物語",
+    "[超高难易度 新SPECIAL] HELL! or HELL?",
+)
+DEFAULT_SPECIAL_SONG = SPECIAL_SONGS[0]
 # 打歌策略:显示名 → 写入 data/config.yml 的 song_strategy 值
 SONG_STRATEGIES = ("挖矿为主", "随机选歌")
 STRATEGY_TO_CFG = {"挖矿为主": "mine", "随机选歌": "random"}
@@ -54,7 +62,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -75,6 +83,7 @@ PLAY_RE = re.compile(r"打歌:\s*(.+?)\s*\(#\d+-\w+\)")
 OPTION_TREE = (
     ("演出", (
         ("live.show", "演出设置", "live"),
+        ("live.special", "超高难度活动", "live"),
         ("live.gate", "时基校准", "settings"),
     )),
     ("运行", (
@@ -283,6 +292,10 @@ class AutodoriGUI:
         self.song_strategy = cfg.get("song_strategy", "挖矿为主")
         if self.song_strategy not in SONG_STRATEGIES:
             self.song_strategy = "挖矿为主"
+        # 超高难度活动是独立配置,刻意不共用上面的难度/策略(它是固定单曲 SPECIAL)
+        self.special_song = cfg.get("special_song", DEFAULT_SPECIAL_SONG)
+        if not str(self.special_song).strip():
+            self.special_song = DEFAULT_SPECIAL_SONG
         self.gate = self._read_gate()
 
         T.set_theme(self.theme)
@@ -315,6 +328,7 @@ class AutodoriGUI:
             "life_mode": self.life_mode,
             "auto_cal": bool(self.auto_cal),
             "song_strategy": self.song_strategy,
+            "special_song": self.special_song,
         }
         try:
             os.makedirs(os.path.dirname(GUI_CONFIG), exist_ok=True)
@@ -478,6 +492,9 @@ class AutodoriGUI:
     def _render_view(self):
         for child in self.host.winfo_children():
             child.destroy()
+        # 卡片里的控件随重建被销毁,必须先清掉引用 —— 否则 _sync_run_state 会去
+        # 操作已销毁的控件并抛 TclError,连带把 _render_view 打断。
+        self.special_start_btn = None
         for key, item in self.nav_items.items():
             item.select(key == self.view)
 
@@ -559,6 +576,8 @@ class AutodoriGUI:
         """按当前选项渲染对应的设置卡片。"""
         if self.view == "live.show":
             return self._detail_show(master)
+        if self.view == "live.special":
+            return self._detail_special(master)
         if self.view == "live.gate":
             return self._detail_gate(master)
         if self.view == "logs":
@@ -608,6 +627,56 @@ class AutodoriGUI:
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(10, 0))
         return card
+
+    def _detail_special(self, master):
+        """超高难度 SPECIAL 活动(hard-coded 单曲,独立于自由演出配置)。
+
+        这个模式的接管点很窄:玩家手动进入活动、把界面停在「选择乐队」页
+        (右下角有「演出开始」按钮那一页),脚本只负责补点开演,然后按固定谱面
+        打这一首,打完停在结算页并点掉「确定」,随即停止。
+        """
+        th = T.get()
+        card = W.Card(master)
+        W.SectionTitle(card.body, "超高难度 SPECIAL 活动",
+                       "限时单曲 · 固定难度 SPECIAL").pack(fill="x", pady=(0, 12))
+
+        r = W.Row(card.body, "曲目")
+        r.pack(fill="x", pady=(0, 6))
+        # 活动曲目标题很长(「[超高难易度 新SPECIAL] 曲名」),方框按可用宽度撑开
+        W.DropdownBox(r.slot, SPECIAL_SONGS, value=self.special_song,
+                      width=640, min_width=560,
+                      on_change=self._on_special_song).pack(side="left")
+        tk.Label(card.body,
+                 text="曲目与难度由活动固定,不参与自由演出的抽歌/挖矿逻辑",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w", pady=(0, 14))
+
+        tk.Label(card.body, text="操作步骤", bg=th["surface"], fg=th["text_2"],
+                 font=T.font(self.font_size, "bold")).pack(anchor="w")
+        for i, line in enumerate((
+            "1. 在游戏里手动进入到「选择乐队」界面(选好乐队,停在右下角「演出开始」按钮那一页)",
+            "2. 回到 GUI 点击下面的「开始(超高难度活动)」,脚本会接管开演",
+            "3. 打完歌后会停在结算页面,不会继续下一首(点「确定」后脚本自动停止)",
+        ), 1):
+            tk.Label(card.body, text=line, bg=th["surface"], fg=th["text_2"],
+                     font=T.font(self.font_size - 1),
+                     anchor="w", justify="left").pack(anchor="w", pady=(6 if i == 1 else 2, 0))
+
+        tk.Label(card.body,
+                 text="注意:GUI 右上角的「开始演出」按钮走的是常规自由演出,与本页无关",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w", pady=(14, 8))
+
+        self.special_start_btn = W.PushButton(
+            card.body, "开始(超高难度活动)",
+            command=lambda: self.start(mode="special"),
+            kind="primary", width=200, height=36)
+        self.special_start_btn.pack(anchor="w", pady=(0, 4))
+        return card
+
+    def _on_special_song(self, value):
+        self.special_song = value
+        self._save_gui_config()
 
     def _detail_gate(self, master):
         th = T.get()
@@ -1015,7 +1084,12 @@ class AutodoriGUI:
         self._set_cal("photogate 已恢复为默认 30ms")
 
     # ---------- start / stop ----------
-    def start(self):
+    def start(self, mode="main"):
+        """拉起 bot。mode="main" 走常规挖矿;mode="special" 走超高难度活动。
+
+        两种模式各由界面上的不同按钮触发(顶栏「开始演出」= main,超高难度
+        活动卡片里的按钮 = special),不做"看当前页面猜模式"的隐式分流。
+        """
         if self.proc is not None and self.proc.poll() is None:
             messagebox.showwarning("已在运行", "bot 已在运行,请先停止。")
             return
@@ -1031,20 +1105,28 @@ class AutodoriGUI:
             self.gate_step.commit()
         self._write_config()
 
+        if mode == "special":
+            # 活动曲固定 SPECIAL 难度、由 bot 自己从曲库解析曲目,不走选歌流程
+            bot_args = ["--mode", "special",
+                        "--special-song", str(self.special_song)]
+        else:
+            bot_args = ["--mode", "main", "--difficulty", str(self.difficulty),
+                        "--livemode", str(LIVE_MODE)]
+
         if getattr(sys, "frozen", False):
             bot = os.path.join(BASE, "autodori.exe")
             if not os.path.exists(bot):
                 messagebox.showerror("环境缺失", "找不到 {},请放在同目录".format(bot))
                 return
-            cmd = [bot, "--mode", "main", "--difficulty", self.difficulty,
-                   "--livemode", LIVE_MODE]
+            cmd = [bot] + bot_args
         else:
             if not os.path.exists(PYTHON):
                 messagebox.showerror("环境缺失", "找不到 {}".format(PYTHON))
                 return
-            cmd = [PYTHON, SCRIPT, "--mode", "main",
-                   "--difficulty", self.difficulty, "--livemode", LIVE_MODE]
-        self._emit("", "INFO", ">>> " + " ".join(cmd))
+            cmd = [PYTHON, SCRIPT] + bot_args
+        # 每个元素都过一遍 str():命令里混进 int 会让 " ".join() 直接抛异常,
+        # 表现为"点开始演出没反应、界面不报错"(踩过一次)。
+        self._emit("", "INFO", ">>> " + " ".join(str(x) for x in cmd))
         # 隐藏 bot 子进程的控制台窗口(双保险)
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
@@ -1205,6 +1287,12 @@ class AutodoriGUI:
             self.start_btn.set_enabled(not running)
         if getattr(self, "stop_btn", None):
             self.stop_btn.set_enabled(running)
+        if getattr(self, "special_start_btn", None):
+            try:
+                if self.special_start_btn.winfo_exists():
+                    self.special_start_btn.set_enabled(not running)
+            except Exception:
+                pass
         if getattr(self, "run_dot", None):
             self.run_dot.set(th["ok"] if running else th["idle"])
         if getattr(self, "run_state", None):
@@ -1263,6 +1351,9 @@ class AutodoriGUI:
             "on_life_exhausted": life,
             "play_at_zero_boost": play_at_zero,
             "song_strategy": STRATEGY_TO_CFG.get(self.song_strategy, "mine"),
+            # 活动曲目也落一份到运行配置:直接手跑
+            # `python src/autodori.py --mode special` 时能沿用界面里选的那首
+            "special_song": str(self.special_song),
         }
         try:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
