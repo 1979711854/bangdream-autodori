@@ -55,7 +55,7 @@ def load_toplevel(path):
 # 1. resolve_special_song 真跑
 # --------------------------------------------------------------------------
 def build_song_index():
-    """真实曲库索引(有缓存就用缓存,取不到就退回最小 stub)。"""
+    """真实曲库索引 + 同名分组(有缓存就用缓存,取不到就退回最小 stub)。"""
     try:
         sys.path.insert(0, str(ROOT / "src"))
         from api import BestdoriAPI
@@ -70,7 +70,7 @@ def build_song_index():
             zh = titles[3] if len(titles) > 3 else None
             if zh:
                 idx.setdefault(zh, sid)
-        return songs, idx
+        return songs, idx, build_ambiguous(songs, idx)
     except Exception as e:  # 离线/缓存缺失时的最小可用替身
         print("  (警告: 取真实曲库失败,退回 stub: %s)" % e)
         songs = {
@@ -79,13 +79,51 @@ def build_song_index():
                 "[New SPECIAL Difficulty] SENSENFUKOKU",
                 None,
                 "[超高难易度 新SPECIAL] SENSENFUKOKU",
-                None]},
+                None],
+                "difficulty": {"0": {}, "1": {}, "2": {}, "3": {}, "4": {}}},
+            "786": {"musicTitle": [
+                "ときめきエクスペリエンス！ (月島まりなver.)",
+                "Tokimeki Experience! (Tsukishima Marina ver.) ",
+                None,
+                "ときめきエクスペリエンス！ (月岛麻里奈ver.)",
+                None],
+                "difficulty": {"0": {}, "1": {}, "2": {}, "3": {}, "4": {}}},
+            "790": {"musicTitle": [
+                "ときめきエクスペリエンス！ (月島まりなver.)",
+                "Tokimeki Experience! (Tsukishima Marina ver.) ",
+                None,
+                "ときめきエクスペリエンス！ (月岛麻里奈ver.)",
+                None],
+                "difficulty": {"0": {}, "1": {}, "2": {}, "3": {}}},
         }
-        idx = {
-            "[超高難易度 SPECIAL] SENSENFUKOKU": "596",
-            "[超高难易度 新SPECIAL] SENSENFUKOKU": "596",
-        }
-        return songs, idx
+        idx = {}
+        for sid, sinfo in songs.items():
+            titles = sinfo["musicTitle"]
+            first = [t for t in titles if t]
+            if first:
+                idx[first[0]] = sid
+            zh = titles[3] if len(titles) > 3 else None
+            if zh:
+                idx.setdefault(zh, sid)
+        return songs, idx, build_ambiguous(songs, idx)
+
+
+def build_ambiguous(songs, idx):
+    """同名标题分组 —— 与 bot 里那段构建逻辑等价(那边是模块级推导式,没法 AST 抽取)。"""
+    t2ids = {}
+    for sid, sinfo in songs.items():
+        for t in sinfo.get("musicTitle") or []:
+            if t and t in idx:
+                ids = t2ids.setdefault(t, [])
+                if sid not in ids:
+                    ids.append(sid)
+    amb = {t: ids for t, ids in t2ids.items() if len(ids) > 1}
+    for t, ids in amb.items():          # 索引默认值排最前,保持与 bot 一致
+        default = idx.get(t)
+        if default in ids:
+            ids.remove(default)
+            ids.insert(0, default)
+    return amb
 
 
 def extract_func(tree, name):
@@ -101,14 +139,18 @@ def test_resolve():
     print("[1] resolve_special_song 曲目解析")
     tree, _ = load_toplevel(BOT_SRC)
     code = extract_func(tree, "resolve_special_song")
-    songs, idx = build_song_index()
+    songs, idx, amb = build_song_index()
     ns = {
         "all_songs": songs,
         "all_song_name_indexes": idx,
+        "ambiguous_titles": amb,
         "_normalize_title": lambda t: unicodedata.normalize("NFKC", t or ""),
         "logging": logging,
         "Optional": Optional,
     }
+    # resolve 现在会调这两个辅助函数 → 一起抽出来执行
+    for helper in ("_special_capable_id", "_prefer_special_id"):
+        exec(extract_func(tree, helper), ns)
     exec(code, ns)
     resolve = ns["resolve_special_song"]
 
@@ -127,6 +169,42 @@ def test_resolve():
     check("None 返回 None", resolve(None) is None)
     title, sid = resolve("596")
     check("数字 id 会带出真实标题", bool(title) and sid == "596", (title, sid))
+
+    # 同名消歧:ときめきエクスペリエンス！(月島まりなver.) 的日文标题在索引里指向
+    # #790,而 #790 没有 SPECIAL 谱面(charts/790/special.json = 404)。活动模式
+    # 打的是固定谱面,必须落到有 SPECIAL 档的 #786 上,否则整首按错谱面打。
+    zh = "ときめきエクスペリエンス！ (月岛麻里奈ver.)"
+    jp = "ときめきエクスペリエンス！ (月島まりなver.)"
+    if "786" in songs and "790" in songs:
+        check("候选确有 786/790 两个 id", set(amb.get(jp) or []) >= {"786", "790"},
+              amb.get(jp))
+        check("786 有 SPECIAL 档",
+              ns["_special_capable_id"]("786") is True)
+        check("790 没有 SPECIAL 档",
+              ns["_special_capable_id"]("790") is False)
+        check("简中标题 -> 786", (resolve(zh) or ("", ""))[1] == "786", resolve(zh))
+        check("日文标题也被改选到 786(不是 790)",
+              (resolve(jp) or ("", ""))[1] == "786", resolve(jp))
+        check("手写 id 790 仍按原样返回(不替换用户明确意图)",
+              (resolve("790") or ("", ""))[1] == "790")
+    else:
+        print("  (跳过高难度消歧断言:曲库缓存里没有 786/790)")
+
+    # 下拉框里每一首都必须真的能打:解析得到 + 该 id 确实有 SPECIAL 谱面。
+    # 标题直接从 gui.py 抽,免得测试里再抄一份、日后漂移。
+    gui_tree = ast.parse(GUI_SRC.read_text(encoding="utf-8"))
+    dropdown = None
+    for node in gui_tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id == "SPECIAL_SONGS" for t in node.targets
+        ):
+            dropdown = ast.literal_eval(node.value)
+    check("从 gui.py 抽到 SPECIAL_SONGS", bool(dropdown), dropdown)
+    for item in dropdown or ():
+        got = resolve(item)
+        ok = bool(got) and ns["_special_capable_id"](got[1])
+        check("下拉框曲目可打: %s -> #%s" % (item, got[1] if got else None),
+              ok, got)
 
 
 # --------------------------------------------------------------------------
@@ -446,8 +524,12 @@ def test_gui_render():
         check("special_song 默认值已落在界面状态里",
               bool(str(app.special_song).strip()))
 
-        # 曲目标题很长(约 385px),下拉框必须装得下,否则文字会被截断 —— 这里用
-        # 真实字体实测,防止以后被人把 width 调回去。
+        # 曲目标题很长,下拉框必须装得下,否则文字会被截断 —— 这里用真实字体实测,
+        # 防止以后被人把 width 调回去。
+        #
+        # 注意:measure() 必须在 Tk 起来之后取。字体未就绪时 Tk 会给出虚高值
+        # (2026-09-30 实测同一字符串 268px -> 415px,差 55%),看门狗会因此误判。
+        # 下面用真渲染 Label 的 reqwidth 交叉验证一次,锁住这个前提。
         import tkinter.font as tkfont
 
         def _walk(w):
@@ -457,11 +539,21 @@ def test_gui_render():
                 out += _walk(c)
             return out
 
+        root.update_idletasks()
+        ft = tkfont.Font(font=G.W._f(G.W.base_size(), "normal"))
+        longest = max(G.SPECIAL_SONGS, key=ft.measure)
+        probe = tk.Label(root, text=longest, font=G.W._f(G.W.base_size(), "normal"))
+        probe.update_idletasks()
+        measured, rendered = ft.measure(longest), probe.winfo_reqwidth()
+        probe.destroy()
+        check("字体度量与真实渲染一致(%r: measure=%d, label=%d)"
+              % (longest[:12] + "…", measured, rendered),
+              0 <= rendered - measured <= 12, rendered - measured)
+
         boxes = [c for c in _walk(app.host) if isinstance(c, G.W.DropdownBox)]
         check("活动页有且只有一个曲目下拉框", len(boxes) == 1, len(boxes))
         if boxes:
             box = boxes[0]
-            ft = tkfont.Font(font=G.W._f(G.W.base_size(), "normal"))
             # 文本从 x=12 起画,右侧还要给箭头留位置 → 需求 = 文本宽 + 24px 余量
             need = max(ft.measure(v) for v in G.SPECIAL_SONGS) + 24
             check("曲目下拉框请求宽度 >= 最长标题所需 %dpx" % need,

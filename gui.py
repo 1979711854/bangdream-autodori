@@ -49,6 +49,7 @@ SPECIAL_SONGS = (
     "[超高难易度 新SPECIAL] SENSENFUKOKU",
     "[超高难易度 新SPECIAL] 六兆年と一夜物語",
     "[超高难易度 新SPECIAL] HELL! or HELL?",
+    "ときめきエクスペリエンス！ (月岛麻里奈ver.)",
 )
 DEFAULT_SPECIAL_SONG = SPECIAL_SONGS[0]
 # 打歌策略:显示名 → 写入 data/config.yml 的 song_strategy 值
@@ -62,7 +63,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛

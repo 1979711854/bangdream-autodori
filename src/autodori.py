@@ -1217,12 +1217,74 @@ def fuzzy_match_song(name, other_names=()):
     return (hit[0], hit[1]) if hit is not None else None
 
 
+def _special_capable_id(sid: str) -> bool:
+    """该曲目 id 是否真有 SPECIAL 谱面。
+
+    谱面档位在曲库缓存里的键是 "0"~"4"(easy..special),有第 5 档才谈得上
+    「超高难度」。只用本机曲库缓存判定,**不发任何网络请求**。
+    """
+    diff = (all_songs.get(str(sid)) or {}).get("difficulty") or {}
+    return "4" in diff
+
+
+def _prefer_special_id(title: str, sid: str) -> str:
+    """同名多 id 时,改选真正带 SPECIAL 谱面的那一个。
+
+    活动模式打的是写死的固定谱面,选错 id 就是整首按错谱面打;而 Bestdori 的
+    同名条目里恰好存在**没有 SPECIAL 档**的那一个(2026-09-30 实测):
+
+        「ときめきエクスペリエンス！ (月島まりなver.)」
+          日文标题 -> 索引 #790 -> 只有 4 档,charts/790/special.json = 404
+          简中标题 -> 索引 #786 -> 有 SPECIAL(Lv26, 1097 条指令)
+
+    同一首歌靠"玩家写的是日文名还是简中名"决定能不能打,太脆。这里统一改成按
+    **有没有 SPECIAL 谱面**这个客观信号挑 —— 仍然只做精确匹配,不引入模糊匹配。
+    挑不出来(0 个,或多个候选都带 SPECIAL)就退回索引原值,不猜。
+    """
+    ids = ambiguous_titles.get(title) or [sid]
+    capable = [i for i in ids if _special_capable_id(i)]
+    if len(capable) == 1:
+        picked = capable[0]
+        if picked != sid:
+            logging.info(
+                "超高难度活动:标题 %r 命中多个 id %s,改选有 SPECIAL 谱面的 #%s",
+                title, ids, picked,
+            )
+        return picked
+    if len(capable) > 1:
+        # 等级相同 = 同一份谱面(本仓库已用逐档 md5 验证过的等价判据,见 09-17 选曲
+        # 分析),这种叫"同名重复条目",静默沿用即可;等级不同才是真歧义 —— 那说明
+        # 确实存在两份不同的谱面,必须让人在日志里看见。
+        levels = {
+            (all_songs.get(i) or {}).get("difficulty", {}).get("4", {}).get("playLevel")
+            for i in capable
+        }
+        if len(levels) > 1:
+            logging.warning(
+                "超高难度活动:标题 %r 有多个 id 带 SPECIAL 谱面且等级不同 %s,沿用 %s",
+                title, capable, sid,
+            )
+        else:
+            logging.debug(
+                "超高难度活动:标题 %r 的候选 %s SPECIAL 等级同为 %s(同一份谱面),沿用 %s",
+                title, capable, levels.pop(), sid,
+            )
+    elif len(ids) > 1:
+        logging.warning(
+            "超高难度活动:标题 %r 的候选 %s 都没有 SPECIAL 谱面,沿用 %s",
+            title, ids, sid,
+        )
+    return sid
+
+
 def resolve_special_song(name: str) -> Optional[tuple]:
     """「超高难度活动」配置的曲目 -> (标题, 曲目 id)。解析不出返回 None。
 
     取值允许两种写法:
-      * 纯数字 —— 直接当 Bestdori 曲目 id 用;
+      * 纯数字 —— 直接当 Bestdori 曲目 id 用(写死了就不再改,只提醒);
       * 标题 —— NFKC 归一后与曲库索引精确匹配(简中、日文标题都在索引里)。
+        命中多个同名 id 时,由 `_prefer_special_id` 按「是否有 SPECIAL 谱面」
+        挑出唯一可打的那个(见该函数说明)。
 
     **刻意不做模糊匹配**:这是用户写死在配置里的固定曲目,匹配错就是整首按错
     谱面打完全程。解析不出来宁可让脚本拒绝启动并打出提示,也绝不猜。
@@ -1235,6 +1297,13 @@ def resolve_special_song(name: str) -> Optional[tuple]:
         sid = str(int(raw))
         if sid in all_songs:
             titles = [t for t in (all_songs[sid].get("musicTitle") or []) if t]
+            # 手写 id 是明确的用户意图,不做替换;但没 SPECIAL 档的 id 必然取不到
+            # 谱面,提前说清楚,免得到时候只看到一个 404。
+            if not _special_capable_id(sid):
+                logging.warning(
+                    "超高难度活动:手写的曲目 id %s 没有 SPECIAL 谱面,谱面可能取不到",
+                    sid,
+                )
             return (titles[0] if titles else sid, sid)
         logging.error("超高难度活动:曲目 id %s 不在曲库中", sid)
         return None
@@ -1242,7 +1311,7 @@ def resolve_special_song(name: str) -> Optional[tuple]:
     key = _normalize_title(raw)
     for title, sid in all_song_name_indexes.items():
         if _normalize_title(title) == key:
-            return (title, sid)
+            return (title, _prefer_special_id(title, sid))
     logging.error(
         "超高难度活动:曲名 %r 不在曲库中(标题需与曲库一致,或直接写曲目 id)", raw
     )
@@ -1319,6 +1388,12 @@ def _prepare_special_song(cli_value: str) -> None:
         logging.error("超高难度活动:无法解析曲目 %r,停止", raw)
         _shutdown(1, "超高难度活动曲目无效")
     title, sid = resolved
+    # 该模式只打 SPECIAL 档;没有这一档的 id 必然取不到谱面(404)。在这里挡下来,
+    # 比让 Chart() 在解谱时抛异常更早、更明确 —— 且发生在 post_task 之前,
+    # 不会在游戏里打到一半才崩。
+    if not _special_capable_id(sid):
+        logging.error("超高难度活动:曲目 %s (#%s) 没有 SPECIAL 谱面,停止", title, sid)
+        _shutdown(1, "超高难度活动曲目无 SPECIAL 谱面")
     # 先落 _resolved_song_id,save_song 才会采信这个 id(同名曲目标题反查不到唯一 id)
     _resolved_song_id = (title, sid)
     logging.info("超高难度活动:曲目 %s (#%s),难度 %s", title, sid, DIFFICULTY)
