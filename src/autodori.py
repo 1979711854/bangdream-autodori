@@ -2147,9 +2147,31 @@ def _log_environment():
 
 
 def main():
+    """入口:装好日志后转入 _main_impl,并保证**任何未捕获异常都落进 debug 日志**。
+
+    打包态(autodori.exe)没有控制台,未捕获异常的 traceback 默认只写 stderr。
+    GUI 把 stderr 并进 stdout 后又按「关键事件」白名单过滤,整段栈会被丢掉,
+    于是 debug/ 日志里一片沉默 —— 早期崩溃(初始化、谱面预处理阶段)只能靠本地
+    复现才能定位(踩过一次:SPECIAL 谱面除零,日志停在半路且无任何报错)。
+    """
     configure_log()
     enable_high_precision_timer()
+    try:
+        _main_impl()
+    except SystemExit:
+        # argparse 参数错误等,保持原语义直接抛出
+        raise
+    except KeyboardInterrupt:
+        logging.info("收到中断信号,准备退出")
+        _shutdown(0, "用户中断")
+    except BaseException as e:
+        # logging.exception 会把完整栈写进 FileHandler(GUI 也读得到第一行),
+        # 然后走统一收尾 —— _shutdown 不返回。
+        logging.exception("脚本异常终止: %r", e)
+        _shutdown(1, "未捕获异常: %s" % (e,))
 
+
+def _main_impl():
     parser = argparse.ArgumentParser(
         description="AutoDori script with different modes."
     )

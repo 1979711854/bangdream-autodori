@@ -63,7 +63,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -269,6 +269,9 @@ class AutodoriGUI:
         # 完整原始日志(含时间戳/级别/logger),与显示用的精简缓冲分离:
         # 导出日志时输出这份全量,而不是被"关键事件"过滤后的精简集。
         self._raw_log = collections.deque(maxlen=20000)
+        # 是否正处于一段 traceback 之内:栈的后续帧以「无时间戳裸行」到达,
+        # 只有首行带 ERROR 级别。不追这几行的话栈就是断的(见 _handle_line)。
+        self._in_traceback = False
         self.started_at = None
         self.songs_done = 0
         self.current_song = ""
@@ -1221,10 +1224,18 @@ class AutodoriGUI:
         m = LOG_RE.match(line)
         if m:
             stamp, level, msg = m.group(1), m.group(2), m.group(3)
+            # 一条 ERROR/CRITICAL 记录的正文之后可能紧跟整段 traceback —— 它是
+            # 逐行写到管道的裸文本(无时间戳/级别),直到下一条日志记录出现为止。
+            self._in_traceback = level in ("ERROR", "CRITICAL")
         else:
             # 无时间戳的非标准行(如 bot 子进程崩溃时的裸输出)用当前时刻兜底,
             # 保证每条日志都带上「HH:MM:SS」,不再出现时间栏空白。
             stamp, level, msg = time.strftime("%H:%M:%S"), "", line.strip()
+            if self._in_traceback and line.strip():
+                # traceback 的续行承载着真正有用的文件/行号/异常类型,必须一并
+                # 显示,否则「关键事件」里只剩一句光秃秃的报错。缩进保留。
+                self._emit(stamp, "ERROR", line.rstrip())
+                return
         if not msg:
             return
 

@@ -197,6 +197,38 @@ class Chart:
             to_time = from_time + duration
             from_x, from_y = from_
             to_x, to_y = to
+
+            # 零长度段：Slide 的相邻两个 connection 可能落在同一 beat —— 谱面用这种
+            # 成对写法表达「一次划过两个 lane」(实测 #786 有 100 处,如 note#984 的
+            # lane 1→0 @beat280、note#998 的 5→6/4→5/3→4/2→3)。
+            # 此时 duration=0,下面的 (to_x - from_x) / duration 会抛
+            # ZeroDivisionError,让整个 save_song() 中断。它跑在 post_task **之前**,
+            # 所以外部表现是「曲目加载完就再无动静、连演出开始都不点」,而
+            # autodori.exe 的 stderr 不被 GUI 捕获 → debug 日志里看不到 traceback。
+            # 瞬时移动没有可插值的中间点,直接返回;调用方若要求按下/抬起,仍按原
+            # 契约补上这两个动作,避免手指状态悬空。
+            if duration <= 0:
+                if down:
+                    actions.append(
+                        {
+                            "finger": finger,
+                            "type": "down",
+                            "time": from_time,
+                            "pos": from_,
+                            "note": note_index,
+                        }
+                    )
+                if up:
+                    actions.append(
+                        {
+                            "finger": finger,
+                            "type": "up",
+                            "time": to_time,
+                            "note": note_index,
+                        }
+                    )
+                return
+
             slices = split_number(duration, slice_size)
             x_size = (to_x - from_x) / duration
             y_size = (to_y - from_y) / duration

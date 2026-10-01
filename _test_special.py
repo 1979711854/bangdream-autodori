@@ -406,12 +406,19 @@ def test_bot_branch():
                 seen.add(item)
     check("改写节点三列表无重复元素", not dup, dup)
 
-    # 3.2 main():--mode special -> entry=special_wait, 难度 special
-    main_fn = next(n for n in tree.body
-                   if isinstance(n, ast.FunctionDef) and n.name == "main")
-    main_seg = ast.get_source_segment(src, main_fn)
-    check("main 里 entry = special_wait", '"special_wait"' in main_seg)
-    check("main 里强制 DIFFICULTY = \"special\"", 'DIFFICULTY = "special"' in main_seg)
+    # 3.2 入口:--mode special -> entry=special_wait, 难度 special
+    # 主流程自 v1.2.7 起搬进 _main_impl(),由 main() 用 try 罩住(见 _test_crashlog.py);
+    # 这里按"入口主流程"取源码,两种结构都能过,避免下次搬动又假失败。
+    entry_fn = next(
+        (n for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == "_main_impl"),
+        None,
+    ) or next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "main")
+    main_seg = ast.get_source_segment(src, entry_fn)
+    check("入口主流程里 entry = special_wait", '"special_wait"' in main_seg)
+    check("入口主流程里强制 DIFFICULTY = \"special\"",
+          'DIFFICULTY = "special"' in main_seg)
     check("--mode choices 含 special", '"special"' in src and '"main", "special"' in src)
     check("--special-song 参数已注册", '"--special-song"' in src)
 
