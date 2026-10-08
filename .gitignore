@@ -640,8 +640,23 @@ NVIDIA Corporation/
 # 不要通配掉。下面这几个只对本机环境有意义,故不入库:
 #   _chk_exe.py / _chk_keyerror.py —— 反编译本机 exe 核对装的是哪份源码
 #   _diag_maa.py                   —— 依赖本机资源目录布局
+#   _diag_{anchor,chart786,duprule,exe_chart,exe_src,fail,fail2,gate,jitter,
+#          tail,trig}.py           —— 现场排查用,依赖本机已跑过的日志/截图
+#   _watch_fail.py                 —— 实时盯打歌失败,需先跑起来才有意义
 _chk_*.py
 _diag_maa.py
+_diag_anchor.py
+_diag_chart786.py
+_diag_duprule.py
+_diag_exe_chart.py
+_diag_exe_src.py
+_diag_fail.py
+_diag_fail2.py
+_diag_gate.py
+_diag_jitter.py
+_diag_tail.py
+_diag_trig.py
+_watch_fail.py
 
 # ---- 会话记忆(本地) ----
 # 跨会话的工作笔记,含内部排查细节与临时路径,不进公开仓库。

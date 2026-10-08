@@ -25,6 +25,18 @@ from tkinter import messagebox
 import ui_theme as T
 import ui_widgets as W
 
+# 设备发现(多开支持)。独立模块而非 import autodori:bot 在模块级就会拉
+# Bestdori 曲库(离线直接崩),且打包的 gui.exe 不含 maa/bin —— 都用不了。
+#
+# import device_scan 放在 try **之外**是刻意的:PyInstaller 靠静态分析决定
+# 打进哪些模块,而 `*.spec` 被 gitignore(.gitignore 有一行 *.spec),没法靠
+# spec 的 hiddenimports 兜底。把唯一的 import 藏进 try 里,将来一次无关的重构
+# 就可能让它悄悄不进包 —— 症状是「界面能开,但设备列表永远是空的」,
+# 而且**没有任何报错**,属于极难排查的一类故障。
+# 运行期容错靠下面的 getattr 兜底,不会因为缺模块就起不来。
+import device_scan
+from device_scan import label_for as device_scan_label
+
 # 高 DPI 下 Tk 默认不感知，必须在创建 Tk() 之前声明
 T.enable_dpi_awareness()
 
@@ -63,7 +75,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.3.0"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -177,13 +189,35 @@ NOTES = """【模拟器设置】
 【使用提醒】
 • 本脚本用于自动挖矿(自动打歌刷取资源/活动奖励),仅供个人使用
 • 请遵守游戏规则与用户协议,不要用于破坏游戏秩序或影响其他玩家
-• 不要同时运行多个实例
+• MuMu 多开时:在「演出设置 → 模拟器实例」里选要连的那台,选择会被记住。
+  多开通常是克隆镜像,每个实例都装了同一个游戏,脚本看不出哪个才是邦邦,
+  所以请务必手动指定 —— 连错会点到别的游戏窗口上
 • 如有问题,先查看 debug 目录下的日志
 """
 
 
 # 常见问题(只读)
-FAQ = """Q:打歌总是 FAST(狂爆 FAST / 整体按早),怎么办?
+FAQ = """Q:多开模拟器时怎么指定连哪个窗口?
+A:在「演出设置 → 模拟器实例」里点刷新按钮,列表会列出所有在线实例(名称 + 端口)。
+选对的那个即可,选择会被记住,下次启动自动沿用。点「预览」可以看某个实例当前的画面,
+确认它是不是你要操作的那台。
+
+需要说明的是:**多开时脚本无法自动判断哪个实例才是邦邦**。MuMu 多开通常是克隆实例镜像,
+每个实例都装了同一个游戏,程序看到的结果完全一样 —— 所以它只能列出实例让你选,
+不会替你猜。保持「自动」时脚本会用启发式挑一个,多开场景下请务必手动指定。
+
+端口规律:MuMu 12 第 n 个实例是 127.0.0.1:(16384+32n),第一个 16384,第二个 16416。
+命令行也支持:`--device 16416`(端口)、`--device 127.0.0.1:16416`(完整地址)、
+`--device 0`(序号)三种写法都接受。
+
+Q:提示「无法确定哪个实例是邦邦游戏」怎么办?
+A:脚本在多个实例中无法唯一判断时会直接停止并列出候选,不会随便挑一个去乱点别的窗口。
+按顺序排查:
+① 点「刷新」重新扫描;② 确认模拟器已完全启动(不是停在启动画面);
+③ 用「预览」逐个看画面,在下拉框里手动指定正确的实例;
+④ 若列表里根本没有你的实例,确认 MuMu 是否为多开器版本、端口是否被占用。
+
+Q:打歌总是 FAST(狂爆 FAST / 整体按早),怎么办?
 A:先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选——若勾选请取消
 (允许系统声音),这是 FAST 偏移最常见的原因,关闭后即完全正常;若还不行,再在「时基校准」里开自动校准 photogate。
 
@@ -300,6 +334,18 @@ class AutodoriGUI:
         self.special_song = cfg.get("special_song", DEFAULT_SPECIAL_SONG)
         if not str(self.special_song).strip():
             self.special_song = DEFAULT_SPECIAL_SONG
+        # 模拟器实例(多开时指定连哪个)。保存的是 adb 地址(127.0.0.1:16416),
+        # 空串 = 自动识别(按已安装邦邦的实例挑)。
+        self.device_address = str(cfg.get("device_address", "") or "")
+        # 手填的 adb 路径(自动发现覆盖不到时的出口);空串 = 自动发现
+        # adb_path 只兼容「早期版本手填过并留在配置里」的情况 —— 界面上已不再
+        # 提供手填入口(需求:删掉该功能)。留读是为了别让老配置里的路径失效。
+        self.adb_path = str(cfg.get("adb_path", "") or "")
+        self._closing = False         # 关窗口标记:让后台扫描线程及时收手
+        self._devices = []          # device_scan.discover() 的结果
+        self._device_labels = []    # 与 self._devices 一一对应的下拉框标签
+        self._device_scanning = False
+        self._shots = {}            # adb address -> 截图路径(多开时肉眼区分实例)
         self.gate = self._read_gate()
 
         T.set_theme(self.theme)
@@ -310,6 +356,9 @@ class AutodoriGUI:
 
         self.root.after(120, self._poll_log)
         self.root.after(500, self._tick)
+        # 开机自动扫一次实例:多开时用户一眼就能看到有几个窗口可选。
+        # 延后触发,别拖慢界面弹出(扫描要跑 adb 子进程,几秒起步)。
+        self.root.after(700, self._scan_devices_async)
         # 关闭窗口时杀掉 bot 子进程,防止它在后台继续点游戏
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -333,6 +382,11 @@ class AutodoriGUI:
             "auto_cal": bool(self.auto_cal),
             "song_strategy": self.song_strategy,
             "special_song": self.special_song,
+            # 多开时指定实例;空串 = 自动识别。属于 GUI 自己的偏好,
+            # 不写进 data/config.yml(那份是 bot 的运行配置)。
+            "device_address": self.device_address,
+            # 手填的 adb 路径;空串 = 自动发现
+            "adb_path": self.adb_path,
         }
         try:
             os.makedirs(os.path.dirname(GUI_CONFIG), exist_ok=True)
@@ -499,6 +553,10 @@ class AutodoriGUI:
         # 卡片里的控件随重建被销毁,必须先清掉引用 —— 否则 _sync_run_state 会去
         # 操作已销毁的控件并抛 TclError,连带把 _render_view 打断。
         self.special_start_btn = None
+        self.device_box = None
+        self.device_status = None
+        self.device_refresh_btn = None
+        self.device_preview_btn = None
         for key, item in self.nav_items.items():
             item.select(key == self.view)
 
@@ -614,6 +672,10 @@ class AutodoriGUI:
             bg=th["surface"], fg=th["text_3"],
             font=T.font(self.font_size - 1), anchor="w", justify="left")
         self.strategy_hint.pack(anchor="w", pady=(0, 14))
+
+        # 模拟器实例放在最上面:多开时这是**第一个**要确认的东西 ——
+        # 连错实例会直接点到别的游戏窗口,比任何设置错误都严重。
+        self._device_row(card.body)
 
         r = W.Row(card.body, "火罐为 0 时")
         r.pack(fill="x", pady=(0, 16))
@@ -1116,6 +1178,10 @@ class AutodoriGUI:
         else:
             bot_args = ["--mode", "main", "--difficulty", str(self.difficulty),
                         "--livemode", str(LIVE_MODE)]
+        # 选定了具体实例就带上 --device。多开时这是防止连错窗口的关键:
+        # 留空则由 bot 按「装了邦邦的实例」自动判定。
+        if self.device_address:
+            bot_args += ["--device", str(self.device_address)]
 
         if getattr(sys, "frozen", False):
             bot = os.path.join(BASE, "autodori.exe")
@@ -1199,6 +1265,15 @@ class AutodoriGUI:
                 line = self.q.get_nowait()
                 if line == "__EOF__":
                     self._on_finished()
+                    continue
+                # 设备扫描结果是 (tag, payload) 元组,不是日志文本
+                if isinstance(line, tuple) and len(line) == 2 \
+                        and line[0] == "__DEVICES__":
+                    try:
+                        self._on_devices_scanned(line[1])
+                    except Exception as e:
+                        self._emit("", "WARN",
+                                   "处理设备扫描结果出错: %r" % (e,))
                     continue
                 try:
                     self._handle_line(line)
@@ -1351,9 +1426,290 @@ class AutodoriGUI:
         self._emit("", "WARN", "=== 手动停止 ===")
 
     def _on_close(self):
+        # 先置关闭标记:正在跑的设备扫描线程据此尽快收手,不再派 adb 子进程。
+        # 不这么做的话,关窗口时解释器会等这些子进程,表现为"点了关闭没反应"。
+        self._closing = True
         # 关窗口时强制结束 bot 整个进程树,避免它留在后台继续点游戏
         self._kill_proc()
         self.root.destroy()
+
+    # ---------- 模拟器实例选择（多开支持）----------
+
+    # 不写「推荐」:多开时自动判定并不能保证选对(包名分不出实例),
+    # 标成推荐会误导用户以为不用管。
+    AUTO_DEVICE_LABEL = "自动"
+
+    def _scan_devices_async(self):
+        """后台线程扫设备,完成后回主线程刷新下拉框。
+
+        扫描要跑 adb 子进程(最多十几个 connect + 每个设备三条 shell),
+        放主线程会把界面卡住几秒 —— Tk 单线程,卡住就没法重绘。
+
+        线程是 daemon,但它持有的 adb 子进程在 interpreter 退出时可能让
+        进程挂着不退(实测关闭窗口会卡住)。所以关窗口时置 _closing,
+        让线程体尽快收手别再派新的子进程。
+        """
+        if self._device_scanning or getattr(self, "_closing", False):
+            return
+        self._device_scanning = True
+        if getattr(self, "device_status", None):
+            self.device_status.configure(text="正在扫描模拟器实例…")
+
+        def work():
+            try:
+                # 传入手填路径(空串则自动发现)
+                result = device_scan.discover(adb=self.adb_path)
+                # 多开邦邦窗口时,包名/进程状态对每个实例都一样,光看文字
+                # 分不出谁是谁 —— 抓一张缩略图让用户**亲眼**确认。
+                # 并发抓:串行的话每个实例一张图要等好几秒。
+                devs = result.get("devices", [])
+                shots = {}
+                if devs and not getattr(self, "_closing", False):
+                    import threading as _th
+                    lock = _th.Lock()
+
+                    def grab(dev):
+                        if getattr(self, "_closing", False):
+                            return
+                        try:
+                            path = device_scan.capture(
+                                result.get("adb", ""), dev.get("address", ""))
+                            if path:
+                                with lock:
+                                    shots[dev["address"]] = path
+                        except Exception:
+                            pass
+
+                    ts = []
+                    for dev in devs:
+                        t = _th.Thread(target=grab, args=(dev,), daemon=True)
+                        t.start()
+                        ts.append(t)
+                    for t in ts:
+                        t.join(timeout=20)
+                result["shots"] = shots
+            except Exception as e:
+                result = {"adb": "", "devices": [], "shots": {}, "error": str(e)}
+            if getattr(self, "_closing", False):
+                return  # 窗口已关,别再往已销毁的队列里灌结果
+            self.q.put(("__DEVICES__", result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_devices_scanned(self, result):
+        """扫描回调(主线程)。"""
+        self._device_scanning = False
+        self._devices = result.get("devices") or []
+        self._shots = result.get("shots") or {}
+        self._device_labels = [device_scan_label(d) for d in self._devices]
+
+        if not self._devices:
+            # 一次都扫不到:下拉框必须重建,否则上一次扫到的实例还留在列表里,
+            # 用户会选到一个已经不在线的窗口(比「选不到」更危险)。
+            self._refresh_device_box()
+            msg = ("未发现正在运行的模拟器实例 — 请先启动 MuMu,再点「刷新」"
+                   if not result.get("adb")
+                   else "未发现在线的模拟器实例 — 请确认 MuMu 已启动,再点「刷新」")
+            if getattr(self, "device_status", None):
+                self.device_status.configure(text=msg)
+            return
+
+        # 校验已保存的选择是否还在候选里(用户可能改了实例/重装了模拟器)
+        if self.device_address and not any(
+                d.get("address") == self.device_address for d in self._devices):
+            self.device_address = ""
+            self._save_gui_config()
+
+        # 只报「客观事实」,不替用户断言哪个是邦邦 —— 多开常是克隆镜像,
+        # 每个实例都装了同一个游戏,包名/进程状态完全一致,据此宣称"这个是
+        # 邦邦"是误导(实测踩过)。用户看端口对得上自己的窗口即可。
+        n = len(self._devices)
+        if getattr(self, "device_status", None):
+            if self.device_address:
+                self.device_status.configure(
+                    text="已选择 %s — 启动时按此实例连接"
+                         % self._label_of(self.device_address))
+            elif n == 1:
+                self.device_status.configure(
+                    text="发现 1 个实例 — 若它是邦邦那台,保持自动识别即可")
+            else:
+                self.device_status.configure(
+                    text="发现 %d 个实例 — 点「预览」确认哪台是邦邦,或直接选端口;"
+                         "多开时脚本无法靠包名区分" % n)
+        self._refresh_device_box()
+
+    def _label_of(self, address):
+        for dev, label in zip(self._devices, self._device_labels):
+            if dev.get("address") == address:
+                return label
+        return address
+
+    def _refresh_device_box(self):
+        """按当前扫描结果重建下拉框选项。
+
+        DropdownBox 没有 set_values,只能整体重建 —— 所以把它的父容器
+        一起清掉再放一个新的(控件是纯展示,状态真值在 self.device_address)。
+        """
+        box = getattr(self, "device_box", None)
+        if box is None:
+            return
+        parent = box.master
+        try:
+            box.destroy()
+        except Exception:
+            pass
+        values = [self.AUTO_DEVICE_LABEL] + list(self._device_labels)
+        current = self.AUTO_DEVICE_LABEL
+        if self.device_address:
+            current = self._label_of(self.device_address)
+            if current not in values:
+                # 上次选的实例这次没扫到(比如它没启动)——仍保留这一项,
+                # 免得用户的选择被静默改掉(那等于换了个窗口接着点)。
+                values.append(current)
+        new_box = W.DropdownBox(
+            parent, values, value=current, width=260, min_width=200,
+            surface="surface", on_change=self._on_device)
+        # pack 的默认行为是把控件**追加到父容器子控件列表末尾**。本行左边还
+        # 有两个 IconButton(它们先创建),若直接 pack,重建后的下拉框会跑到
+        # 按钮右侧 —— 表现为「框和按钮换了位置」。before=first 把它钉回第一位。
+        try:
+            first = parent.pack_slaves()[0]
+        except Exception:
+            first = None
+        if first is not None and first is not new_box:
+            new_box.pack(side="left", before=first)
+        else:
+            new_box.pack(side="left")
+        self.device_box = new_box
+
+    def _on_device(self, value):
+        """下拉框选择变化:存回状态并落盘。
+
+        注意 DropdownBox 选中项变了但**不会**回调自己(只有用户点菜单才会),
+        这里也不需要重建下拉框 —— 它的 _index 已经由 _pick 改好了。
+        """
+        if value == self.AUTO_DEVICE_LABEL:
+            self.device_address = ""
+        else:
+            self.device_address = ""
+            for dev, label in zip(self._devices, self._device_labels):
+                if label == value:
+                    self.device_address = dev.get("address", "")
+                    break
+        self._save_gui_config()
+        if getattr(self, "device_status", None):
+            self.device_status.configure(
+                text=("已选择 %s — 启动时按此实例连接"
+                      % self._label_of(self.device_address))
+                if self.device_address else "自动：脚本自行选择实例")
+
+    def _device_row(self, master):
+        """演出设置卡片里的「模拟器实例」一行。"""
+        th = T.get()
+        r = W.Row(master, "模拟器实例")
+        r.pack(fill="x", pady=(0, 6))
+
+        # 没扫到设备时也显示「自动识别」,保证用户永远看得到当前策略
+        values = [self.AUTO_DEVICE_LABEL] + list(self._device_labels)
+        current = self.AUTO_DEVICE_LABEL
+        if self.device_address:
+            current = self._label_of(self.device_address)
+            if current not in values:
+                values.append(current)
+        # 框与两个按钮放进同一个横向容器 —— 关键:**不能**把 state 用的
+        # fill="x" 标签与 side="left" 控件混在同一个父容器里。Tk 的 pack 按
+        # **调用顺序**切空间:side="left" 的先把横向可用区占满,后调用的
+        # fill="x" 只能被挤到它们上方一行 —— 表现为「状态文字浮在控件上面」,
+        # 整行错位。嵌套一层容器后,两行各自独立 pack,不会互相抢空间。
+        line = tk.Frame(r.slot, bg=th["surface"])
+        line.pack(fill="x")
+
+        box = W.DropdownBox(
+            line, values, value=current, width=260, min_width=200,
+            surface="surface", on_change=self._on_device)
+        # 不再 fill="x"/expand —— 那一版会把方框拉满整行,视觉上过于抢眼,
+        # 且标签文字只有几十个字符,撑开只是浪费空白。定宽即可。
+        box.pack(side="left")
+        self.device_box = box
+
+        btn = W.IconButton(line, "refresh", size=30,
+                           command=self._scan_devices_async,
+                           tip="重新扫描模拟器实例")
+        btn.pack(side="left", padx=(8, 0))
+        self.device_refresh_btn = btn
+
+        # 预览按钮:多开时包名/进程状态分不出实例,只能让用户看一眼画面
+        prev = W.IconButton(line, "live", size=30,
+                            command=self._preview_device,
+                            tip="预览所选实例的画面")
+        prev.pack(side="left", padx=(6, 0))
+        self.device_preview_btn = prev
+
+        self.device_status = tk.Label(
+            r.slot, text="", bg=th["surface"], fg=th["text_3"],
+            font=T.font(self.font_size - 1), anchor="w")
+        self.device_status.pack(fill="x", pady=(4, 0))
+        if not self._devices:
+            self.device_status.configure(
+                text="点右侧按钮扫描实例 — 多开时在此指定连哪台")
+
+        return r
+
+    def _preview_device(self):
+        """弹出所选实例的当前画面,让用户确认「这个端口就是我要的窗口」。
+
+        多开邦邦窗口时,包名/进程状态对每个实例完全一致,唯一可靠的区分
+        办法就是让用户自己看一眼画面(是不是在选曲页、是不是目标账号)。
+        """
+        if not self._devices:
+            messagebox.showinfo("模拟器实例", "请先点右侧按钮扫描实例。")
+            return
+        shots = getattr(self, "_shots", {}) or {}
+        # 没选具体实例时,预览第一个装了邦邦的;否则预览选中的
+        address = self.device_address
+        if not address:
+            for dev in self._devices:
+                if dev.get("running") is True:
+                    address = dev.get("address", "")
+                    break
+        if not address:
+            address = self._devices[0].get("address", "")
+
+        path = shots.get(address)
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning(
+                "无法截图",
+                "没能抓到该实例的画面。\n\n"
+                "可能原因:实例未启动、或 adb 连接已断开。\n"
+                "请确认 MuMu 正常运行后点「刷新」重试。")
+            return
+        try:
+            img = tk.PhotoImage(file=path)
+        except Exception as e:
+            messagebox.showerror("无法预览", "读取截图失败: {}".format(e))
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("实例预览 — {}".format(address))
+        th = T.get()
+        win.configure(bg=th["app_bg"])
+        # 截图是 1280x720,按窗口可用宽度等比缩小(不依赖 PIL)
+        max_w, max_h = 720, 405
+        ratio = min(max_w / img.width(), max_h / img.height(), 1.0)
+        w, h = max(1, int(img.width() * ratio)), max(1, int(img.height() * ratio))
+        shown = img.subsample(
+            max(1, int(img.width() / w) or 1), max(1, int(img.height() / h) or 1)
+        )
+        lbl = tk.Label(win, image=shown, bg=th["app_bg"], bd=0)
+        lbl.image = shown  # 保持引用,否则会被回收成空白
+        lbl.pack(padx=12, pady=(12, 6))
+        tk.Label(
+            win,
+            text="端口 {}　·　这是该实例当前的画面".format(address),
+            bg=th["app_bg"], fg=th["text_3"],
+            font=T.font(self.font_size - 1),
+        ).pack(pady=(0, 12))
+        win.resizable(False, False)
 
     def _write_config(self):
         life = "auto" if self.life_mode == "自动退出重新选歌" else "wait"

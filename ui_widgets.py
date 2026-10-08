@@ -442,8 +442,15 @@ class DropdownBox(tk.Canvas):
         if self._menu is not None:
             return
         th = theme()
-        x = self.winfo_rootx()
-        y = self.winfo_rooty() + self.winfo_height() + 1
+        # 控件可能已被父卡片重建销毁(见 gui._refresh_device_box):
+        # winfo_rootx() 在那种状态下抛 TclError,必须先探活。
+        try:
+            if not self.winfo_exists():
+                return
+            x = self.winfo_rootx()
+            y = self.winfo_rooty() + self.winfo_height() + 1
+        except Exception:
+            return
         self._menu = tk.Menu(self, tearoff=0,
                              bg=th["surface"], fg=th["text"],
                              activebackground=th["accent_soft"],
@@ -458,14 +465,31 @@ class DropdownBox(tk.Canvas):
         try:
             self._menu.tk_popup(x, y)
         finally:
-            self._menu.grab_release()
+            # grab_release 本身也可能因控件已销毁而抛(TclError),一并兜住 ——
+            # 菜单关闭路径绝不能因为「控件刚好被重建」而炸掉整段回调。
+            try:
+                self._menu.grab_release()
+            except Exception:
+                pass
             self._menu = None
-            self._draw()
+            # 期间可能发生卡片重建(_render_view 会 destroy 整个下拉框),
+            # 此时重绘会抛 "invalid command name"。先探活,再画。
+            try:
+                if not self.winfo_exists():
+                    return
+                self._draw()
+            except Exception:
+                pass
 
     def _pick(self, idx):
         if idx != self._index:
             self._index = idx
-            self._draw()
+            # 重绘先做但容错:on_change 可能触发界面重建(见 gui._refresh_device_box
+            # 的 destroy + 重建),若那时才发现自己已被销毁就晚了。
+            try:
+                self._draw()
+            except Exception:
+                pass
             if self.on_change:
                 self.on_change(self.values[idx])
 
@@ -949,7 +973,7 @@ def _stash_photo(canvas, photo):
 def draw_icon(canvas, kind, x, y, color, size=14):
     """在画布上画极简线性图标（不使用 emoji，保证跨平台一致）。
 
-    kind ∈ {live, logs, docs, settings, theme, sun, moon, gear}
+    kind ∈ {live, logs, docs, settings, theme, sun, moon, gear, refresh}
     gear / moon 用桌面 SVG 描边路径采样复刻,其余为几何绘制。
     x, y 为左上角,size 为图标像素边长。
     """
@@ -1027,6 +1051,19 @@ def draw_icon(canvas, kind, x, y, color, size=14):
     elif kind == "moon":
         # 桌面 half-moon.svg 月牙外形(描边),用于深色模式切换按钮
         _svg_stroke(canvas, MOON_SVG, x, y, size, color, stroke=1.5)
+    elif kind == "refresh":
+        # 循环箭头(刷新/重新扫描):一段圆弧 + 箭头尖
+        canvas.create_arc(
+            x + 2.5 * s, y + 2.5 * s, x + 11.5 * s, y + 11.5 * s,
+            start=40, extent=285, style="arc", outline=color, width=1.4 * s,
+        )
+        # 箭头尖(在圆弧终点处)
+        canvas.create_polygon(
+            x + 9.2 * s, y + 1.6 * s,
+            x + 12.4 * s, y + 2.6 * s,
+            x + 11.4 * s, y + 5.8 * s,
+            fill=color, outline="",
+        )
 
 
 class NavItem(tk.Canvas):
@@ -1117,10 +1154,44 @@ class IconButton(tk.Canvas):
         self._cmd = command
         self._hover = False
         self._tip = tip
+        self._tip_win = None
         self.bind("<Button-1>", lambda _e: self._cmd and self._cmd())
         self.bind("<Enter>", lambda _e: self._set_hover(True))
         self.bind("<Leave>", lambda _e: self._set_hover(False))
+        if tip:
+            # 纯图标按钮没有文字说明,必须给 tooltip,否则用户无从知道它是干什么的
+            self.bind("<Motion>", self._show_tip)
+            self.bind("<Leave>", self._hide_tip)
         self._draw()
+
+    def _show_tip(self, event):
+        if not self._tip or self._tip_win is not None:
+            return
+        th = theme()
+        try:
+            win = tk.Toplevel(self)
+            win.wm_overrideredirect(True)
+            win.configure(bg=th["border"])
+            tk.Label(
+                win, text=self._tip, bg=th["surface"], fg=th["text_2"],
+                font=_f(base_size() - 1), padx=6, pady=3,
+            ).pack()
+            win.update_idletasks()
+            x = self.winfo_rootx() + self._size // 2 - win.winfo_width() // 2
+            y = self.winfo_rooty() + self._size + 4
+            win.wm_geometry("+%d+%d" % (max(0, x), y))
+            self._tip_win = win
+        except Exception:
+            self._tip_win = None
+
+    def _hide_tip(self, _e=None):
+        win = self._tip_win
+        self._tip_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
 
     def set_icon(self, kind):
         self._icon = kind

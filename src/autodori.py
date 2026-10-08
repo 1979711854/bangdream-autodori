@@ -522,6 +522,10 @@ _game_seen_running = False  # 见过游戏在跑之后才启用「游戏退出�
 _shutting_down = False
 _lifecycle_lock = threading.Lock()
 
+# 用户显式指定的设备(端口 / 完整地址 / 序号)。非空时选设备阶段完全按它来,
+# 不做任何自动判定。由 --device / GUI 下拉框写入。
+DEVICE_OVERRIDE: str = ""
+
 
 def _request_exit(reason: str) -> None:
     """登记「关掉游戏并停止脚本」的请求(幂等)。
@@ -566,6 +570,9 @@ def _adb_shell(args: list, timeout: float = 6.0) -> Optional[str]:
             capture_output=True,
             text=True,
             timeout=timeout,
+            # 同 _adb_shell_on:中文 Windows 的 locale 编码是 GBK,adb 输出的
+            # UTF-8 字节会让 subprocess 抛 UnicodeDecodeError 而整个查询失败。
+            encoding="utf-8", errors="replace",
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as e:
@@ -586,6 +593,300 @@ def _game_process_running() -> Optional[bool]:
     if out is None:
         return None
     return bool(out.strip())
+
+
+# ---------------------------------------------------------------------------
+# 多开设备识别
+#
+# 背景:MuMu 多开时每个实例都是一个独立的 adb 设备(端口 16384 + 32n),
+# 界面上长得一模一样。而选设备发生在 GUI 启动的 bot 子进程里,拿不到 stdin,
+# 所以既不能弹窗询问、也**绝不能静默挑第一个** —— 那会让 minitouch 的绝对
+# 坐标点在别的游戏窗口上。
+#
+# 判定分层(越靠前越可靠):
+#   1. pm path <pkg>  —— 邦邦**已安装**。主判据:用户常态是「先开模拟器、
+#      点开始演出,再由脚本自己点开始游戏」,此时 pidof 全为空,所以不能把
+#      「进程存活」当唯一依据。
+#   2. pidof <pkg>   —— 邦邦**正在运行**。装了但没在玩的实例要降权。
+#   3. 端口号         —— 兜底:探测全失败时至少能让用户手动指定。
+#
+# 语义纪律:任何一层查询失败都返回 None(不可用),**绝不能当成「没装/没跑」**
+# —— 一次 adb 抖动会让所有实例看起来都是空的,导致误报 fatal 或错选设备。
+# 这与 _game_process_running 的三态口径一致。
+# ---------------------------------------------------------------------------
+
+_PROBE_TIMEOUT_S = 6.0
+
+
+def _adb_shell_on(dev, args: list, timeout: float = _PROBE_TIMEOUT_S):
+    """在指定设备上执行一条 shell 命令,查不到返回 None。
+
+    与 _adb_shell 的区别只在于「用哪个设备」:选设备阶段 device 还是 None,
+    必须显式传。返回 None 与「命令成功但输出为空」严格区分。
+    """
+    if dev is None:
+        return None
+    cmd = [str(dev.adb_path), "-s", str(dev.address), "shell"] + list(args)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            # 必须显式给编码:中文 Windows 的 locale 编码是 GBK,adb 回来的
+            # UTF-8 字节(设备名、包路径)会让它抛 UnicodeDecodeError。
+            # errors="replace" 保证解码失败也把输出拿回来 —— 这里只是做
+            # 「含不含某字符串」的判定,尾部乱码无害,远好过整条调用崩掉。
+            encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        logging.debug("探测 adb 失败 %s %s: %s", dev.address, args, e)
+        return None
+    err = (proc.stderr or "").strip()
+    if proc.returncode not in (0, 1) or err:
+        # rc=1 常是「包不存在」这类正常否定答案,但 stderr 有内容一律视为查询失败
+        logging.debug(
+            "探测 adb 异常 %s %s: rc=%s err=%s",
+            dev.address, args, proc.returncode, err[:200],
+        )
+        return None
+    return proc.stdout or ""
+
+
+def _probe_device(dev) -> dict:
+    """探测单个设备上邦邦的安装/运行状态。
+
+    返回 {"address","name","installed","running","foreground"}:
+      installed / running —— True / False / None(查不到)
+      foreground          —— True / False / None(查不到)
+    """
+    info = {
+        "address": str(getattr(dev, "address", "") or "?"),
+        "name": str(getattr(dev, "name", "") or "?"),
+        "installed": None,
+        "running": None,
+        "foreground": None,
+    }
+
+    # 1) 已安装?pm path 命中即返回 "package:/data/app/..." 路径
+    out = _adb_shell_on(dev, ["pm", "path", GAME_PACKAGE])
+    if out is not None:
+        info["installed"] = GAME_PACKAGE in out
+
+    # 2) 正在运行?
+    out = _adb_shell_on(dev, ["pidof", GAME_PACKAGE])
+    if out is not None:
+        info["running"] = bool(out.strip())
+
+    # 3) 在前台?装了但切到别的游戏时,应当让用户选那个真正在玩的实例
+    out = _adb_shell_on(dev, ["dumpsys", "window", "windows"])
+    if out is None:
+        # 老版本 dumpsys 不接受 windows 参数,退回全局查一次
+        out = _adb_shell_on(dev, ["dumpsys", "window"])
+    if out is not None and GAME_PACKAGE in out:
+        info["foreground"] = True
+    elif out is not None:
+        # 只在明确抓到 mCurrentFocus 行时才敢判 False;
+        # 抓不到焦点行(某些 ROM 不输出)保持 None,不误判。
+        focus = ""
+        for line in out.splitlines():
+            if "mCurrentFocus" in line or "mFocusedApp" in line:
+                focus = line
+                break
+        if focus:
+            info["foreground"] = GAME_PACKAGE in focus
+    return info
+
+
+def _probe_all_devices(devices: list) -> list:
+    """并发探测一批设备。单个设备失败不影响其他,失败的项 installed=None。"""
+    results = [None] * len(devices)
+
+    def work(i, dev):
+        try:
+            results[i] = _probe_device(dev)
+        except Exception as e:  # 探测绝不抛出:失败按「查不到」处理
+            logging.debug("探测设备异常 %s: %s", getattr(dev, "address", "?"), e)
+            results[i] = {
+                "address": str(getattr(dev, "address", "?") or "?"),
+                "name": str(getattr(dev, "name", "?") or "?"),
+                "installed": None, "running": None, "foreground": None,
+            }
+
+    threads = []
+    for i, dev in enumerate(devices):
+        t = threading.Thread(target=work, args=(i, dev), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=_PROBE_TIMEOUT_S * 3 + 5)
+    # 极端情况下 join 超时,补齐空洞,避免调用方拿到 None
+    for i, r in enumerate(results):
+        if r is None:
+            results[i] = {
+                "address": str(getattr(devices[i], "address", "?") or "?"),
+                "name": str(getattr(devices[i], "name", "?") or "?"),
+                "installed": None, "running": None, "foreground": None,
+            }
+    return results
+
+
+def _ensure_override_device(devices: list, requested: str) -> list:
+    """显式指定的实例若不在 MAA 枚举结果里,补一个进去。
+
+    背景:MAA 的 find_adb_devices 只认它自己配置里登记过的地址(默认只有
+    127.0.0.1:16384 一个)。多开时用户选第 2、3 个实例,它压根不在结果里,
+    于是「我明明选了它,却报没有可用设备」。
+
+    做法:按用户给的端口/地址直接 `adb connect`,再把它包成一个 AdbDevice
+    塞回列表。配置从已知设备**克隆**(同一个 adb_path + 同样的输入/截屏
+    方式),这样 screencap_methods / input_methods 这些能力配置不会丢 ——
+    直接 new 一个空 AdbDevice 会退化成通用 mjpg/inject,打歌会崩。
+    """
+    want = str(requested or "").strip()
+    if not want:
+        return devices
+    # 已在内(按端口或完整地址比对)则不动
+    for d in devices:
+        addr = str(getattr(d, "address", "") or "")
+        if want in (addr, addr.split(":")[-1]):
+            return devices
+    if not devices:
+        logging.error(
+            "未枚举到任何模拟器设备,无法使用 --device %s 指定的实例", want
+        )
+        return devices
+
+    adb_path = devices[0].adb_path
+    # 把用户写的东西归一成 host:port
+    if want.isdigit():
+        address = "127.0.0.1:%s" % want
+    elif ":" in want:
+        address = want
+    else:
+        address = want
+
+    # 连一次:失败说明这个实例根本没在跑,早报错比让用户对着死端口猜强
+    try:
+        proc = subprocess.run(
+            [str(adb_path), "connect", address],
+            capture_output=True, text=True, timeout=8,
+            # 同 _adb_shell_on:显式 UTF-8 + replace。这里输出直接决定
+            # 连不连得上,绝不能因为解码失败就误判成「连接失败」。
+            encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        out = (proc.stdout or "").strip()
+        logging.info("adb connect %s: %s", address, out or "(无输出)")
+        low = out.lower()
+        if proc.returncode != 0 or (
+            "connected" not in low and "already" not in low
+        ):
+            logging.error(
+                "无法连接指定的实例 %s —— 请确认该模拟器已启动。"
+                "MuMu 多开第 n 个实例的端口为 16384 + 32n。",
+                address,
+            )
+            return devices
+    except Exception as e:
+        logging.error("adb connect %s 失败: %s", address, e)
+        return devices
+
+    try:
+        extra = AdbDevice(
+            name="MuMu (指定实例 %s)" % address.split(":")[-1],
+            adb_path=adb_path,
+            address=address,
+            screencap_methods=devices[0].screencap_methods,
+            input_methods=devices[0].input_methods,
+            config=devices[0].config,
+        )
+    except Exception as e:
+        logging.error("构造指定实例的设备对象失败: %s", e)
+        return devices
+
+    logging.info("已按 --device %s 追加该实例到候选设备", address)
+    return list(devices) + [extra]
+
+
+def _format_device_choices(probes: list) -> str:
+    """把探测结果渲染成给用户看的候选清单。"""
+    if not probes:
+        return "(没有枚举到任何 MuMu / 雷电模拟器设备)"
+    lines = []
+    for i, p in enumerate(probes):
+        tags = []
+        if p["installed"] is True:
+            tags.append("已装邦邦")
+        elif p["installed"] is False:
+            tags.append("未装邦邦")
+        else:
+            tags.append("安装状态未知")
+        if p["running"] is True:
+            tags.append("运行中")
+        elif p["running"] is False:
+            tags.append("未运行")
+        if p["foreground"] is True:
+            tags.append("在前台")
+        lines.append(
+            "  [{}] {} ({})  {}".format(i, p["name"], p["address"], "、".join(tags))
+        )
+    return "\n".join(lines)
+
+
+def _pick_device_by_probe(probes: list, requested: str = "") -> int:
+    """按探测结果挑出应该使用的设备下标。返回 -1 表示挑不出来。
+
+    requested 非空(用户/CLI 显式指定)时按「端口或序号匹配」精确命中,
+    不做任何推断 —— 显式指定永远优先于自动判定。
+    """
+    # ① 显式指定:允许写端口(16416)、完整地址(127.0.0.1:16416)或序号(0)
+    want = str(requested or "").strip()
+    if want:
+        for i, p in enumerate(probes):
+            addr = p["address"]
+            port = addr.split(":")[-1]
+            # 序号写法(0/1/2…)是 MuMu 多开器的通用说法(参考实现也用
+            # device.instance),端口则是完整地址。两者都接受,数字相同时
+            # 以端口为准 —— 16384 显然是端口而不是序号。
+            if want in (addr, port) or (want.isdigit() and int(want) == i):
+                logging.info("使用指定的设备: [%d] %s (%s)", i, p["name"], addr)
+                return i
+        logging.error("指定的设备「%s」不在候选列表中", want)
+        return -1
+
+    # ② 装了邦邦的实例就是候选集(installed=False 的直接排除:
+    #    它连包都没有,选它必然连错游戏)
+    installed = [i for i, p in enumerate(probes) if p["installed"] is True]
+    if not installed:
+        # ③ 探测全部不可用/都没装 —— 唯一能做的就是让用户自己指定,
+        #    绝不静默挑第一个(那正是「操作到其他游戏窗口」的成因)
+        return -1
+    if len(installed) == 1:
+        logging.info(
+            "自动识别到邦邦实例: [%d] %s (%s)",
+            installed[0], probes[installed[0]]["name"], probes[installed[0]]["address"],
+        )
+        return installed[0]
+
+    # ④ 多个实例都装了邦邦:优先选「正在运行」的,再优先「在前台」的
+    running = [i for i in installed if probes[i]["running"] is True]
+    if len(running) == 1:
+        logging.info(
+            "自动识别到正在运行的邦邦实例: [%d] %s (%s)",
+            running[0], probes[running[0]]["name"], probes[running[0]]["address"],
+        )
+        return running[0]
+    fg = [i for i in running if probes[i]["foreground"] is True]
+    if len(fg) == 1:
+        logging.info(
+            "自动识别到前台邦邦实例: [%d] %s (%s)",
+            fg[0], probes[fg[0]]["name"], probes[fg[0]]["address"],
+        )
+        return fg[0]
+    # ⑤ 依然无法唯一确定 —— 交给用户,见 init_maa 的报错分支
+    return -1
 
 
 def _wait_game_exit(timeout: float) -> bool:
@@ -1792,17 +2093,37 @@ def init_maa():
     filter_str = config.get("device", {}).get("filter", "devices")
     _device = eval(filter_str, {}, {"devices": _device})
 
+    # 用户显式指定了实例,但它可能不在 MAA 枚举结果里 ——
+    # MAA 只认自己配置中登记过的地址(默认仅 127.0.0.1:16384)。
+    # 多开时用户选的第 2、3 个实例就会漏掉,表现为「我明明选了它,却连不上」。
+    # 这里显式 adb connect 一次,让 MAA 的下一次 find 能认出它。
+    _device = _ensure_override_device(_device, DEVICE_OVERRIDE)
+
     if not _device:
         logging.fatal("No supported devices were found.")
         sys.exit(1)
-    elif len(_device) == 1:
+    elif len(_device) == 1 and not DEVICE_OVERRIDE:
         device = _device[0]
-    elif len(_device) > 1:
-        print("Multiple devices were found:")
-        for i, device in enumerate(_device):
-            print(f"{i}: {device.name}({device.address})")
-        selected = input("Select a device: ")
-        device = _device[int(selected)]
+    else:
+        # 多个设备(或显式指定):靠包名探测自动判定「哪个才是邦邦」。
+        # 这里绝对不能有 input() —— GUI 启动的 bot 子进程没有 stdin 通道,
+        # 拿不到输入;更不能静默挑第一个,那会让 minitouch 的绝对坐标点在
+        # 别的游戏窗口上(见 _probe_device 上方的分层说明)。
+        probes = _probe_all_devices(_device)
+        logging.info("检测到 %d 个模拟器实例,逐个探测邦邦:", len(probes))
+        for line in _format_device_choices(probes).splitlines():
+            logging.info("%s", line)
+        idx = _pick_device_by_probe(probes, DEVICE_OVERRIDE)
+        if idx < 0:
+            logging.fatal(
+                "无法确定哪个实例是邦邦游戏 —— 为避免操作到其他游戏窗口,已停止。\n"
+                "请在 GUI 的「演出设置」里选择「模拟器实例」,或用命令行 "
+                "--device 指定端口/序号。\n候选设备:\n%s",
+                _format_device_choices(probes),
+            )
+            sys.exit(1)
+        device = _device[idx]
+
     maacontroller = AdbController(
         adb_path=device.adb_path,
         address=device.address,
@@ -2219,14 +2540,26 @@ def _main_impl():
         action="store_true",
         help="Specify if skip version check",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="",
+        help=(
+            "指定要使用的模拟器实例:MuMu 多开时填端口(如 16416)、"
+            "完整地址(如 127.0.0.1:16416)或候选序号(如 0)。"
+            "留空则按已安装邦邦的实例自动判定。"
+        ),
+    )
     args = parser.parse_args()
+
+    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE
+    DEVICE_OVERRIDE = str(args.device or "").strip()
 
     if not args.skip_version_check:
         get_current_version()
         if current_version != None:
             check_update()
 
-    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE
     if args.mode == "special":
         # 活动曲固定按 SPECIAL 谱面打;入口节点是 special_wait(不是 main),
         # 因为整条流程不做选曲 —— 见 assets/resource/pipeline/special.json。
