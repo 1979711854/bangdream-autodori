@@ -476,21 +476,35 @@ def test_gui():
     tree = ast.parse(src)
     cls = next(n for n in tree.body
                if isinstance(n, ast.ClassDef) and "AutodoriGUI" in n.name)
-    start_fn = next(n for n in cls.body
-                    if isinstance(n, ast.FunctionDef) and n.name == "start")
+    # 参数拼装可能有两处：start() 里的 bot_args = [...],
+    # 或抽成独立方法 _bot_args(mode) 后 start() 只调它（挑战演出那样做）。
+    # 两种都要查，否则新结构会被漏掉 → 回归测试形同虚设。
+    def _check_args(fn):
+        out = []
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "bot_args" for t in node.targets
+            ):
+                if not isinstance(node.value, (ast.List, ast.Tuple)):
+                    continue
+                for el in node.value.elts:
+                    if isinstance(el, ast.Constant) and isinstance(el.value, str):
+                        continue
+                    if isinstance(el, ast.Call) and isinstance(el.func, ast.Name) \
+                            and el.func.id == "str":
+                        continue
+                    out.append(ast.dump(el)[:60])
+        return out
+
+    checked = 0
     bad = []
-    for node in ast.walk(start_fn):
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "bot_args" for t in node.targets
-        ):
-            for el in node.value.elts:
-                if isinstance(el, ast.Constant) and isinstance(el.value, str):
-                    continue
-                if isinstance(el, ast.Call) and isinstance(el.func, ast.Name) \
-                        and el.func.id == "str":
-                    continue
-                bad.append(ast.dump(el)[:60])
+    for fn in [n for n in cls.body if isinstance(n, ast.FunctionDef)]:
+        if fn.name not in ("start", "_bot_args"):
+            continue
+        bad += ["%s: %s" % (fn.name, g) for g in _check_args(fn)]
+        checked += 1
     check("bot_args 每项都是 str 或不含裸表达式", not bad, bad)
+    check("参数拼装代码有被检查到（结构变了别漏）", checked > 0, checked)
 
 
 def test_gui_render():
