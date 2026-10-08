@@ -48,11 +48,13 @@ from minitouchpy import (
 import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
+from challenge import ChallengeCPRecognition, SelectChallengeCP, challenge_overrides, click
 import envcheck
 from util import *
 
 MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
+CHALLENGE_FINISH = "home"
 DIFFICULTY = "hard"
 # ---- 超高难度 SPECIAL 活动(限时单曲) ----
 # 活动入口由玩家手动进入:玩家把界面停在「开演前的确认页」,脚本从那里接管
@@ -78,6 +80,8 @@ if _timing_cfg.get("photogate_latency_ms") is not None:
     PHOTOGATE_LATENCY = int(_timing_cfg["photogate_latency_ms"])
     print("PHOTOGATE_LATENCY set to {}ms".format(PHOTOGATE_LATENCY))
 maaresource = Resource()
+maaresource.register_custom_recognition("ChallengeCPRecognition", ChallengeCPRecognition())
+maaresource.register_custom_action("SelectChallengeCP", SelectChallengeCP())
 maatasker = Tasker()
 maacontroller: AdbController = None
 device: AdbDevice = None
@@ -433,7 +437,7 @@ class SongRecognition(CustomRecognition):
         if song_id is None:
             return CustomRecognition.AnalyzeResult(None, "")
 
-        if not check_song_available(result_music_name, song_id, DIFFICULTY):
+        if LIVEMODE != "challengelive" and not check_song_available(result_music_name, song_id, DIFFICULTY):
             return CustomRecognition.AnalyzeResult(None, "")
 
         # 把选中的 id 交给紧随其后的 SaveSong 动作(同名多条目时不能再靠标题查表)
@@ -1423,6 +1427,15 @@ class SaveSong(CustomAction):
         return CustomAction.RunResult(True)
 
 
+@maaresource.custom_action("StartChallengeLive")
+class StartChallengeLive(CustomAction):
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        if current_chart is None:
+            logging.error("挑战谱面尚未准备，停止演出。")
+            return False
+        return click(context, "_challenge_start_live", [1040, 584, 185, 87])
+
+
 # 曲库里同一首歌可能有多个条目,靠标题前缀区分,而它们是**完全不同的谱面**:
 #   `[FULL] キズナミュージック♪`(#249, expert 1485 音符) 与
 #   `キズナミュージック♪`(#158, expert 436 音符)。
@@ -2354,6 +2367,10 @@ def _get_override_pipeline():
         livemode_pipeline["expected"] = "挑战演出"
     all_pipelines["select_live_mode"] = livemode_pipeline
 
+    if LIVEMODE == "challengelive":
+        for name, override in challenge_overrides(CHALLENGE_FINISH).items():
+            all_pipelines.setdefault(name, {}).update(override)
+
     return all_pipelines
 
 
@@ -2521,6 +2538,12 @@ def _main_impl():
         default="freelive",
     )
     parser.add_argument(
+        "--challenge-finish",
+        choices=["home", "exit"],
+        default="home",
+        help="挑战演出 CP 不足 200 后的动作: home 返回主页面, exit 退出游戏",
+    )
+    parser.add_argument(
         "--liveboost",
         type=int,
         default=1,
@@ -2552,7 +2575,7 @@ def _main_impl():
     )
     args = parser.parse_args()
 
-    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE
+    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE, CHALLENGE_FINISH
     DEVICE_OVERRIDE = str(args.device or "").strip()
 
     if not args.skip_version_check:
@@ -2571,6 +2594,7 @@ def _main_impl():
         DIFFICULTY = args.difficulty
         entry = "main"
     LIVEMODE = args.livemode
+    CHALLENGE_FINISH = args.challenge_finish
     MIN_LIVEBOOST = args.liveboost
     init_maa()
     init_player_and_mnt()

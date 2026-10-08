@@ -52,9 +52,10 @@ CONFIG = os.path.join(BASE, "data", "config.yml")
 GUI_CONFIG = os.path.join(BASE, "data", "gui_config.json")
 BUILD_META = os.path.join(BASE, "assets", "build_metadata.json")
 
-# 演出模式仅支持自由演出,禁止协力模式(challengelive)
+# 顶栏的常规演出固定使用自由演出；挑战演出由独立按钮启动。
 LIVE_MODE = "freelive"
 DIFFICULTIES = ["easy", "normal", "hard", "expert", "special"]
+CHALLENGE_DIFFICULTIES = ["easy", "normal", "hard", "expert"]
 # 超高难度 SPECIAL 活动(限时单曲):曲目固定、难度固定 SPECIAL、不打循环。
 # 标题写法必须与曲库一致(简中客户端标题),也可直接填 Bestdori 曲目 id。
 SPECIAL_SONGS = (
@@ -96,6 +97,7 @@ PLAY_RE = re.compile(r"打歌:\s*(.+?)\s*\(#\d+-\w+\)")
 OPTION_TREE = (
     ("演出", (
         ("live.show", "演出设置", "live"),
+        ("live.challenge", "挑战演出清 CP", "live"),
         ("live.special", "超高难度活动", "live"),
         ("live.gate", "时基校准", "settings"),
     )),
@@ -115,7 +117,7 @@ OPTION_TREE = (
 VIEW_KEYS = [k for _, items in OPTION_TREE for k, _, _ in items]
 
 # 底部状态栏环境信息
-ENV_INFO = ("自由演出 · freelive", "MuMu Player 12", "1280 × 720")
+ENV_INFO = ("自由 / 挑战演出", "MuMu Player 12", "1280 × 720")
 
 
 def _parse_play_result(line):
@@ -180,8 +182,8 @@ NOTES = """【模拟器设置】
 
 【游戏设置】
 • 游戏:邦邦国服(bilibili)
-• 演出模式仅支持自由演出(freelive),不支持协力模式
-• 选曲列表设为"正常",清空歌曲筛选器
+• 支持自由演出(freelive)和挑战演出(challengelive),不支持协力模式
+• 自由演出的选曲列表设为"正常",清空歌曲筛选器
 • 演出设定:将流速调整为 8.0
 • 演出效果·音量设定:关闭"3D切入模式","动作模式"改为"轻量模式"
 • 演出效果·音量设定:启用"FAST/SLOW表示"和"Perfect状态显示"
@@ -247,7 +249,8 @@ Q:我发现了 BUG?
 A:可以反馈到 GitHub Issues。
 
 Q:如何指定打某一首歌?
-A:代码本身暂不支持直接指定某首歌,但可以手动把想打的歌加入游戏内的收藏,让脚本只从收藏里随机选,相当于只打那一首。
+A:自由演出可手动把想打的歌加入游戏内的收藏,让脚本只从收藏里选;
+挑战演出请先在游戏里选好歌曲和乐队,再从「挑战演出清 CP」页启动。
 """
 
 
@@ -329,6 +332,10 @@ class AutodoriGUI:
 
         # 运行参数(重建界面时保留)
         self.difficulty = cfg.get("difficulty", "expert")
+        self.challenge_difficulty = cfg.get("challenge_difficulty", "hard")
+        if self.challenge_difficulty not in CHALLENGE_DIFFICULTIES:
+            self.challenge_difficulty = "hard"
+        self.challenge_exit_game = bool(cfg.get("challenge_exit_game", False))
         self.boost_mode = cfg.get("boost_mode", "继续打歌")
         self.life_mode = cfg.get("life_mode", "自动退出重新选歌")
         self.auto_cal = bool(cfg.get("auto_cal", False))
@@ -382,6 +389,8 @@ class AutodoriGUI:
             "window_size": self.window_size,
             "view": self.view,
             "difficulty": self.difficulty,
+            "challenge_difficulty": self.challenge_difficulty,
+            "challenge_exit_game": self.challenge_exit_game,
             "boost_mode": self.boost_mode,
             "life_mode": self.life_mode,
             "auto_cal": bool(self.auto_cal),
@@ -474,8 +483,8 @@ class AutodoriGUI:
         self.stop_btn = W.PushButton(bar, "停止", command=self.stop,
                                      kind="secondary", width=88, height=34)
         self.stop_btn.pack(side="right", padx=(0, 16))
-        self.start_btn = W.PushButton(bar, "开始演出", command=self.start,
-                                      kind="primary", width=112, height=34)
+        self.start_btn = W.PushButton(bar, "开始自由演出", command=self.start,
+                                      kind="primary", width=144, height=34)
         self.start_btn.pack(side="right", padx=(0, 8))
 
     def _build_sidebar(self):
@@ -562,6 +571,7 @@ class AutodoriGUI:
         self.device_status = None
         self.device_refresh_btn = None
         self.device_preview_btn = None
+        self.challenge_start_btn = None
         for key, item in self.nav_items.items():
             item.select(key == self.view)
 
@@ -598,7 +608,7 @@ class AutodoriGUI:
                                   fg=th["text"],
                                   font=T.font(self.font_size + 3, "bold"))
         self.run_state.pack(side="left", padx=8)
-        self.run_hint = tk.Label(head, text="配置完成后点击右上角「开始演出」",
+        self.run_hint = tk.Label(head, text="选择模式并点击对应的开始按钮",
                                  bg=th["surface"], fg=th["text_3"],
                                  font=T.font(self.font_size - 1))
         self.run_hint.pack(side="left")
@@ -622,7 +632,7 @@ class AutodoriGUI:
         self.m_songs = W.Metric(metrics, "已完成", "%d 首" % self.songs_done)
         self.m_songs.pack(side="left")
 
-        tk.Label(card.body, text="提示:若「开始演出」首次点击无反应,关闭窗口重新打开一次即可",
+        tk.Label(card.body, text="提示:若开始按钮首次点击无反应,关闭窗口重新打开一次即可",
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(12, 0))
         return card
@@ -643,6 +653,8 @@ class AutodoriGUI:
         """按当前选项渲染对应的设置卡片。"""
         if self.view == "live.show":
             return self._detail_show(master)
+        if self.view == "live.challenge":
+            return self._detail_challenge(master)
         if self.view == "live.special":
             return self._detail_special(master)
         if self.view == "live.gate":
@@ -699,6 +711,51 @@ class AutodoriGUI:
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(10, 0))
         return card
 
+    def _detail_challenge(self, master):
+        th = T.get()
+        card = W.Card(master)
+        W.SectionTitle(card.body, "挑战演出清 CP",
+                       "按剩余 CP 自动选择可用倍率").pack(fill="x", pady=(0, 12))
+
+        self._device_row(card.body)
+
+        r = W.Row(card.body, "难度")
+        r.pack(fill="x", pady=(0, 16))
+        W.DropdownBox(r.slot, CHALLENGE_DIFFICULTIES,
+                      value=self.challenge_difficulty, width=200, min_width=180,
+                      on_change=self._on_challenge_difficulty).pack(side="left")
+
+        for line in (
+            "先在游戏里选好挑战歌曲和队伍，停在挑战选曲界面。",
+            "按剩余CP选择最高可用倍率:8一4一2一1倍；不足200 CP时停止。",
+        ):
+            tk.Label(card.body, text=line, bg=th["surface"], fg=th["text_2"],
+                     font=T.font(self.font_size - 1), anchor="w",
+                     justify="left").pack(anchor="w", pady=(0, 6))
+
+        exit_game = tk.BooleanVar(master=card.body, value=self.challenge_exit_game)
+        tk.Checkbutton(
+            card.body, text="清完 CP 后退出游戏（未勾选则返回主页面）",
+            variable=exit_game,
+            command=lambda: self._on_challenge_exit_game(exit_game.get()),
+            bg=th["surface"], fg=th["text_2"], selectcolor=th["surface"],
+            activebackground=th["surface"], activeforeground=th["text_2"],
+            font=T.font(self.font_size - 1), anchor="w",
+        ).pack(anchor="w", pady=(8, 12))
+        self.challenge_start_btn = W.PushButton(
+            card.body, "开始清 CP", command=lambda: self.start(mode="challenge"),
+            kind="primary", width=160, height=36)
+        self.challenge_start_btn.pack(anchor="w", pady=(0, 4))
+        return card
+
+    def _on_challenge_difficulty(self, value):
+        self.challenge_difficulty = value
+        self._save_gui_config()
+
+    def _on_challenge_exit_game(self, value):
+        self.challenge_exit_game = value
+        self._save_gui_config()
+
     def _detail_special(self, master):
         """超高难度 SPECIAL 活动(hard-coded 单曲,独立于自由演出配置)。
 
@@ -734,7 +791,7 @@ class AutodoriGUI:
                      anchor="w", justify="left").pack(anchor="w", pady=(6 if i == 1 else 2, 0))
 
         tk.Label(card.body,
-                 text="注意:GUI 右上角的「开始演出」按钮走的是常规自由演出,与本页无关",
+                 text="注意:GUI 右上角的「开始自由演出」按钮走的是常规自由演出,与本页无关",
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(14, 8))
 
@@ -889,7 +946,7 @@ class AutodoriGUI:
         for k, v in (
             ("项目", "BanG Dream · 邦邦自动挖矿助手"),
             ("版本", "v" + self._version()),
-            ("演出模式", "自由演出 (freelive)"),
+            ("演出模式", "自由演出 / 挑战演出"),
             ("分辨率", "1280 × 720 · MuMu Player 12"),
             ("仓库", "github.com/1979711854/bangdream-autodori"),
             ("提醒", "仅供个人学习使用,请遵守游戏规则与用户协议"),
@@ -1155,12 +1212,22 @@ class AutodoriGUI:
         self._set_cal("photogate 已恢复为默认 30ms")
 
     # ---------- start / stop ----------
-    def start(self, mode="main"):
-        """拉起 bot。mode="main" 走常规挖矿;mode="special" 走超高难度活动。
+    def _bot_args(self, mode):
+        if mode == "special":
+            args = ["--mode", "special", "--special-song", str(self.special_song)]
+        elif mode == "challenge":
+            args = ["--mode", "main", "--difficulty", str(self.challenge_difficulty),
+                    "--livemode", "challengelive", "--challenge-finish",
+                    "exit" if self.challenge_exit_game else "home"]
+        else:
+            args = ["--mode", "main", "--difficulty", str(self.difficulty),
+                    "--livemode", LIVE_MODE]
+        if self.device_address:
+            args += ["--device", str(self.device_address)]
+        return args
 
-        两种模式各由界面上的不同按钮触发(顶栏「开始演出」= main,超高难度
-        活动卡片里的按钮 = special),不做"看当前页面猜模式"的隐式分流。
-        """
+    def start(self, mode="main"):
+        """按按钮指定的模式拉起 bot。顶栏始终启动自由演出。"""
         if self.proc is not None and self.proc.poll() is None:
             messagebox.showwarning("已在运行", "bot 已在运行,请先停止。")
             return
@@ -1176,17 +1243,7 @@ class AutodoriGUI:
             self.gate_step.commit()
         self._write_config()
 
-        if mode == "special":
-            # 活动曲固定 SPECIAL 难度、由 bot 自己从曲库解析曲目,不走选歌流程
-            bot_args = ["--mode", "special",
-                        "--special-song", str(self.special_song)]
-        else:
-            bot_args = ["--mode", "main", "--difficulty", str(self.difficulty),
-                        "--livemode", str(LIVE_MODE)]
-        # 选定了具体实例就带上 --device。多开时这是防止连错窗口的关键:
-        # 留空则由 bot 按「装了邦邦的实例」自动判定。
-        if self.device_address:
-            bot_args += ["--device", str(self.device_address)]
+        bot_args = self._bot_args(mode)
 
         if getattr(sys, "frozen", False):
             bot = os.path.join(BASE, "autodori.exe")
@@ -1238,6 +1295,8 @@ class AutodoriGUI:
         "Mumu and MNT inited",
         "Save song",
         "Start play",
+        "剩余",
+        "无法识别挑战点数",
         ">>> ",
         "退出",
         "生命值耗尽",
@@ -1385,6 +1444,12 @@ class AutodoriGUI:
                     self.special_start_btn.set_enabled(not running)
             except Exception:
                 pass
+        if getattr(self, "challenge_start_btn", None):
+            try:
+                if self.challenge_start_btn.winfo_exists():
+                    self.challenge_start_btn.set_enabled(not running)
+            except Exception:
+                pass
         if getattr(self, "run_dot", None):
             self.run_dot.set(th["ok"] if running else th["idle"])
         if getattr(self, "run_state", None):
@@ -1392,7 +1457,7 @@ class AutodoriGUI:
         if getattr(self, "run_hint", None):
             self.run_hint.configure(
                 text="正在自动演出,请勿操作电脑" if running
-                else "配置完成后点击右上角「开始演出」")
+                else "选择模式并点击对应的开始按钮")
         if getattr(self, "status_dot", None):
             self.status_dot.set(th["ok"] if running else th["idle"])
         if getattr(self, "status_text", None):

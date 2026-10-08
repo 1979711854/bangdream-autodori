@@ -219,6 +219,7 @@ for _doc in ("README.md", "CHANGELOG.md", "RELEASE_NOTES.md"):
         shutil.copy(_doc_src, os.path.join(dist_dir, _doc))
     else:
         print(f"warning: {_doc} not found, skipped")
+shutil.copy(os.path.join(current_dir, "run_challenge_live.bat"), dist_dir)
 if os.path.isdir(os.path.join(current_dir, "screenshots")):
     shutil.copytree(
         os.path.join(current_dir, "screenshots"),
