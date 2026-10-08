@@ -172,34 +172,51 @@ def list_mumu_instances(manager: str) -> list:
 
     与 MAA 内部用的完全是同一套命令(MAA 的 find_mumu_serials 也走
     MuMuManager),所以 GUI 看到的实例集合与 bot 侧一致。
-    返回 [{"index": int, "name": str, "started": bool, "android": bool}];
+    返回 [{"index", "name", "port", "started", "android"}];
+    `port` 是权威的 adb 端口 —— discover() 靠它把实例名对上正确的设备,
+    不用列表下标(下标对齐在多开/多模拟器混跑时会错配)。
     找不到 manager 或全部查询失败时返回 None(表示"查不到",不是"没有实例")。
     """
     if not manager:
         return None
     found = []
-    for idx in range(16):  # MuMu 最多 16 开,超出的直接停
-        try:
-            proc = subprocess.run(
-                [manager, "info", "--vmindex", str(idx)],
-                capture_output=True, text=True, timeout=_TIMEOUT,
-                # 同 _run:显式 UTF-8 + replace,否则实例名含中文时会解码失败
-                encoding="utf-8", errors="replace",
-                creationflags=_CREATE_NO_WINDOW,
-            )
-        except Exception:
-            break
-        try:
-            data = json.loads(proc.stdout or "")
-        except Exception:
-            break
+    # 用 `info -v all` 一次拿全部实例,而不是逐个 `--vmindex N`:
+    #   · N 次进程启动 + N 次 RPC ≈ 几秒,一次只要几百毫秒;
+    #   · 单查(`--vmindex N`)在实例**未启动时不返回 adb_port**,字段不全;
+    #     `-v all` 在实例启动后字段完整(实测对比过两种输出)。
+    try:
+        proc = subprocess.run(
+            [manager, "info", "-v", "all"],
+            capture_output=True, text=True, timeout=_TIMEOUT * 3,
+            # 同 _run:显式 UTF-8 + replace,否则实例名含中文时会解码失败
+            encoding="utf-8", errors="replace",
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except Exception:
+        return None
+    try:
+        allinfo = json.loads(proc.stdout or "")
+    except Exception:
+        return None
+    if not isinstance(allinfo, dict):
+        return None
+    # 输出形如 {"0": {...}, "1": {...}} —— 按 index 排,保证顺序稳定。
+    for key in sorted(allinfo, key=lambda k: str(k)):
+        data = allinfo[key]
         if not isinstance(data, dict) or data.get("errcode"):
-            break  # -200 = player index not found,后面没有了
-        if "index" not in data:
-            break
+            continue
+        idx = data.get("index", key)
+        try:
+            idx = int(idx)
+        except Exception:
+            continue
         found.append({
             "index": int(data.get("index", idx)),
             "name": str(data.get("name") or ("MuMu模拟器 %s" % idx)),
+            # adb_port 在 info 输出里是权威端口;取不到就留空,让调用方退回
+            # index 匹配 —— **不要**用"16384+32*index"反推,不同版本/渠道
+            # 不保证符合那个规律,猜出来的端口会把名字贴到错误的设备上。
+            "port": str(data.get("adb_port") or ""),
             "started": bool(data.get("is_process_started")),
             "android": bool(data.get("is_android_started")),
         })
@@ -303,6 +320,58 @@ def _guess_ports(adb: str, count: int = 8) -> list:
     # 按候选顺序返回,保证下拉框里端口是升序(用户预期)
     return [a for a in ("127.0.0.1:%d" % p for p in candidates) if a in found]
 
+def _device_fingerprint(adb: str, address: str) -> str:
+    """取设备内唯一标识,用来判断两个端口是不是**同一台**设备。
+
+    动机(实测踩到):开了两个 MuMu 实例后,`adb devices` 会报**四条**:
+        127.0.0.1:16384  127.0.0.1:16416  127.0.0.1:5555  127.0.0.1:5557
+    但 5555/5557 是 MuMu 早期用的端口,adb 连接记录没被清理,重新 connect
+    后又冒出来 —— 实测 `settings get secure android_id` 与
+    `/proc/sys/kernel/random/boot_id` 显示 5555 与 16384 **完全相同**,
+    5557 与 16416 也相同,也就是**只有 2 台设备却出现 4 个选项**。
+
+    这些"影子"必须去掉,否则用户会以为要选 4 次,而且可能连错窗口。
+    返回空串表示取不到(那就不去重,宁可多列也不误删)。
+    """
+    for args in (["settings", "get", "secure", "android_id"],
+                 ["cat", "/proc/sys/kernel/random/boot_id"]):
+        out = _adb_shell(adb, address, args)
+        val = (out or "").strip()
+        if val and val not in ("null", ""):
+            return val
+    return ""
+
+
+def _dedupe_same_device(adb: str, devices: list, official_ports: set) -> list:
+    """同一台设备被多个端口连上时只保留一个。
+
+    保留规则:优先留 MuMuManager 认可的端口(实例真身),否则留端口号最小的
+    —— 目的是让下拉框里的端口与用户预期(MuMu 的 16384/16416)一致,
+    而不是留下一串看着莫名其妙的 5555。
+    """
+    by_fp, kept, dropped = {}, [], []
+    for dev in devices:
+        fp = _device_fingerprint(adb, dev["address"])
+        if not fp:
+            kept.append(dev)
+            continue
+        if fp not in by_fp:
+            by_fp[fp] = dev
+            kept.append(dev)
+            continue
+        # 撞上了:按规则挑一个留下
+        win = by_fp[fp]
+        win_is_official = win["port"] in official_ports
+        dev_is_official = dev["port"] in official_ports
+        if dev_is_official and not win_is_official:
+            kept[kept.index(win)] = dev
+            by_fp[fp] = dev
+            dropped.append(win)
+        else:
+            dropped.append(dev)
+    return kept
+
+
 def _describe_all(adb: str, addresses: list) -> list:
     """并发探测一批设备。单个失败不影响其他,返回顺序与输入一致。
 
@@ -368,18 +437,30 @@ def discover(adb: str = "", manager: str = "") -> dict:
             if addr not in ports:
                 ports.append(addr)
 
+    # 实例名要**按端口/index 对应**,不能用列表下标硬凑。
+    # 反例(实测会遇到):adb 已在线的设备顺序与 MuMuManager 返回的实例顺序
+    # 未必一致 —— 例如 5555(雷电)排在 16384(MuMu)前面,下标对齐就会把
+    # 雷电那台显示成 MuMu 的名字。多开时这种错配会让用户选错实例。
+    by_port = {}
+    for inst in (instances or []):
+        if inst.get("port"):
+            by_port.setdefault(inst["port"], inst)
+
     devices = []
     infos = _describe_all(adb, ports)
     for i, addr in enumerate(ports):
         info = infos[i]
         port = addr.split(":")[-1] if ":" in addr else addr
         name = "模拟器实例 %s" % port
-        # 有 MuMuManager 的权威数据就换成它的实例名
-        try:
-            if instances and i < len(instances):
-                name = instances[i]["name"]
-        except Exception:
-            pass
+        # 实例名只认端口精确匹配。**不要**退回按列表下标硬凑 ——
+        # MuMuManager 列出的是「全部已创建的实例」,含未启动/未初始化的空壳;
+        # 而 ports 来自「当前在线的 adb 设备」。两者长度和顺序都不保证一致,
+        # 下标对齐会把名字贴到错误的设备上(实测本机就有一个 index=1 的
+        # 空实例,disk_size=0,从未启动)。匹配不上就用中性名,宁可信息少
+        # 也不能贴错 —— 用户据此判断连哪台,贴错等于连错窗口。
+        inst = by_port.get(str(port))
+        if inst is not None:
+            name = inst["name"]
         devices.append({
             "address": addr,
             "port": str(port),
@@ -389,21 +470,44 @@ def discover(adb: str = "", manager: str = "") -> dict:
             "running": info["running"],
             "foreground": info["foreground"],
         })
+    # 同一台设备常会被多个端口连上(实测:两个 MuMu 实例 → adb 报 4 条,
+    # 其中 5555/5557 是影子端口,android_id 与 16384/16416 相同)。
+    # 不去掉的话用户会看到 4 个选项、以为要选 4 次,还可能连错窗口。
+    if len(devices) > 1:
+        official = set()
+        for inst in (instances or []):
+            if inst.get("port"):
+                official.add(inst["port"])
+        devices = _dedupe_same_device(adb, devices, official)
     return {"adb": adb, "manager": manager, "devices": devices}
 
 
 def label_for(dev: dict) -> str:
     """给下拉框生成标签。
 
-    **刻意不写「已装邦邦 / 这是邦邦」之类的断言** —— 实测多开场景下
-    MuMu 往往克隆实例镜像，每个实例都装了同一个游戏，`pm path` / `pidof`
-    对它们返回完全一样的结果,据此宣称"哪个是邦邦"是**误导**。
-    这里只给用户能自己核对的事实:实例名(来自 MuMuManager)+ 端口/序号,
-    外加「在前台」这种一眼可验证的状态(用户看屏幕就知道对不对)。
+    这里报的是**本实例内的事实**（「装了什么游戏」），不是「哪个实例才是邦邦」
+    —— 后者在克隆镜像多开下确实无法区分（`pm path` / `pidof` 对每个实例返回
+    一样），但那是另一个维度的问题。别把两者混为一谈：
+
+      · 单模拟器 + 装了多个游戏（实测用户的场景，如同时装邦邦与碧蓝）
+        → 「装了邦邦」是**准确且有用**的，必须显示；
+      · 多开克隆镜像、每台都装邦邦 → 「装了邦邦」对每台都一样，此时这句话
+        退化成无信息量（不是错误），端口仍能区分实例。
+
+    所以这里照实报「装了/在跑」，让用户看到客观状态；至于「该选哪台」，
+    多开场景靠端口和预览按钮，不靠本函数断言。
     """
     name = dev.get("name") or "模拟器实例"
     port = dev.get("port") or "?"
     tags = []
+    installed = dev.get("installed")
+    running = dev.get("running")
+    if installed is True:
+        tags.append("装了邦邦")
+    elif installed is False:
+        tags.append("未装邦邦")
+    if running is True:
+        tags.append("运行中")
     if dev.get("foreground") is True:
         tags.append("在前台")
     if not tags:

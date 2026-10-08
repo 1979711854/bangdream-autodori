@@ -108,14 +108,14 @@ def main():
     check("选项数 = 1(自动) + 3(实例)", len(labels), 4)
     check("第一项是自动项", labels[0], app.AUTO_DEVICE_LABEL)
     check("含 16416 端口", any("16416" in x for x in labels), True)
-    # 多开克隆镜像时包名分不出实例 -> 只报「发现 N 个实例」并引导预览,
-    # 绝不能说"已识别到邦邦实例"(那是在做我们做不到的判断)。
-    check("多实例 -> 只报数量并引导预览",
-          "预览" in app.device_status.cget("text")
-          and "无法靠包名区分" in app.device_status.cget("text"), True)
+    # 多开克隆镜像时每台都装了邦邦 -> 「都装了邦邦」这句是对的(事实),
+    # 但必须同时引导用户用预览/端口区分,不能让它变成"已帮你选好"。
+    txt_multi = app.device_status.cget("text")
+    check("多实例且都装了 -> 提示预览区分",
+          "预览" in txt_multi and "指定" in txt_multi, True)
     check("且不自动选中任何一个", app.device_address, "")
 
-    print("=== 2b. 只扫到一个实例 -> 中性提示,不宣称是邦邦 ===")
+    print("=== 2b. 只扫到一个且装了邦邦 -> 直接说可用 ===")
     app._on_devices_scanned({
         "adb": "adb.exe",
         "devices": [FakeDev(16416, installed=True, running=True,
@@ -124,9 +124,18 @@ def main():
     })
     root.update()
     txt = app.device_status.cget("text")
-    check("单实例 -> 中性提示", "1 个实例" in txt, True)
-    check("单实例提示不含'自动识别到邦邦'",
-          "自动识别到邦邦" in txt, False)
+    check("单实例+装了邦邦 -> 提示可直接用",
+          "1 个实例" in txt and "已装邦邦" in txt, True)
+
+    print("=== 2c. 单实例但没装邦邦 -> 如实说没有 ===")
+    app._on_devices_scanned({
+        "adb": "adb.exe",
+        "devices": [FakeDev(16384, installed=False, running=False)],
+        "shots": {},
+    })
+    root.update()
+    check("单实例未装邦邦 -> 如实提示",
+          "未检测到邦邦" in app.device_status.cget("text"), True)
     # 回到三开状态供后续用例
     app._on_devices_scanned({"adb": "adb.exe", "devices": devs, "shots": {}})
     root.update()
@@ -161,7 +170,7 @@ def main():
     root.update()
     txt = app.device_status.cget("text")
     check("报出实例数量", "2 个实例" in txt, True)
-    check("不宣称已识别邦邦", "自动识别到邦邦" in txt, False)
+    check("说明多开时需手动指定", "指定" in txt, True)
     check("不会偷偷选中某个实例", app.device_address, "")
 
     print("=== 6. 扫不到设备 -> 明确提示,不崩 ===")

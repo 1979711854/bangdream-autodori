@@ -104,12 +104,18 @@ def main():
     print("     下拉框标签示例:", labels[1])
     check("标签含端口", "16416" in labels[1], True)
     check("在前台标签正确", "在前台" in labels[1], True)
-    # 关键回归:标签**不得**出现"已装邦邦/邦邦运行中"这类断言 ——
-    # 多开克隆镜像时每个实例结果都一样,宣称哪个是邦邦就是误导(实测踩过)。
-    for lab in labels:
-        for banned in ("已装邦邦", "邦邦运行中", "邦邦未运行", "未装邦邦"):
-            check("标签不含断言词 %s(%s)" % (banned, lab[:16]), banned in lab, False)
-    check("无前台标记时只有名称+端口", labels[0].count("·"), 1)
+    # 「装了邦邦 / 运行中」是**本实例内的事实**(`pm path` / `pidof` 实测),
+    # 不是对"哪个实例才是邦邦"的断言 —— 用户实测场景是单模拟器里装了
+    # 邦邦 + 另一个音游,这个信息必须显示(18:40 我误删过一次,被实机打脸)。
+    check("装了邦邦会显示", "装了邦邦" in labels[1], True)
+    check("运行中会显示", "运行中" in labels[1], True)
+    # 但"未装邦邦"必须如实显示,不能因为用户想打邦邦就含糊过去
+    check("未装邦邦如实显示", "未装邦邦" in labels[0], True)
+    # 探测不可用(三个字段全 None)时不能编造状态,只给名称 + 端口
+    unknown = D.label_for({"name": "模拟器实例", "port": "16448",
+                           "installed": None, "running": None, "foreground": None})
+    check("状态未知时只给名称+端口", unknown, "模拟器实例 · 端口 16448")
+    check("状态未知时不编造", any(w in unknown for w in ("装了邦邦", "未装邦邦", "运行中")), False)
 
     print("=== 2. 单开:最常见场景,不得退化 ===")
     adb = FakeAdb(online=["127.0.0.1:16384"], installed=["127.0.0.1:16384"],
@@ -134,7 +140,7 @@ def main():
     print("=== 5. MuMuManager 给出实例名 -> 标签用真名 ===")
     adb = FakeAdb(online=["127.0.0.1:16384"], installed=["127.0.0.1:16384"])
     install_fakes(adb, monkey_manager=[
-        {"index": 0, "name": "邦邦专用实例", "started": True, "android": True},
+        {"index": 0, "name": "邦邦专用实例", "port": "16384", "started": True, "android": True},
     ])
     devs = D.discover()["devices"]
     check("用 MuMuManager 的名字", devs[0]["name"], "邦邦专用实例")
@@ -155,12 +161,72 @@ def main():
     install_fakes(adb)
     devs = D.discover()["devices"]
     # 探测不可用(installed/running/foreground 全 None)时,标签必须**只**给
-    # 名称 + 端口,不能出现任何状态断言 —— 查不到就承认查不到。
+    # 探测字段全为 None(查不到)时,标签必须只给名称 + 端口,
+    # **不能编造状态** —— 查不到就承认查不到。
     for d in devs:
+        if d.get("installed") is not None:
+            continue  # 这台是真探测到了,状态该显示就显示(见上面的用例)
         lab = D.label_for(d)
-        check("不可达时标签不含状态词(%s)" % lab[:18],
-              any(w in lab for w in ("装", "运行", "邦邦")), False)
+        check("不可达时不编造状态(%s)" % lab[:18],
+              any(w in lab for w in ("装了邦邦", "未装邦邦", "运行中")), False)
         check("不可达时标签含端口", d["port"] in lab, True)
+
+    print("=== 7b. 实例名按端口匹配,不按下标(回归) ===")
+    # 场景: MuMuManager 列了 3 个实例(含未启动的空壳),但 adb 只在线 2 台,
+    # 且顺序与实例顺序**不一致**(雷电 5555 排在 MuMu 16384 前面)。
+    # 旧实现按列表下标硬凑 -> 5555 会被贴上 index0 的名字(错配)。
+    mgr = [
+        {"index": 0, "name": "MuMu模拟器",   "port": "16384", "started": True,  "android": True},
+        {"index": 1, "name": "空壳未初始化",  "port": "",       "started": False, "android": False},
+        {"index": 2, "name": "雷电模拟器",   "port": "5555",  "started": True,  "android": True},
+    ]
+    adb2 = FakeAdb(online=["127.0.0.1:16384", "127.0.0.1:5555"],
+                   installed=["127.0.0.1:16384"])
+    install_fakes(adb2, mgr)
+    got = D.discover()["devices"]
+    byp = {d["port"]: d["name"] for d in got}
+    print("     端口->名称:", byp)
+    check("16384 拿到 MuMu 的名字", byp.get("16384"), "MuMu模拟器")
+    check("5555 拿到雷电的名字(不是下标硬凑)", byp.get("5555"), "雷电模拟器")
+    check("在线设备数 = 2", len(got), 2)
+    check("未初始化的空实例没混进列表", "空壳未初始化" not in [d["name"] for d in got], True)
+    # 端口缺失时必须用中性名,不能猜
+    mgr2 = [{"index": 0, "name": "某实例", "port": "", "started": True, "android": True}]
+    adb3 = FakeAdb(online=["127.0.0.1:16448"], installed=[])
+    install_fakes(adb3, mgr2)
+    only = D.discover()["devices"][0]
+    print("     端口缺失时:", only["name"])
+    check("端口缺失时用中性名而非贴错", only["name"], "模拟器实例 16448")
+
+    print("=== 7c. 影子端口去重(回归) ===")
+    # 实测:两个 MuMu 实例 -> adb devices 报 4 条(16384/16416 是真身,
+    # 5555/5557 是历史残留端口,android_id 与真身完全相同)。
+    # 不去重的话用户会看到 4 个选项,以为要选 4 次,还可能连错窗口。
+    fps = {
+        "127.0.0.1:16384": "dev-A", "127.0.0.1:5555": "dev-A",   # 同一台
+        "127.0.0.1:16416": "dev-B", "127.0.0.1:5557": "dev-B",   # 同一台
+    }
+    D._adb_shell = lambda adb, addr, args, timeout=None: (
+        fps.get(addr, "") if args[:2] == ["settings", "get"] else ""
+    )
+    mgr = [
+        {"index": 0, "name": "MuMu模拟器", "port": "16384", "started": True, "android": True},
+        {"index": 1, "name": "MuMu安卓设备-1", "port": "16416", "started": True, "android": True},
+    ]
+    adb4 = FakeAdb(online=list(fps.keys()), installed=["127.0.0.1:16384"])
+    install_fakes(adb4, mgr)
+    D._device_fingerprint = lambda adb, addr: fps.get(addr, "")
+    got = D.discover()["devices"]
+    ports = [d["port"] for d in got]
+    print("     去重后端口:", ports)
+    check("4 条 adb 记录去重成 2 台", len(got), 2)
+    check("保留的是 MuMu 官方端口", ports, ["16384", "16416"])
+    check("名字正确对应", [d["name"] for d in got], ["MuMu模拟器", "MuMu安卓设备-1"])
+
+    print("=== 7d. 真指纹取不到时不去重(宁可多列也不误删) ===")
+    D._device_fingerprint = lambda adb, addr: ""
+    got2 = D.discover()["devices"]
+    check("取不到指纹 -> 原样保留全部", len(got2), 4)
 
     print("=== 8. JSON 可序列化(命令行调试/日志用) ===")
     import json

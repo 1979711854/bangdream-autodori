@@ -202,9 +202,14 @@ A:在「演出设置 → 模拟器实例」里点刷新按钮,列表会列出所
 选对的那个即可,选择会被记住,下次启动自动沿用。点「预览」可以看某个实例当前的画面,
 确认它是不是你要操作的那台。
 
-需要说明的是:**多开时脚本无法自动判断哪个实例才是邦邦**。MuMu 多开通常是克隆实例镜像,
-每个实例都装了同一个游戏,程序看到的结果完全一样 —— 所以它只能列出实例让你选,
-不会替你猜。保持「自动」时脚本会用启发式挑一个,多开场景下请务必手动指定。
+列表会显示每个实例**是否装了邦邦、是否在运行中、是否在前台** —— 这些是实测事实,
+不是猜的,同一个模拟器里装了别的音游时也能一眼看出来。
+
+只有多开克隆镜像时需要注意:那种情况下每台都装了同一个游戏,「装了邦邦」对每台都
+一样,靠它区分不了。此时用端口或「预览」按钮逐个确认。
+
+保持「自动」时,只有一个在线实例可以直接用;有多个时脚本会用启发式挑,
+不确定就手动指定。
 
 端口规律:MuMu 12 第 n 个实例是 127.0.0.1:(16384+32n),第一个 16384,第二个 16416。
 命令行也支持:`--device 16416`(端口)、`--device 127.0.0.1:16416`(完整地址)、
@@ -1438,6 +1443,13 @@ class AutodoriGUI:
     # 不写「推荐」:多开时自动判定并不能保证选对(包名分不出实例),
     # 标成推荐会误导用户以为不用管。
     AUTO_DEVICE_LABEL = "自动"
+    # 状态文字与下拉框的文字左缘对齐所需的左内边距(实机截图揪出这处错位)。
+    # 实测标定(不是推算):pack(padx=N) 后 Label 文字落在 左缘+N+1,
+    # DropdownBox._draw 用 `create_text(12, ..., anchor="w")`,框内文字落在
+    # 左缘+12。实测 N=11 时仍差 11px,故取 N+1 == 12 → N=11 已经是全量。
+    # 下面这两行由 _chk_align6.py 复核,改 Label 样式时务必重跑。
+    _DEVICE_TEXT_PADX = 11
+    _DEVICE_TEXT_ORIGIN = 12  # DropdownBox._draw 里 create_text 的 x
 
     def _scan_devices_async(self):
         """后台线程扫设备,完成后回主线程刷新下拉框。
@@ -1524,18 +1536,32 @@ class AutodoriGUI:
         # 每个实例都装了同一个游戏,包名/进程状态完全一致,据此宣称"这个是
         # 邦邦"是误导(实测踩过)。用户看端口对得上自己的窗口即可。
         n = len(self._devices)
+        # 「装了邦邦」是本实例内的事实,可以直接报(实测准且有用 —— 用户可能
+        # 同一模拟器里还装了别的音游)。但「哪个实例才是邦邦」在克隆镜像多开下
+        # 无法判定,那种场景要靠端口 + 预览按钮区分,别混为一谈。
+        has_gd = [d for d in self._devices if d.get("installed") is True]
         if getattr(self, "device_status", None):
             if self.device_address:
                 self.device_status.configure(
                     text="已选择 %s — 启动时按此实例连接"
                          % self._label_of(self.device_address))
+            elif n == 1 and has_gd:
+                self.device_status.configure(
+                    text="发现 1 个实例且已装邦邦 — 保持「自动」即可")
             elif n == 1:
                 self.device_status.configure(
-                    text="发现 1 个实例 — 若它是邦邦那台,保持自动识别即可")
+                    text="发现 1 个实例但未检测到邦邦 — 确认游戏装在这个模拟器里")
+            elif len(has_gd) == 1:
+                self.device_status.configure(
+                    text="发现 %d 个实例,其中 1 个装了邦邦 — 点「预览」确认后指定"
+                         % n)
+            elif len(has_gd) > 1:
+                self.device_status.configure(
+                    text="发现 %d 个实例且都装了邦邦(克隆镜像多开时常见)— "
+                         "请用「预览」逐个看画面,按端口指定" % n)
             else:
                 self.device_status.configure(
-                    text="发现 %d 个实例 — 点「预览」确认哪台是邦邦,或直接选端口;"
-                         "多开时脚本无法靠包名区分" % n)
+                    text="发现 %d 个实例但都没有邦邦 — 确认游戏装在哪个模拟器里" % n)
         self._refresh_device_box()
 
     def _label_of(self, address):
@@ -1648,7 +1674,9 @@ class AutodoriGUI:
         self.device_status = tk.Label(
             r.slot, text="", bg=th["surface"], fg=th["text_3"],
             font=T.font(self.font_size - 1), anchor="w")
-        self.device_status.pack(fill="x", pady=(4, 0))
+        # padx 见 _DEVICE_TEXT_PADX 的说明：让状态文字与框内文字左缘对齐
+        self.device_status.pack(fill="x", pady=(4, 0),
+                                padx=self._DEVICE_TEXT_PADX)
         if not self._devices:
             self.device_status.configure(
                 text="点右侧按钮扫描实例 — 多开时在此指定连哪台")
