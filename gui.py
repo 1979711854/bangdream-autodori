@@ -1738,10 +1738,14 @@ class AutodoriGUI:
 
         self.device_status = tk.Label(
             r.slot, text="", bg=th["surface"], fg=th["text_3"],
-            font=T.font(self.font_size - 1), anchor="w")
-        # padx 见 _DEVICE_TEXT_PADX 的说明：让状态文字与框内文字左缘对齐
+            font=T.font(self.font_size - 1), anchor="w", justify="left",
+            wraplength=760,   # 状态文字较长时不越出卡片右边界（实测截图里被截断）
+        )
+        # padx 见 _DEVICE_TEXT_PADX 的说明：让状态文字与框内文字左缘对齐。
+        # 右侧留 11px 余量 —— 只加左边距的话，右对齐的文字会顶出卡片边界。
         self.device_status.pack(fill="x", pady=(4, 0),
-                                padx=self._DEVICE_TEXT_PADX)
+                                padx=(self._DEVICE_TEXT_PADX,
+                                      self._DEVICE_TEXT_PADX))
         if not self._devices:
             self.device_status.configure(
                 text="点右侧按钮扫描实例 — 多开时在此指定连哪台")
