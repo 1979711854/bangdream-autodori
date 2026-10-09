@@ -1,13 +1,13 @@
 {
     "special_wait": {
         "next": [
+            "special_song_running",
             "special_click_start",
             "special_click_start_ocr",
             "special_click_confirm",
             "special_click_ok",
             "special_click_next",
             "special_click_close",
-            "special_song_running",
             "special_idle"
         ],
         "interrupt": [

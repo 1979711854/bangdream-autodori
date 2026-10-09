@@ -63,6 +63,7 @@ SPECIAL_SONGS = (
     "[超高难易度 新SPECIAL] 六兆年と一夜物語",
     "[超高难易度 新SPECIAL] HELL! or HELL?",
     "ときめきエクスペリエンス！ (月岛麻里奈ver.)",
+    "[期间限定 SPECIAL]ピコっと！パピっと！！ガルパ☆ピコ！！！",
 )
 DEFAULT_SPECIAL_SONG = SPECIAL_SONGS[0]
 # 打歌策略:显示名 → 写入 data/config.yml 的 song_strategy 值
@@ -76,7 +77,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -96,13 +97,16 @@ PLAY_RE = re.compile(r"打歌:\s*(.+?)\s*\(#\d+-\w+\)")
 # 左栏选项树:(分组名, ((key, 标签, 图标), ...))
 OPTION_TREE = (
     ("演出", (
-        ("live.show", "演出设置", "live"),
+        ("live.show", "自由演出设置", "live"),
         ("live.challenge", "挑战演出清 CP", "live"),
         ("live.special", "超高难度活动", "live"),
-        ("live.gate", "时基校准", "settings"),
+        ("live.gate", "时基校准", "app-notification"),
+    )),
+    ("日常", (
+        ("daily", "一键清理日常", "clipboard-check"),
     )),
     ("运行", (
-        ("logs", "运行日志", "logs"),
+        ("logs", "运行日志", "chat-bubble-check"),
     )),
     ("说明", (
         ("docs.notes", "注意事项", "docs"),
@@ -110,8 +114,8 @@ OPTION_TREE = (
         ("docs.faq", "常见问题", "docs"),
     )),
     ("设置", (
-        ("settings.ui", "界面", "settings"),
-        ("settings.about", "关于", "settings"),
+        ("settings.ui", "界面", "info-circle"),
+        ("settings.about", "关于", "info-circle"),
     )),
 )
 VIEW_KEYS = [k for _, items in OPTION_TREE for k, _, _ in items]
@@ -191,7 +195,7 @@ NOTES = """【模拟器设置】
 【使用提醒】
 • 本脚本用于自动挖矿(自动打歌刷取资源/活动奖励),仅供个人使用
 • 请遵守游戏规则与用户协议,不要用于破坏游戏秩序或影响其他玩家
-• MuMu 多开时:在「演出设置 → 模拟器实例」里选要连的那台,选择会被记住。
+• MuMu 多开时:在「自由演出设置 → 模拟器实例」里选要连的那台,选择会被记住。
   多开通常是克隆镜像,每个实例都装了同一个游戏,脚本看不出哪个才是邦邦,
   所以请务必手动指定 —— 连错会点到别的游戏窗口上
 • 如有问题,先查看 debug 目录下的日志
@@ -200,15 +204,13 @@ NOTES = """【模拟器设置】
 
 # 常见问题(只读)
 FAQ = """Q:多开模拟器时怎么指定连哪个窗口?
-A:在「演出设置 → 模拟器实例」里点刷新按钮,列表会列出所有在线实例(名称 + 端口)。
+A:在「自由演出设置 → 模拟器实例」里点刷新按钮,列表会列出所有在线实例(名称 + 端口)。
 选对的那个即可,选择会被记住,下次启动自动沿用。点「预览」可以看某个实例当前的画面,
 确认它是不是你要操作的那台。
 
-列表会显示每个实例**是否装了邦邦、是否在运行中、是否在前台** —— 这些是实测事实,
-不是猜的,同一个模拟器里装了别的音游时也能一眼看出来。
-
-只有多开克隆镜像时需要注意:那种情况下每台都装了同一个游戏,「装了邦邦」对每台都
-一样,靠它区分不了。此时用端口或「预览」按钮逐个确认。
+列表只显示「实例名 + 端口」(以前还会附「装了邦邦 / 运行中」,太长会把框挤爆,
+已去掉)。装没装邦邦不需要你看 —— 脚本启动时会自己去每个实例上按包名探测,
+挑出装了邦邦的那台;多开克隆镜像时每台都一样,同样靠端口或「预览」逐个确认。
 
 保持「自动」时,只有一个在线实例可以直接用;有多个时脚本会用启发式挑,
 不确定就手动指定。
@@ -353,6 +355,13 @@ class AutodoriGUI:
         # adb_path 只兼容「早期版本手填过并留在配置里」的情况 —— 界面上已不再
         # 提供手填入口(需求:删掉该功能)。留读是为了别让老配置里的路径失效。
         self.adb_path = str(cfg.get("adb_path", "") or "")
+        # 一键清理日常的配置(见 Issue #4)
+        # 一键清理日常(见 Issue #4)。总开关本身代表「启动游戏 + 领取每日签到/弹窗奖励」——
+        # 这几步是进主界面的必经流程,没有可关的余地,所以不做成独立勾选项;
+        # 「清火打歌」与「每日三抽」才是真正可选的两步,各自一个开关。
+        self.daily_enabled = bool(cfg.get("daily_enabled", False))
+        self.daily_auto_clear_fire = bool(cfg.get("daily_auto_clear_fire", False))
+        self.daily_auto_free_pull = bool(cfg.get("daily_auto_free_pull", False))
         self._closing = False         # 关窗口标记:让后台扫描线程及时收手
         self._devices = []          # device_scan.discover() 的结果
         self._device_labels = []    # 与 self._devices 一一对应的下拉框标签
@@ -401,6 +410,10 @@ class AutodoriGUI:
             "device_address": self.device_address,
             # 手填的 adb 路径;空串 = 自动发现
             "adb_path": self.adb_path,
+            # 一键清理日常(见 Issue #4)
+            "daily_enabled": bool(self.daily_enabled),
+            "daily_auto_clear_fire": bool(self.daily_auto_clear_fire),
+            "daily_auto_free_pull": bool(self.daily_auto_free_pull),
         }
         try:
             os.makedirs(os.path.dirname(GUI_CONFIG), exist_ok=True)
@@ -572,6 +585,10 @@ class AutodoriGUI:
         self.device_refresh_btn = None
         self.device_preview_btn = None
         self.challenge_start_btn = None
+        self.daily_start_btn = None
+        # 日常的两个可选步骤(清火/三抽)要随总开关置灰,得拿到它们界面上的控件。
+        # 每次进入「日常」页重建卡片时会重新赋值;空元组 = 还没建过卡片。
+        self._daily_vars = ()
         for key, item in self.nav_items.items():
             item.select(key == self.view)
 
@@ -665,12 +682,14 @@ class AutodoriGUI:
             return self._detail_docs(master)
         if self.view == "settings.ui":
             return self._detail_ui(master)
+        if self.view == "daily":
+            return self._detail_daily(master)
         return self._detail_about(master)
 
     def _detail_show(self, master):
         th = T.get()
         card = W.Card(master)
-        W.SectionTitle(card.body, "演出设置", "仅支持自由演出").pack(
+        W.SectionTitle(card.body, "自由演出设置", "仅支持自由演出").pack(
             fill="x", pady=(0, 12))
 
         r = W.Row(card.body, "难度")
@@ -732,6 +751,14 @@ class AutodoriGUI:
             tk.Label(card.body, text=line, bg=th["surface"], fg=th["text_2"],
                      font=T.font(self.font_size - 1), anchor="w",
                      justify="left").pack(anchor="w", pady=(0, 6))
+
+        # 用户 10-09 反馈「点错了按钮、以为挑战难度没生效」——两个开始按钮(顶栏
+        # 那个是自由演出)确实容易混,和「超高难度活动」页一样加一句显式提示。
+        tk.Label(card.body,
+                 text="注意:GUI 右上角的「开始自由演出」按钮走的是常规自由演出,与本页无关",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(6, 0))
 
         exit_game = tk.BooleanVar(master=card.body, value=self.challenge_exit_game)
         tk.Checkbutton(
@@ -938,6 +965,98 @@ class AutodoriGUI:
                                  font=T.font(self.font_size - 1))
         self.set_hint.pack(anchor="w", pady=(8, 0))
         return card
+
+    def _detail_daily(self, master):
+        """一键清理日常(Issue #4)。
+
+        分成两类,这是用户 10-09 定的结构:
+          · **总开关即「必经流程」**:启动游戏 + 领取每日签到奖励 + 领取弹窗赠送奖励。
+            每日签到与开场赠送弹窗**不点掉就进不了主界面**,所以它们没有"关掉"的余地,
+            不做成勾选项 —— 免得用户以为不勾就不会领。
+          · **可选两步,各自独立开关**:清火打歌、每日免费三抽。
+        """
+        th = T.get()
+        card = W.Card(master)
+        W.SectionTitle(card.body, "一键清理日常",
+                       "启动游戏 + 签到 + [清火] + [三抽]").pack(
+            fill="x", pady=(0, 12))
+
+        en = tk.BooleanVar(master=card.body, value=self.daily_enabled)
+        tk.Checkbutton(
+            card.body, text="启用一键清理日常",
+            variable=en,
+            command=lambda: self._on_daily_enabled(en.get()),
+            bg=th["surface"], fg=th["text"], selectcolor=th["surface"],
+            activebackground=th["surface"], activeforeground=th["text"],
+            font=T.font(self.font_size), anchor="w",
+        ).pack(anchor="w", pady=(0, 2))
+        tk.Label(card.body,
+                 text="含:启动游戏 + 领取每日签到奖励 + 领取弹窗赠送奖励\n"
+                      "（这几步是进游戏主界面的必经流程,勾选本项即自动完成）",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(0, 10))
+
+        # 两个可选步骤。总开关关着时置灰,避免「勾了却没反应」。
+        # lambda 用默认参数绑住 var/cb —— 循环里的闭包直接引用循环变量会全部
+        # 指到最后一项(晚绑定),点哪一个都触发同一个回调。
+        subs = []
+        for text, value, cb in (
+            ("自动清火打歌（先打歌清火，完成每日演出后自动转入三抽）",
+             self.daily_auto_clear_fire, self._on_daily_auto_clear_fire),
+            ("每日免费三抽（固定 3 次，游戏内置上限；需先完成每日演出才解锁）",
+             self.daily_auto_free_pull, self._on_daily_auto_free_pull),
+        ):
+            var = tk.BooleanVar(master=card.body, value=value)
+            chk = tk.Checkbutton(
+                card.body, text=text,
+                variable=var,
+                command=lambda v=var, f=cb: f(v.get()),
+                bg=th["surface"], fg=th["text_2"], selectcolor=th["surface"],
+                activebackground=th["surface"], activeforeground=th["text_2"],
+                font=T.font(self.font_size - 1), anchor="w",
+                state=("normal" if self.daily_enabled else "disabled"),
+            )
+            chk.pack(anchor="w", pady=(0, 4))
+            subs.append((var, chk))
+        self._daily_vars = tuple(subs)
+
+        self.daily_start_btn = W.PushButton(
+            card.body, "开始日常", command=lambda: self.start(mode="daily"),
+            kind="primary", width=160, height=36)
+        self.daily_start_btn.pack(anchor="w", pady=(10, 4))
+        tk.Label(card.body,
+                 text="清火与三抽都不勾时,只做「启动游戏 + 领签到/弹窗」两件事",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w", pady=(8, 0))
+        return card
+
+    def _on_daily_enabled(self, value):
+        """一键清理日常的总开关。
+
+        它代表「启动游戏 + 领签到/弹窗」这段**必经流程**(没有单独开关),
+        同时决定下面两个可选步骤(清火 / 三抽)能不能勾 —— 关着时置灰。
+
+        ⚠️ 不再像以前那样"勾上就把子项一起勾上":签到/弹窗本来就是我方必经步骤,
+        而清火/三抽是用户自己要选的,总开关替他勾上容易误打。
+        """
+        self.daily_enabled = bool(value)
+        for _var, chk in (getattr(self, "_daily_vars", None) or ()):
+            try:
+                chk.configure(
+                    state=("normal" if self.daily_enabled else "disabled"))
+            except Exception:
+                # 卡片已被销毁/重建时控件失效:持久状态已改好,界面同步失败可忽略。
+                pass
+        self._save_gui_config()
+
+    def _on_daily_auto_clear_fire(self, value):
+        self.daily_auto_clear_fire = bool(value)
+        self._save_gui_config()
+
+    def _on_daily_auto_free_pull(self, value):
+        self.daily_auto_free_pull = bool(value)
+        self._save_gui_config()
 
     def _detail_about(self, master):
         th = T.get()
@@ -1219,6 +1338,8 @@ class AutodoriGUI:
             args = ["--mode", "main", "--difficulty", str(self.challenge_difficulty),
                     "--livemode", "challengelive", "--challenge-finish",
                     "exit" if self.challenge_exit_game else "home"]
+        elif mode == "daily":
+            args = ["--mode", "daily"]
         else:
             args = ["--mode", "main", "--difficulty", str(self.difficulty),
                     "--livemode", LIVE_MODE]
@@ -1450,6 +1571,12 @@ class AutodoriGUI:
                     self.challenge_start_btn.set_enabled(not running)
             except Exception:
                 pass
+        if getattr(self, "daily_start_btn", None):
+            try:
+                if self.daily_start_btn.winfo_exists():
+                    self.daily_start_btn.set_enabled(not running)
+            except Exception:
+                pass
         if getattr(self, "run_dot", None):
             self.run_dot.set(th["ok"] if running else th["idle"])
         if getattr(self, "run_state", None):
@@ -1601,32 +1728,20 @@ class AutodoriGUI:
         # 每个实例都装了同一个游戏,包名/进程状态完全一致,据此宣称"这个是
         # 邦邦"是误导(实测踩过)。用户看端口对得上自己的窗口即可。
         n = len(self._devices)
-        # 「装了邦邦」是本实例内的事实,可以直接报(实测准且有用 —— 用户可能
-        # 同一模拟器里还装了别的音游)。但「哪个实例才是邦邦」在克隆镜像多开下
-        # 无法判定,那种场景要靠端口 + 预览按钮区分,别混为一谈。
-        has_gd = [d for d in self._devices if d.get("installed") is True]
+        # 状态行只报客观的「实例数量」,不再复述「装了邦邦」:多开克隆镜像时
+        # 每台都装邦邦,这句话退化成零信息量;而单机同时装多个音游时又容易
+        # 被读成「已判定该选哪台」。该选哪台靠端口 + 「预览」按钮自己看。
         if getattr(self, "device_status", None):
             if self.device_address:
                 self.device_status.configure(
                     text="已选择 %s — 启动时按此实例连接"
                          % self._label_of(self.device_address))
-            elif n == 1 and has_gd:
-                self.device_status.configure(
-                    text="发现 1 个实例且已装邦邦 — 保持「自动」即可")
             elif n == 1:
                 self.device_status.configure(
-                    text="发现 1 个实例但未检测到邦邦 — 确认游戏装在这个模拟器里")
-            elif len(has_gd) == 1:
-                self.device_status.configure(
-                    text="发现 %d 个实例,其中 1 个装了邦邦 — 点「预览」确认后指定"
-                         % n)
-            elif len(has_gd) > 1:
-                self.device_status.configure(
-                    text="发现 %d 个实例且都装了邦邦(克隆镜像多开时常见)— "
-                         "请用「预览」逐个看画面,按端口指定" % n)
+                    text="发现 1 个实例 — 保持「自动」即可")
             else:
                 self.device_status.configure(
-                    text="发现 %d 个实例但都没有邦邦 — 确认游戏装在哪个模拟器里" % n)
+                    text="发现 %d 个实例 — 点「预览」逐个看画面,按端口指定" % n)
         self._refresh_device_box()
 
     def _label_of(self, address):
@@ -1658,7 +1773,7 @@ class AutodoriGUI:
                 # 免得用户的选择被静默改掉(那等于换了个窗口接着点)。
                 values.append(current)
         new_box = W.DropdownBox(
-            parent, values, value=current, width=260, min_width=200,
+            parent, values, value=current, width=400, min_width=300,
             surface="surface", on_change=self._on_device)
         # pack 的默认行为是把控件**追加到父容器子控件列表末尾**。本行左边还
         # 有两个 IconButton(它们先创建),若直接 pack,重建后的下拉框会跑到
@@ -1695,7 +1810,7 @@ class AutodoriGUI:
                 if self.device_address else "自动：脚本自行选择实例")
 
     def _device_row(self, master):
-        """演出设置卡片里的「模拟器实例」一行。"""
+        """自由演出设置卡片里的「模拟器实例」一行。"""
         th = T.get()
         r = W.Row(master, "模拟器实例")
         r.pack(fill="x", pady=(0, 6))
@@ -1716,28 +1831,34 @@ class AutodoriGUI:
         line.pack(fill="x")
 
         box = W.DropdownBox(
-            line, values, value=current, width=260, min_width=200,
+            line, values, value=current, width=400, min_width=300,
             surface="surface", on_change=self._on_device)
         # 不再 fill="x"/expand —— 那一版会把方框拉满整行,视觉上过于抢眼,
         # 且标签文字只有几十个字符,撑开只是浪费空白。定宽即可。
-        box.pack(side="left")
+        # anchor="center":下拉框(28px)与两个图标按钮(30px)高度不同,顶对齐
+        # 会让框体上缘齐平而中轴偏低 —— 居中后三者共用同一水平中轴线。
+        box.pack(side="left", anchor="center")
         self.device_box = box
 
         btn = W.IconButton(line, "refresh", size=30,
                            command=self._scan_devices_async,
                            tip="重新扫描模拟器实例")
-        btn.pack(side="left", padx=(8, 0))
+        btn.pack(side="left", padx=(8, 0), anchor="center")
         self.device_refresh_btn = btn
 
         # 预览按钮:多开时包名/进程状态分不出实例,只能让用户看一眼画面
         prev = W.IconButton(line, "live", size=30,
                             command=self._preview_device,
                             tip="预览所选实例的画面")
-        prev.pack(side="left", padx=(6, 0))
+        prev.pack(side="left", padx=(6, 0), anchor="center")
         self.device_preview_btn = prev
 
+        # 状态文字**不**放 slot 内:它比框体多一整行高度,留在 slot 里会把
+        # slot 撑高,Row 的垂直居中就会拿「框+状态」的总高去对标签,
+        # 标签落在框与状态之间、反而对不齐框。挪到 Row 外面独立成行后,
+        # slot 只剩框体那一行,标签即可与框精确同一中轴线。
         self.device_status = tk.Label(
-            r.slot, text="", bg=th["surface"], fg=th["text_3"],
+            master, text="", bg=th["surface"], fg=th["text_3"],
             font=T.font(self.font_size - 1), anchor="w", justify="left",
             wraplength=760,   # 状态文字较长时不越出卡片右边界（实测截图里被截断）
         )
@@ -1819,6 +1940,13 @@ class AutodoriGUI:
             # 活动曲目也落一份到运行配置:直接手跑
             # `python src/autodori.py --mode special` 时能沿用界面里选的那首
             "special_song": str(self.special_song),
+            # 一键清理日常(见 Issue #4):bot 实时读 data/config.yml 的 daily.*。
+            # 三抽为固定3次(游戏内置每日免费上限);弹窗赠送领取并入启动流程。
+            "daily": {
+                "enabled": bool(self.daily_enabled),
+                "auto_clear_fire": bool(self.daily_auto_clear_fire),
+                "auto_free_pull": bool(self.daily_auto_free_pull),
+            },
         }
         try:
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)

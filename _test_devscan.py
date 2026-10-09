@@ -68,11 +68,21 @@ class FakeAdb:
 
 def install_fakes(monkey_adb, monkey_manager=None):
     D.list_adb_devices = monkey_adb.devices
-    # 真实实现的 _guess_ports 返回**完整地址**,mock 必须对齐这个契约
-    D._guess_ports = lambda adb, count=8: [
-        a for a in ("127.0.0.1:%d" % p for p in D._MUMU_PORTS[:count])
-        if a in monkey_adb.connectable
-    ]
+
+    # 真实实现的 _connect_addresses 返回**完整地址**,mock 必须对齐这个契约。
+    # discover() 现在会在「MuMuManager 给了端口但 adb devices 没报」时主动补连,
+    # 不 mock 掉的话测试会真的去起 adb 子进程。
+    def fake_connect(_adb, addresses):
+        out = []
+        for addr in addresses:
+            rc, text = monkey_adb.connect(None, addr)
+            if rc == 0 and ("connected to" in text.lower() or "already" in text.lower()):
+                out.append(addr)
+        return out
+
+    D._connect_addresses = fake_connect
+    D._guess_ports = lambda adb, count=8: fake_connect(
+        adb, ["127.0.0.1:%d" % p for p in D._MUMU_PORTS[:count]])
     # discover 内部经 _adb_shell 拿状态,必须一并替换,否则会真去调 adb
     D._adb_shell = monkey_adb.shell
     if monkey_manager is not None:
@@ -102,16 +112,18 @@ def main():
           [d["running"] for d in devs], [False, True, False])
     labels = [D.label_for(d) for d in devs]
     print("     下拉框标签示例:", labels[1])
-    check("标签含端口", "16416" in labels[1], True)
-    check("在前台标签正确", "在前台" in labels[1], True)
-    # 「装了邦邦 / 运行中」是**本实例内的事实**(`pm path` / `pidof` 实测),
-    # 不是对"哪个实例才是邦邦"的断言 —— 用户实测场景是单模拟器里装了
-    # 邦邦 + 另一个音游,这个信息必须显示(18:40 我误删过一次,被实机打脸)。
-    check("装了邦邦会显示", "装了邦邦" in labels[1], True)
-    check("运行中会显示", "运行中" in labels[1], True)
-    # 但"未装邦邦"必须如实显示,不能因为用户想打邦邦就含糊过去
-    check("未装邦邦如实显示", "未装邦邦" in labels[0], True)
-    # 探测不可用(三个字段全 None)时不能编造状态,只给名称 + 端口
+    # 2026-10-09 用户要求:标签**只留「名称 · 端口」**,去掉尾部的
+    # 「(装了邦邦、运行中、在前台)」——那段太长会把下拉框挤爆。
+    # ⚠️ 「不显示」≠「不探测」:状态仍照实留在 dev 字典里,给状态行/预览用。
+    check("标签含端口", labels[1].endswith("端口 16416"), True)
+    check("标签不再带状态括号", "(" not in labels[1] and "（" not in labels[1], True)
+    check("状态字眼不出现在标签里",
+          any(w in labels[1] for w in ("装了邦邦", "未装邦邦", "运行中", "在前台")), False)
+    check("状态仍在探测字段里(装了邦邦)", devs[1]["installed"], True)
+    check("状态仍在探测字段里(运行中/在前台)",
+          [devs[1]["running"], devs[1]["foreground"]], [True, True])
+    check("未装邦邦同样只进字段", devs[0]["installed"], False)
+    # 探测不可用(三个字段全 None)时更不能编造状态,只给名称 + 端口
     unknown = D.label_for({"name": "模拟器实例", "port": "16448",
                            "installed": None, "running": None, "foreground": None})
     check("状态未知时只给名称+端口", unknown, "模拟器实例 · 端口 16448")
@@ -227,6 +239,32 @@ def main():
     D._device_fingerprint = lambda adb, addr: ""
     got2 = D.discover()["devices"]
     check("取不到指纹 -> 原样保留全部", len(got2), 4)
+
+    print("=== 7e. MuMuManager 有端口但 `adb devices` 没报 -> 必须主动补连(回归) ===")
+    # 用户 10-09 实测:两个 MuMu 实例的安卓都已启动完成,`adb devices` 却只报
+    # `emulator-5554`(MuMu 的 16384/16416 **不会自动注册**)→ 旧实现只在
+    # ports 为空时才猜端口,而 emulator-5554 已经占住 ports → 另一台永远发现不了,
+    # 表现就是「GUI 只找到一个游戏窗口」。
+    mgr = [
+        {"index": 0, "name": "MuMu模拟器", "port": "16384", "started": True, "android": True},
+        {"index": 1, "name": "MuMu安卓设备-1", "port": "16416", "started": True, "android": True},
+    ]
+    adb5 = FakeAdb(online=["emulator-5554"],
+                   installed=["127.0.0.1:16384"],
+                   running=["127.0.0.1:16384"],
+                   connectable=["127.0.0.1:16384", "127.0.0.1:16416"])
+    install_fakes(adb5, mgr)
+    # emulator-5554 与 16384 是同一台(实测 android_id/boot_id 相同)→ 让指纹相同
+    D._device_fingerprint = lambda adb, addr: (
+        "dev-A" if addr in ("127.0.0.1:16384", "emulator-5554") else "")
+    got5 = D.discover()["devices"]
+    ports5 = sorted(d["port"] for d in got5)
+    print("     端口:", ports5)
+    check("按 MuMuManager 端口补连 -> 两台都出来", ports5, ["16384", "16416"])
+    check("补连的那两台都真去 connect 了",
+          sorted(set(adb5.connected))[:2], ["127.0.0.1:16384", "127.0.0.1:16416"])
+    check("有邦邦那台仍照实标 installed",
+          [d["installed"] for d in got5 if d["port"] == "16384"], [True])
 
     print("=== 8. JSON 可序列化(命令行调试/日志用) ===")
     import json

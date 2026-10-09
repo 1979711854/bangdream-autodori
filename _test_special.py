@@ -22,6 +22,7 @@
 import ast
 import json
 import logging
+import re
 import sys
 import unicodedata
 from pathlib import Path
@@ -234,6 +235,25 @@ def refs(node):
     return out
 
 
+def _click_chain(special):
+    """取出「点开演」这条链的有序节点列表。
+
+    2026-10-09 曾因临时插入 `special_song_check`(选曲校验)节点,点击链被挪进
+    它的 next,于是加了这个取链函数兜住断言。**该校验已按用户要求撤销**,
+    现在 `special_wait.next` 以 `special_song_running`(打歌画面判据)开头,
+    点击链紧随其后 —— 两者都在 `next` 里,取链函数因此直接返回 `next` 即可,
+    「模板先于 OCR」那条断言不必跟着再改一次。
+    """
+    wait = special.get("special_wait", {}) or {}
+    nxt = wait.get("next") or []
+    head = nxt[0] if nxt else None
+    if head and head in special and head.startswith("special_"):
+        inner = special[head].get("next") or []
+        if "special_click_start" in inner:
+            return inner
+    return nxt
+
+
 def test_pipeline():
     print("[2] pipeline 接线")
     special = json.loads((PIPELINE_DIR / "special.json").read_text(encoding="utf-8"))
@@ -278,6 +298,33 @@ def test_pipeline():
     check("special_idle 带 post_delay 限速(不做全速空转)",
           isinstance(idle.get("post_delay"), (int, float)))
 
+    # 2.4b **不做选曲校验**(2026-10-09 用户决定,曾短暂加过又撤销)
+    # 曾加 `SpecialSongCheck` 校验「玩家实际选中的曲 == 配置的曲」,但两次实跑都被打脸:
+    #   ① 正确选对 #689 被误拦 —— `[期间限定 SPECIAL]` 被 OCR 整段误识成
+    #      `OIAL「期i限定 SPECIALI`,首字符就错;
+    #   ② 更糟的一次读出 `不澄当形方柔郡父` —— 那是画面里别处的字(立绘/背景),
+    #      说明「选择乐队」页曲名 OCR 根本不稳定。
+    # 用户的处理方式是「跑错了自己重新选歌」→ 校验权交给人眼,不再自动化。
+    # 这里留一条反向断言,防止有人把 `special_song_check` 再加回来。
+    check("SPECIAL 模式不做选曲校验(已按用户要求撤销)",
+          "special_song_check" not in special and
+          "SpecialSongCheck" not in open(BOT_SRC, encoding="utf-8").read(),
+          "若确实要恢复校验,先跟用户确认曲名 OCR 的可靠性")
+    # 2.4c 打歌画面判据必须排在最前(2026-10-09 实机定位):
+    # 原来 `special_song_running` 排在 6 个点击节点**之后**,而 MAA 每轮轮询会
+    # 按顺序逐个识别、命中即停 —— 于是暂停按钮出现后要等整轮跑完才轮到它,
+    # 实测单轮 3.1~3.7s,最长晚 4.6s 才进 playsong。
+    # 后果:#786/#689 的谱面首音在 2.05~2.17s,等认到时首音早过,游戏画面里
+    # 音符已经在跑 → `wait_first_note` 再也等不到静默窗口 → 12s 兜底超时后
+    # 按背景噪声触发 → 整首按晚约 10s → 全 MISS。
+    # 暂停按钮只在打歌画面出现(template 0.95;选择乐队页 0.60、歌曲信息页
+    # 0.41),排最前不会误命中,也不影响开演点击链。
+    check("special_song_running 排在点击链之前(打歌画面要第一时间认到)",
+          bool(wait_next) and wait_next[0] == "special_song_running", wait_next)
+    check("special_wait.next 仍是完整点击链、未被选曲校验插入",
+          "special_click_start" in wait_next and "special_song_check" not in wait_next,
+          wait_next)
+
     # 2.5 收尾链路:打完 -> special_finish -> stop
     check("special_finish.next == ['stop']",
           special.get("special_finish", {}).get("next") == ["stop"])
@@ -305,8 +352,9 @@ def test_pipeline():
     check("special_click_start_ocr 用 OCR 识别「演出开始」",
           "演出开始" in (special.get("special_click_start_ocr", {}).get("expected") or []))
     check("模板识别排在 OCR 兜底之前",
-          wait_next.index("special_click_start") < wait_next.index("special_click_start_ocr"),
-          wait_next)
+          _click_chain(special).index("special_click_start")
+          < _click_chain(special).index("special_click_start_ocr"),
+          _click_chain(special))
 
     # 2.7 活动节点里不允许出现「无 recognition 且带 Click」的盲点节点
     blind = [
@@ -423,10 +471,15 @@ def test_bot_branch():
     check("--special-song 参数已注册", '"--special-song"' in src)
 
     # 3.3 谱面预加载的位置:建好 player 之后、post_task 之前
+    #
+    # 取 post_task 时必须锚在**主流程**（_main_impl）里那一次，不能用「文件里第一个」。
+    # Issue #4 加的 _run_daily_flow() 里也有 post_task，且定义在 _main_impl 之前，
+    # `next(...)` 会先撞上它(2026-10-09 修chart.py 时被这条误报绊住：
+    # 报 (2641, 2534)，业务代码其实是对的)。所以改成取最后一个。
     lines = src.splitlines()
     i_player = next(i for i, l in enumerate(lines) if l.strip() == "init_player_and_mnt()")
     i_prep = next(i for i, l in enumerate(lines) if l.strip() == "_prepare_special_song(args.special_song)")
-    i_task = next(i for i, l in enumerate(lines) if "maatasker.post_task(" in l)
+    i_task = max(i for i, l in enumerate(lines) if "maatasker.post_task(" in l)
     check("预加载在 init_player_and_mnt 之后", i_prep > i_player, (i_player, i_prep))
     check("预加载在 post_task 之前", i_prep < i_task, (i_prep, i_task))
 

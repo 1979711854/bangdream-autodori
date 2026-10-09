@@ -249,16 +249,18 @@ class Row(tk.Frame):
                 self, text=label, bg=th["surface"], fg=th["text_2"],
                 font=_f(), width=label_width, anchor="w",
             )
-            lb.pack(side="left")
+            # anchor="center":标签单行文字与右侧控件(下拉框高 28px)垂直居中,
+            # 保证「框体与文字在同一水平线上垂直居中」,而不是默认顶对齐导致框偏下。
+            lb.pack(side="left", anchor="center")
             # 标签与下拉框之间留固定空隙,让选项整体更靠右、更宽松
             tk.Frame(self, bg=th["surface"], width=label_gap).pack(side="left")
         self.slot = tk.Frame(self, bg=th["surface"])
-        self.slot.pack(side="left", fill="x", expand=True)
+        self.slot.pack(side="left", fill="x", expand=True, anchor="center")
         if hint:
             tk.Label(
                 self, text=hint, bg=th["surface"], fg=th["text_3"],
                 font=_f(base_size() - 1),
-            ).pack(side="right")
+            ).pack(side="right", anchor="center")
 
 
 class Segmented(tk.Canvas):
@@ -773,6 +775,35 @@ SETTINGS_SVG = ("M19.6224 10.3954 L18.5247 7.7448 L20 6 L18 4 L16.2647 5.48295 "
 MOON_SVG = ("M3 11.5066 C3 16.7497 7.25034 21 12.4934 21 C16.2209 21 "
             "19.4466 18.8518 21 15.7259 C12.4934 15.7259 8.27411 11.5066 "
             "8.27411 3 C5.14821 4.55344 3 7.77915 3 11.5066 Z")
+# 2026-10-09 用户提供的 4 个桌面图标(同为 24x24 stroke 型),按上面的方式复刻。
+# 每条 path 的 d 直接拼在一起:解析器按 M 起新子路径、按 Z 收口,支持隐式续写。
+CLIPBOARD_CHECK_SVG = (
+    "M8.5 4H6C4.89543 4 4 4.89543 4 6V20C4 21.1046 4.89543 22 6 22H12"
+    "M15.5 4H18C19.1046 4 20 4.89543 20 6V15"
+    "M8 6.4V4.5C8 4.22386 8.22386 4 8.5 4C8.77614 4 9.00422 3.77604 "
+    "9.05152 3.50398C9.19968 2.65171 9.77399 1 12 1C14.226 1 14.8003 2.65171 "
+    "14.9485 3.50398C14.9958 3.77604 15.2239 4 15.5 4C15.7761 4 16 4.22386 "
+    "16 4.5V6.4C16 6.73137 15.7314 7 15.4 7H8.6C8.26863 7 8 6.73137 8 6.4Z"
+    "M15.5 20.5L17.5 22.5L22.5 17.5"
+)
+INFO_CIRCLE_SVG = (
+    "M12 11.5V16.5"
+    "M12 7.51L12.01 7.49889"
+    "M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2"
+    "C6.47715 2 2 6.47715 2 12C2 17.5228 6.47715 22 12 22Z"
+)
+APP_NOTIFICATION_SVG = (
+    "M19 8C20.6569 8 22 6.65685 22 5C22 3.34315 20.6569 2 19 2"
+    "C17.3431 2 16 3.34315 16 5C16 6.65685 17.3431 8 19 8Z"
+    "M21 12V15C21 18.3137 18.3137 21 15 21H9C5.68629 21 3 18.3137 3 15"
+    "V9C3 5.68629 5.68629 3 9 3H12"
+)
+CHAT_BUBBLE_CHECK_SVG = (
+    "M8 12L11 15L16 10"
+    "M12 22C17.5228 22 22 17.5228 22 12C22 6.47715 17.5228 2 12 2"
+    "C6.47715 2 2 6.47715 2 12C2 13.8214 2.48697 15.5291 3.33782 17"
+    "L2.5 21.5L7 20.6622C8.47087 21.513 10.1786 22 12 22Z"
+)
 
 _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 
@@ -836,13 +867,15 @@ def _svg_path_pts(d, n=14):
             if rel:
                 X, Y = x + X, y + Y
             x, y = X, Y
-            if cur_pts is None:
-                cur_pts = []
-                closed = False
-            # 保持同一子路径(隐式后续)
-            if not cur_pts:
-                cur_pts = [(round(x, 3), round(y, 3))]
-                # 但子路径起点 = 当前
+            # 每个 M 一律**开新子路径**(SVG 语义)。原来只在 cur_pts 为空时才开,
+            # 于是「上一条 path 没有以 Z 收口」时会被并进同一串点,在两段之间连出
+            # 一条本不该有的直线(实测:info-circle 的竖线会和圆圈连成长竖线、
+            # clipboard-check 的夹子会和外框连起来)。现有的 SETTINGS_SVG /
+            # MOON_SVG 每条子路径都以 Z 收口 → 行为完全不变。
+            if cur_pts:
+                subs.append((cur_pts, False))
+            cur_pts = [(round(x, 3), round(y, 3))]
+            closed = False
             last_cmd = "M"
         elif base == "L":
             X, Y = float(toks[i]), float(toks[i + 1])
@@ -973,8 +1006,9 @@ def _stash_photo(canvas, photo):
 def draw_icon(canvas, kind, x, y, color, size=14):
     """在画布上画极简线性图标（不使用 emoji，保证跨平台一致）。
 
-    kind ∈ {live, logs, docs, settings, theme, sun, moon, gear, refresh}
-    gear / moon 用桌面 SVG 描边路径采样复刻,其余为几何绘制。
+    kind ∈ {live, logs, docs, settings, theme, sun, moon, gear, refresh,
+            clipboard-check, info-circle, app-notification, chat-bubble-check}
+    后 6 个用桌面 SVG 描边路径采样复刻,其余为几何绘制。
     x, y 为左上角,size 为图标像素边长。
     """
     s = size / 14.0
@@ -1051,6 +1085,18 @@ def draw_icon(canvas, kind, x, y, color, size=14):
     elif kind == "moon":
         # 桌面 half-moon.svg 月牙外形(描边),用于深色模式切换按钮
         _svg_stroke(canvas, MOON_SVG, x, y, size, color, stroke=1.5)
+    elif kind == "clipboard-check":
+        # 桌面 clipboard-check.svg —— 左栏「一键清理日常」(2026-10-09 用户指定)
+        _svg_stroke(canvas, CLIPBOARD_CHECK_SVG, x, y, size, color, stroke=1.45)
+    elif kind == "info-circle":
+        # 桌面 info-circle.svg —— 左栏「界面」「关于」(2026-10-09 用户指定)
+        _svg_stroke(canvas, INFO_CIRCLE_SVG, x, y, size, color, stroke=1.45)
+    elif kind == "app-notification":
+        # 桌面 app-notification.svg —— 左栏「时基校准」(2026-10-09 用户指定)
+        _svg_stroke(canvas, APP_NOTIFICATION_SVG, x, y, size, color, stroke=1.45)
+    elif kind == "chat-bubble-check":
+        # 桌面 chat-bubble-check.svg —— 左栏「运行日志」(2026-10-09 用户指定)
+        _svg_stroke(canvas, CHAT_BUBBLE_CHECK_SVG, x, y, size, color, stroke=1.45)
     elif kind == "refresh":
         # 循环箭头(刷新/重新扫描):一段圆弧 + 箭头尖
         canvas.create_arc(

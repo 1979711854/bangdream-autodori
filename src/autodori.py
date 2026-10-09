@@ -62,6 +62,15 @@ DIFFICULTY = "hard"
 # **一首**就收尾停止。曲目与难度都固定,所以整条流程不选曲、不选难度 —— 这是
 # 与常规挖矿流程唯一的实质差别。SPECIAL_MODE 由 `--mode special` 打开。
 SPECIAL_MODE = False
+# ---- 一键清理日常(Issue #4) ----
+# 流程分三段,开关各自独立(结构由用户 10-09 定):
+#   ① 启动游戏 + 点掉开场公告/赠送弹窗(每日签到奖励也在这里领取)
+#      —— **必经流程,没有开关**:不点掉就进不了主界面,做成开关是误导。
+#   ② daily.auto_clear_fire 开启时:清火阶段复用常规打歌主循环,火量耗尽即视为
+#      清火完成(HandleLifeExhausted 走清火分支,只 StopTask 不请求进程退出)。
+#   ③ daily.auto_free_pull 开启时:每日免费三抽。三抽固定 3 次(游戏内置每日上限)。
+_DAILY_CLEAR_FIRE = False
+_DAILY_FREE_PULL = False
 # 默认曲目:简中客户端标题(曲库 musicTitle 下标 3)。也可写纯数字曲目 id,
 # 见 resolve_special_song()。换活动批次时改这里或 GUI 下拉。
 DEFAULT_SPECIAL_SONG = "[超高难易度 新SPECIAL] SENSENFUKOKU"
@@ -814,6 +823,84 @@ def _ensure_override_device(devices: list, requested: str) -> list:
     return list(devices) + [extra]
 
 
+_ADB_CONNECT_TIMEOUT_S = 6.0
+
+
+def _adb_connect(adb_path, address, timeout: float = _ADB_CONNECT_TIMEOUT_S) -> bool:
+    """对地址做一次 `adb connect`;True = 这条连接可用。
+
+    判据与 `device_scan._guess_ports` 一致:`adb connect` 对**没在跑**的实例也可能
+    rc=0,必须看输出文本里出现 connected/already 才算数。
+    """
+    if not adb_path or not address:
+        return False
+    try:
+        proc = subprocess.run(
+            [str(adb_path), "connect", str(address)],
+            capture_output=True, text=True, timeout=timeout,
+            # 同 _adb_shell_on:显式 UTF-8 + replace,别让中文 Windows 的 GBK 默认
+            # 编码把「连上没连上」这个判定搅掉。
+            encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as e:
+        logging.debug("adb connect %s 失败: %s", address, e)
+        return False
+    low = ((proc.stdout or "") + (proc.stderr or "")).lower()
+    return "connected to" in low or "already" in low
+
+
+def _drop_unreachable_devices(devices: list) -> list:
+    """从候选里剔除「adb 连不上」的实例(多候选时才做)。
+
+    背景(2026-10-09 实机):MAA 的 `find_adb_devices` 走 MuMuManager,会把
+    **已创建但从未启动**的实例也按 `16384 + 32n` 反推成候选 —— 实测一个
+    `index=1` 的空壳被列成 `127.0.0.1:16416`。那个地址 adb 连不上,探测必然
+    三条命令全 None(显示「安装状态未知」);更麻烦的是它把「本来只有一个可用
+    实例」撑成「多实例」→ 走自动判定分支 → 真正那台一旦也探不出邦邦,就整体
+    fatal「无法确定哪个实例是邦邦游戏」。
+    GUI 侧 `device_scan.discover` 走 `adb devices`(只列在线的),两边口径本就不
+    一致;这里补上 connect 这一步,让 bot 的候选表与 GUI 对齐。
+
+    纪律:**全部连不上时保留原候选表**(宁可让后面的探测报「未知」,也不在 adb
+    抖动时把唯一可用设备误删 —— 与 `_device_fingerprint` 取不到就不去重同口径)。
+    """
+    if len(devices) < 2:
+        # 单候选走 `len(_device) == 1` 直接采用,不探测也不 fatal,没有误判空间
+        return devices
+
+    ok = [False] * len(devices)
+
+    def work(i, dev):
+        ok[i] = _adb_connect(
+            getattr(dev, "adb_path", ""), str(getattr(dev, "address", "") or "")
+        )
+
+    # 必须并发:adb connect 连一个不存在的端口要等 TCP 超时(实测单个约 2s),
+    # 串行在多开时会把启动拖住十几秒。与 _guess_ports 同一处理。
+    threads = []
+    for i, dev in enumerate(devices):
+        t = threading.Thread(target=work, args=(i, dev), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=_ADB_CONNECT_TIMEOUT_S + 3)
+
+    kept = []
+    for i, dev in enumerate(devices):
+        if ok[i]:
+            kept.append(dev)
+        else:
+            logging.info(
+                "候选设备 %s 连不上(MuMu 里已创建但没启动?),已从候选中剔除",
+                getattr(dev, "address", "?"),
+            )
+    if not kept:
+        logging.warning("候选设备全都连不上 —— adb 可能异常,保留原候选表继续探测")
+        return devices
+    return kept
+
+
 def _format_device_choices(probes: list) -> str:
     """把探测结果渲染成给用户看的候选清单。"""
     if not probes:
@@ -1138,6 +1225,13 @@ class HandleLiveBoost(CustomAction):
 @maaresource.custom_action("HandleLifeExhausted")
 class HandleLifeExhausted(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
+        if _DAILY_CLEAR_FIRE:
+            # 清火模式(Issue #4):火量耗尽 = 打歌阶段完成。只结束当前任务
+            # (StopTask),不请求进程退出 —— 外层 _run_daily_flow 还要继续三抽。
+            # 必须放在 on_life_exhausted 模式判断之前:清火不消耗火罐等道具。
+            logging.info("清火完成:火量耗尽,结束打歌阶段,转入每日免费三抽")
+            _run_node_once(context, "stop")
+            return CustomAction.RunResult(False)
         # GUI 配置 data/config.yml 的 on_life_exhausted:
         #   auto = 回到主页后自动继续打歌; wait = 停在主页等用户手动操作
         mode = str(_runtime_config().get("on_life_exhausted", "auto") or "auto")
@@ -1168,6 +1262,14 @@ _SPECIAL_IDLE_WARN_INTERVAL_S = 15.0
 _special_idle_since: Optional[float] = None
 _special_idle_warned_at: float = 0.0
 
+# ⚠️ 这里曾经放过「选曲校验」的两个标志位(_special_song_mismatch / _special_song_verified),
+# 已按用户要求**整个移除**(2026-10-09)。原因见 SPECIAL 活动模式的说明:
+# 「选择乐队」页的曲名 OCR **不稳定** —— 实测既会把 `[期间限定 SPECIAL]` 整段误识成
+# `OIAL「期i限定 SPECIALI`(前缀全毁),也会在某些画面下读出与曲名无关的字符串
+# (`不澄当形方柔郡父`,显然是立绘/背景上的字)。判据无论怎么调都会误拦用户的正确操作,
+# 而用户的选择习惯是「跑错了自己重新选歌」→ 由人眼做这件事更可靠。
+# **别再加回来**;真要校验曲名,只能用选歌页的「乐曲等级」数字(SPECIAL 用不上那个位置)。
+
 #: 收尾时在得分界面找「确定」的轮数与间隔(得分界面会先播一段分数动画)
 _SPECIAL_FINISH_ROUNDS = 8
 _SPECIAL_FINISH_INTERVAL_S = 0.8
@@ -1184,6 +1286,7 @@ class SpecialIdle(CustomAction):
 
     def run(self, context: Context, argv: CustomAction.RunArg):
         global _special_idle_since, _special_idle_warned_at
+
         now = time.time()
         if _special_idle_since is None:
             _special_idle_since = now
@@ -1951,10 +2054,39 @@ def wait_first_note():
             )
         )
 
+    #冻结阶段的总超时上限(见下方 FREEZE_TIMEOUT_S)。冻结成功的标志是
+    # 「连续 200 帧 change<=3.0」,但如果检测带里始终有东西在动(立绘呼吸、
+    # 背景光效、滚动字幕),静默判定就会被反复重置 —— 实测同一首#786 冻结耗时
+    # 在 1.3s ~ 108.8s 之间剧烈波动(静默重置 0 ~ 5536 次),而能打成的
+    # #487/#486 稳定在 1.2s / 重置 0 次。**首音基准点由冻结完成时刻决定**,
+    # 等太久会让整首系统性偏后 → 全 MISS。所以必须给冻结封顶。
+    #
+    # 上限取值:正常曲子冻结约 1.2s;谱面首音本身在 2~5s。
+    # 取 12s 既容得下前奏偏长的曲子,又不会等到歌都快结束了还在等。
+    FREEZE_TIMEOUT_S = 12.0
+
     while True:
         try:
             screen = current_player.ipc_capture_display()
             frame_t = time.perf_counter()
+            # 冻结阶段超时判定(只在冻结未完成时有意义)。
+            if not freezed and (frame_t - t_start) * 1000.0 >= FREEZE_TIMEOUT_S * 1000.0:
+                freezed = True
+                _freeze_done_t = frame_t
+                _log_t = 0.0
+                logging.warning(
+                    "冻结阶段超过 %.0fs 仍未静默(已重置 %d 次),强制进入首音检测;"
+                    "检测带在此期间始终在变化,首音基准可能偏后 —— "
+                    "若整首系统性偏后,先查这一条",
+                    FREEZE_TIMEOUT_S,
+                    freeze_resets,
+                )
+                last_avg = band_avg = None
+                last_edge_avg = None
+                prev_change = None
+                prev_frame_t = None
+                _maybe_log(0.0, (0.0, 0.0, 0.0), "force-timeout")
+                continue
             rows = np.empty((row_count, 3), dtype=np.float64)
             for r in range(from_row, to_row + 1):
                 avg, _ = evaluate_row_color(screen, r)
@@ -2111,6 +2243,10 @@ def init_maa():
     # 多开时用户选的第 2、3 个实例就会漏掉,表现为「我明明选了它,却连不上」。
     # 这里显式 adb connect 一次,让 MAA 的下一次 find 能认出它。
     _device = _ensure_override_device(_device, DEVICE_OVERRIDE)
+    # MAA 会把「已创建但没启动」的实例也列成候选(见该函数说明),先按 adb 实际
+    # 连接能力过滤一遍 —— 这既让候选表与 GUI 口径一致,也让「只剩一台真正在跑」
+    # 时走 `len(_device) == 1` 直接采用,不必再进自动判定。
+    _device = _drop_unreachable_devices(_device)
 
     if not _device:
         logging.fatal("No supported devices were found.")
@@ -2128,12 +2264,23 @@ def init_maa():
             logging.info("%s", line)
         idx = _pick_device_by_probe(probes, DEVICE_OVERRIDE)
         if idx < 0:
-            logging.fatal(
-                "无法确定哪个实例是邦邦游戏 —— 为避免操作到其他游戏窗口,已停止。\n"
-                "请在 GUI 的「演出设置」里选择「模拟器实例」,或用命令行 "
-                "--device 指定端口/序号。\n候选设备:\n%s",
-                _format_device_choices(probes),
-            )
+            # 两种失败必须分开报,否则用户不知道下一步该做什么:
+            #   · 全部探测不可用(installed=None) → 是「连不上/命令超时」,该去启动模拟器;
+            #   · 至少一台探到了「没装邦邦」      → 是「选哪台」,该去 GUI 里选实例。
+            unknown = [p for p in probes if p["installed"] is None]
+            if probes and len(unknown) == len(probes):
+                logging.fatal(
+                    "候选的 %d 个模拟器实例都探测失败(adb 连不上或命令超时)—— "
+                    "请确认模拟器与安卓系统已启动完成,再重试。\n候选设备:\n%s",
+                    len(probes), _format_device_choices(probes),
+                )
+            else:
+                logging.fatal(
+                    "无法确定哪个实例是邦邦游戏 —— 为避免操作到其他游戏窗口,已停止。\n"
+                    "请在 GUI 的「自由演出设置」里选择「模拟器实例」,或用命令行 "
+                    "--device 指定端口/序号。\n候选设备:\n%s",
+                    _format_device_choices(probes),
+                )
             sys.exit(1)
         device = _device[idx]
 
@@ -2384,11 +2531,18 @@ def get_current_version():
         logging.debug("Failed to get current version")
 
 
+# 自动更新检查指向的仓库。
+# ⚠️ 2026-10-09 修正:原来硬编码的是**上游原项目** `EvATive7/autodori`,于是本仓库
+# (1979711854/bangdream-autodori)发布的版本用户永远看不到 —— 日志里长期显示的
+# `Newest version: v1.0.21` 就是上游的版本号。换仓库/改名只改这一处。
+UPDATE_REPO = "1979711854/bangdream-autodori"
+
+
 def check_update():
     logging.debug("Checking for updates...")
     try:
         version = requests.get(
-            "https://api.github.com/repos/EvATive7/autodori/releases/latest"
+            f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
         ).json()["tag_name"]
         logging.debug(f"Current version: {current_version}")
         logging.debug(f"Newest version: {version}")
@@ -2398,10 +2552,10 @@ def check_update():
             RESET = "\033[0m"
 
             print(
-                f"{ORANGE}{BOLD}有更新可用：{version}，在 https://github.com/EvATive7/autodori/releases 下载最新版本{RESET}"
+                f"{ORANGE}{BOLD}有更新可用：{version}，在 https://github.com/{UPDATE_REPO}/releases 下载最新版本{RESET}"
             )
             print(
-                f"{ORANGE}{BOLD}An update is available: {version}, download the latest version at https://github.com/EvAtive7/autodori/releases{RESET}"
+                f"{ORANGE}{BOLD}An update is available: {version}, download the latest version at https://github.com/{UPDATE_REPO}/releases{RESET}"
             )
             time.sleep(5)
 
@@ -2509,6 +2663,33 @@ def main():
         _shutdown(1, "未捕获异常: %s" % (e,))
 
 
+def _run_daily_flow(entry: str) -> None:
+    """一键清理日常(Issue #4)的分阶段执行。
+
+    阶段1 daily       启动游戏 + 点掉开场公告/赠送弹窗(每日签到奖励也在这里领取),
+                      回主界面。**必经流程,没有开关** —— 不点掉就进不了主界面。
+    阶段2 main        仅 daily.auto_clear_fire 开启时:复用常规挖矿打歌主循环清火;
+                      火量耗尽时 HandleLifeExhausted 走清火分支,用 stop 节点
+                      (StopTask)结束本阶段 —— 不请求进程退出,以便继续阶段3。
+    阶段3 daily_pull  仅 daily.auto_free_pull 开启时:每日免费三抽 —— 招募 →
+                      演出招募,按按钮状态幂等推进(免费→确认→抽; 剩余0回/
+                      今日已完成→收尾; 尚未完成每日演出→跳过),完成后退回主界面停止。
+
+    两个开关都关时,只做阶段1(启动 + 领签到/弹窗)就收尾。
+    """
+    maatasker.post_task(entry, _get_override_pipeline()).wait().get()
+    if _DAILY_CLEAR_FIRE:
+        logging.info("自动清火:进入打歌循环,火量耗尽后自动转入下一阶段")
+        maatasker.post_task("main", _get_override_pipeline()).wait().get()
+    else:
+        logging.info("未勾选「自动清火打歌」,跳过清火阶段")
+    if _DAILY_FREE_PULL:
+        logging.info("执行每日免费三抽(固定3次,游戏内置每日上限)")
+        maatasker.post_task("daily_pull", _get_override_pipeline()).wait().get()
+    else:
+        logging.info("未勾选「每日免费三抽」,跳过抽卡阶段")
+
+
 def _main_impl():
     parser = argparse.ArgumentParser(
         description="AutoDori script with different modes."
@@ -2516,10 +2697,11 @@ def _main_impl():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["main", "special"],
+        choices=["main", "special", "daily"],
         help=(
             "Specify the mode to run. 'main' = 常规挖矿;"
-            "'special' = 超高难度 SPECIAL 活动(固定单曲,玩家手动进入后接管)"
+            "'special' = 超高难度 SPECIAL 活动(固定单曲,玩家手动进入后接管);"
+            "'daily' = 一键清理日常(启动游戏+领签到/弹窗;清火打歌与每日三抽各有开关)"
         ),
         default="main",
     )
@@ -2576,6 +2758,7 @@ def _main_impl():
     args = parser.parse_args()
 
     global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE, CHALLENGE_FINISH
+    global _DAILY_CLEAR_FIRE, _DAILY_FREE_PULL
     DEVICE_OVERRIDE = str(args.device or "").strip()
 
     if not args.skip_version_check:
@@ -2589,6 +2772,15 @@ def _main_impl():
         SPECIAL_MODE = True
         DIFFICULTY = "special"
         entry = "special_wait"
+    elif args.mode == "daily":
+        # 一键清理日常(Issue #4):分三阶段执行(见 _run_daily_flow)。
+        # 阶段1(启动 + 领签到/弹窗)是必经流程、没有开关;阶段2/3 各由一个开关控制 ——
+        # 结构由用户 10-09 定,别再退回成"三个选项都得勾"。
+        SPECIAL_MODE = False
+        daily_cfg = _runtime_config().get("daily") or {}
+        _DAILY_CLEAR_FIRE = bool(daily_cfg.get("auto_clear_fire", False))
+        _DAILY_FREE_PULL = bool(daily_cfg.get("auto_free_pull", False))
+        entry = "daily"
     else:
         SPECIAL_MODE = False
         DIFFICULTY = args.difficulty
@@ -2605,7 +2797,10 @@ def _main_impl():
     # 退出看门狗:关游戏/停任务任何一条链没落实都由它兜底,保证脚本一定停。
     _start_exit_watchdog()
     try:
-        maatasker.post_task(entry, _get_override_pipeline()).wait().get()
+        if args.mode == "daily":
+            _run_daily_flow(entry)
+        else:
+            maatasker.post_task(entry, _get_override_pipeline()).wait().get()
     except KeyboardInterrupt:
         logging.info("收到中断信号,准备退出")
     except Exception as e:

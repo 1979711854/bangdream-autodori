@@ -12,6 +12,13 @@ from api import BestdoriAPI
 import yaml
 
 
+# 可用手指数上限。minitouch 上报的 max_contacts一般是 10。
+# 注意这是「设备能同时按下的触点数」,不是「游戏能判几个音」—— 10 指在
+# 密集段能显著减少因手指被占满而漏掉的音符（实测 #786 从漏 94 个降到 0 个）。
+# 上限设成 10 而非更高：超过 minitouch 常规上限的部分不会被设备接受。
+MAX_FINGERS = 10
+
+
 class PlayRecord(Model):
     class Meta:
         database = SqliteDatabase("data/play_records.db")
@@ -123,15 +130,26 @@ class Chart:
             )
 
         actions = []
+        # 可用手指数。minitouch 的 max_contacts 通常是 10（设备实际支持的上限），
+        # 原实现只给5 个,是为了模拟真人 5 指 —— 但那是"手不够用"的近似,
+        # 不是设备限制:多给的 contact 游戏照样识别。
+        #
+        # 5 指对绝大多数曲子够用（#596/#487/#486 实测抢不到手指数恒为 0）,但
+        # #786（ときめきエクスペリエンス！,1097 音符/104s）有 8.6% 的音符抢不到手,
+        # 最高时 5 指全被长按占满 → 这些音符**必然 MISS**。
+        #
+        # get_finger 按 id 升序返回**第一个空闲**手指,所以只要 5 指够用,
+        # 提到 10 不会改变任何分配结果 —— 已实测 #596/#487/#486 的 actions
+        # 逐字节一致（见 _exp_noimpact.py）,属零影响改动。
         available_fingers = [
             {
                 "id": i,
                 "occupied_time": [],
             }
-            for i in range(1, 6)
+            for i in range(1, MAX_FINGERS + 1)
         ]
 
-        # 5 指全部被占用时 get_finger 会返回 None,调用方没有做任何处理 ——
+        # 全部手指都被占用时 get_finger 会返回 None,调用方没有做任何处理 ——
         # 生成出来的指令要么带着 finger=None,要么被移动/长按分支直接丢弃,
         # 结果就是这些音符不会发出点击。它们必然 MISS,而且在结算里表现为
         # 「其余判定都正常、只有零星几个 miss,且 fast/slow 为 0」,和时序偏移
@@ -400,9 +418,10 @@ class Chart:
 
         if finger_missed:
             self._logger.warning(
-                "%d 个音符没抢到手指(5 指全被占用),这些音符不会发出点击指令 → 必然 MISS;"
+                "%d 个音符没抢到手指(%d 指全被占用),这些音符不会发出点击指令 → 必然 MISS;"
                 "首次出现在 %.0fms,前几个: %s",
                 len(finger_missed),
+                MAX_FINGERS,
                 finger_missed[0],
                 ", ".join("%.0f" % t for t in finger_missed[:8]),
             )
@@ -436,6 +455,19 @@ class Chart:
         for i, action in enumerate(actions):
             action_type = action["type"]
             action_index = action["index"]
+
+            # finger=None = 这个音符在解算时5 指全被占用、没抢到手指(见 notes_to_actions
+            # 的 finger_missed)。它照样被排进了时间轴,但没有手指可用。
+            #
+            # 原实现在这里照样调builder.down/up,把 finger 直接格式化进命令串,
+            # 生成出 `d None 200 590 1` / `u None` 这种**非法 minitouch 指令**。
+            # 实测 #786(ときめきエクスペリエンス！) 5 指下会产生 252 条,
+            # 其余三首为 0 —— 它是唯一一首密到 5 指不够的曲子。minitouch 收到
+            # 非法 contact 会解析失败,把整批命令的语义搅乱(轻则该音符 MISS,
+            # 重则整批下发错位),所以这里直接丢弃、不生成任何指令。
+            # 语义上等价于"这个音符没被点",与解算层的判断一致。
+            if action.get("finger", None) is None and action_type in ("down", "move", "up"):
+                continue
 
             self._a2c_offset += interval_offset
 

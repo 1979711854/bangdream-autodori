@@ -285,23 +285,26 @@ def list_adb_devices(adb: str) -> list:
     return out
 
 
-def _guess_ports(adb: str, count: int = 8) -> list:
-    """按 MuMu / 雷电的端口规律试 connect,只返回**真的连上**的端口。
+def _connect_addresses(adb: str, addresses: list) -> list:
+    """并发 `adb connect` 一批地址,返回**真的连上**的那些(保持输入顺序)。
 
-    MuMu 12 多开实例通常在 16384 + 32n,但不同版本/渠道端口并不保证一致,
-    所以这里把规律只当"候选",用 connect 的真实回执做筛选 ——
-    adb connect 对没在跑的实例也可能 rc=0,必须看输出文本。
+    判据与 _guess_ports 一致:`adb connect` 对没在跑的实例也可能 rc=0,
+    必须看输出文本里的 connected/already。
 
-    必须并发:adb connect 连一个**不存在的**端口要等 TCP 超时(实测单个约
-    2s,串行 8 个端口就是 16 秒,用户点一次「刷新」要干等)。并发后总耗时
-    等于最慢的那一个,退出关窗时也不会被拖住。
+    ⚠️ **为什么必须显式 connect**:MuMu 的 `16384/16416` **不会自动出现在
+    `adb devices` 里** —— 2026-10-09 实测,两个实例的安卓都已启动完成,
+    `adb devices` 却只报一条 `emulator-5554`;不主动 connect,那两个实例就
+    永远发现不了(这正是用户报的「GUI 只找到一个实例」的根因)。
+
+    必须并发:adb connect 连一个**不存在的**端口要等 TCP 超时(实测单个约 2s,
+    串行 8 个就是 16 秒,用户点一次「刷新」要干等)。并发后总耗时约等于最慢的那个。
     """
-    candidates = _MUMU_PORTS[:count] + _LD_PORTS[:count]
+    if not adb or not addresses:
+        return []
     found = []
     lock = threading.Lock()
 
-    def probe(port):
-        address = "127.0.0.1:%d" % port
+    def probe(address):
         rc, out = _run([adb, "connect", address], timeout=6)
         if rc != 0:
             return
@@ -311,14 +314,26 @@ def _guess_ports(adb: str, count: int = 8) -> list:
                 found.append(address)
 
     threads = []
-    for port in candidates:
-        t = threading.Thread(target=probe, args=(port,), daemon=True)
+    for addr in addresses:
+        t = threading.Thread(target=probe, args=(addr,), daemon=True)
         t.start()
         threads.append(t)
     for t in threads:
         t.join(timeout=10)
-    # 按候选顺序返回,保证下拉框里端口是升序(用户预期)
-    return [a for a in ("127.0.0.1:%d" % p for p in candidates) if a in found]
+    return [a for a in addresses if a in found]
+
+
+def _guess_ports(adb: str, count: int = 8) -> list:
+    """按 MuMu / 雷电的端口规律试 connect,只返回**真的连上**的端口。
+
+    MuMu 12 多开实例通常在 16384 + 32n,但不同版本/渠道端口并不保证一致,
+    所以这里把规律只当"候选",用 connect 的真实回执做筛选。候选按端口升序
+    返回,保证下拉框里端口是升序(用户预期)。
+    """
+    candidates = ["127.0.0.1:%d" % p
+                  for p in (_MUMU_PORTS[:count] + _LD_PORTS[:count])]
+    return _connect_addresses(adb, candidates)
+
 
 def _device_fingerprint(adb: str, address: str) -> str:
     """取设备内唯一标识,用来判断两个端口是不是**同一台**设备。
@@ -431,6 +446,17 @@ def discover(adb: str = "", manager: str = "") -> dict:
     # 报不出来时才猜,且按已知实例数收敛 —— 否则「没开模拟器」这个最常见的
     # 情况也要白等十几秒。
     ports = list(local)
+    # ⚠️ MuMu 的 16384/16416 不会自动进 `adb devices`(实测:两个实例都起着,
+    # adb 只报 emulator-5554) → 必须按 MuMuManager 给的**权威端口**主动 connect,
+    # 否则多开的其余实例永远发现不了。原来只在 ports 为空时才猜端口,而
+    # emulator-5554 已经把 ports 占住 → 猜都不猜(用户报的「只找到一个实例」根因)。
+    declared = sorted({"127.0.0.1:%s" % i["port"]
+                       for i in (instances or []) if i.get("port")})
+    missing = [a for a in declared if a not in ports]
+    if missing:
+        for addr in _connect_addresses(adb, missing):
+            if addr not in ports:
+                ports.append(addr)
     if not ports:
         guess_count = min(len(instances), 8) if instances else 2
         for addr in _guess_ports(adb, guess_count):
@@ -483,36 +509,18 @@ def discover(adb: str = "", manager: str = "") -> dict:
 
 
 def label_for(dev: dict) -> str:
-    """给下拉框生成标签。
+    """给下拉框生成标签：**只留「实例名 · 端口」**。
 
-    这里报的是**本实例内的事实**（「装了什么游戏」），不是「哪个实例才是邦邦」
-    —— 后者在克隆镜像多开下确实无法区分（`pm path` / `pidof` 对每个实例返回
-    一样），但那是另一个维度的问题。别把两者混为一谈：
+    2026-10-09 用户要求去掉尾部的「(装了邦邦、运行中、在前台)」——那段太长，把
+    下拉框挤爆（实测「模拟器实例名 · 端口 16384(装了邦邦、运行中、在前台)」远超框宽）。
 
-      · 单模拟器 + 装了多个游戏（实测用户的场景，如同时装邦邦与碧蓝）
-        → 「装了邦邦」是**准确且有用**的，必须显示；
-      · 多开克隆镜像、每台都装邦邦 → 「装了邦邦」对每台都一样，此时这句话
-        退化成无信息量（不是错误），端口仍能区分实例。
-
-    所以这里照实报「装了/在跑」，让用户看到客观状态；至于「该选哪台」，
-    多开场景靠端口和预览按钮，不靠本函数断言。
+    注意**只是不显示，不是不探测**：`installed` / `running` / `foreground` 仍照实
+    探测并留在 `dev` 里，供状态行与「预览」按钮使用（`discover()` 的返回值不变）。
+    该选哪台本来也不靠这句话 —— 多开时靠端口 + 「预览」逐个看画面。
     """
     name = dev.get("name") or "模拟器实例"
     port = dev.get("port") or "?"
-    tags = []
-    installed = dev.get("installed")
-    running = dev.get("running")
-    if installed is True:
-        tags.append("装了邦邦")
-    elif installed is False:
-        tags.append("未装邦邦")
-    if running is True:
-        tags.append("运行中")
-    if dev.get("foreground") is True:
-        tags.append("在前台")
-    if not tags:
-        return "%s · 端口 %s" % (name, port)
-    return "%s · 端口 %s(%s)" % (name, port, "、".join(tags))
+    return "%s · 端口 %s" % (name, port)
 
 
 def capture(adb: str, address: str, timeout: float = 12.0):

@@ -1,9 +1,13 @@
-"""离线复算: 谱面里有多少音符抢不到手指(5 指全被占用)。
+"""离线复算: 谱面里有多少音符抢不到手指(全部手指都被占用)。
 
-原理: chart.Chart.notes_to_actions() 内部维护 5 根手指的占用时间轴,
-同步音符多于 5 个(含被长按/滑条长期占用的)时 get_finger() 返回 None,
+原理: chart.Chart.notes_to_actions() 内部维护 MAX_FINGERS 根手指的占用时间轴,
+同步音符多于可用手指数(含被长按/滑条长期占用的)时 get_finger() 返回 None,
 这些音符不会生成点击指令 -> 必然 MISS。该方法自己会 logger.warning 汇总,
 本脚本只负责捕获并显示它。
+
+同时校验下游: actions_to_MNTcmd() 生成的**最终 minitouch 指令串**里
+不允许出现 `d None ...` / `u None` 这类非法 contact(2026-10-09 修复前
+#786 会产生 252 条)。这是回归的第一道闸。
 
 用法:
     .venv/Scripts/python.exe _diag_finger.py 664 hard
@@ -75,6 +79,27 @@ def check(song_id, difficulty):
         print("    >> 无 finger=None, 手指分配充足")
     for m in finger_msgs:
         print("    >> [被测代码告警] %s" % m)
+
+    # 下游闸门: 最终 minitouch 指令串里绝不能有非法 contact
+    bad_cmds = []
+    try:
+        chart.actions_to_MNTcmd(
+            RESOLUTION, 0,
+            {"up": 0, "down": 0, "move": 0, "wait": 0, "interval": 0},
+            size=10 ** 9,
+        )
+        for c in chart._commands:
+            s = c.get("command") or ""
+            if s.startswith(("d ", "m ", "u ")) and "None" in s:
+                bad_cmds.append(s)
+    except Exception as exc:
+        print("    >> [指令生成异常] %s" % exc)
+
+    if bad_cmds:
+        print("    !! 非法 minitouch 指令 %d 条(必须为 0): %s" % (len(bad_cmds), bad_cmds[:5]))
+    else:
+        print("    >> minitouch 指令串合法(无 None contact)")
+
     return none_notes
 
 
@@ -84,7 +109,7 @@ if __name__ == "__main__":
         args = ["664", "hard"]
 
     pairs = [(args[i], args[i + 1]) for i in range(0, len(args) - 1, 2)]
-    print("离线复算: 5 指占用导致的漏打 (%d 个谱面)" % len(pairs))
+    print("离线复算: 手指占用导致的漏打+ 非法指令 (%d 个谱面)" % len(pairs))
     for sid, diff in pairs:
         print("-" * 60)
         check(sid, diff)

@@ -1,0 +1,360 @@
+{
+    "daily": {
+        "next": [
+            "daily_home"
+        ],
+        "interrupt": [
+            "start_app",
+            "login_expired",
+            "connect_failed",
+            "ok_button",
+            "confirm_button",
+            "close_button",
+            "next_button",
+            "tap_to_next"
+        ]
+    },
+    "daily_home": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/live_home.png",
+        "roi": [
+            1042,
+            543,
+            238,
+            177
+        ],
+        "threshold": 0.95,
+        "next": [
+            "stop"
+        ]
+    },
+    "daily_pull": {
+        "next": [
+            "daily_pull_home",
+            "daily_pull_back"
+        ],
+        "interrupt": [
+            "start_app",
+            "login_expired",
+            "connect_failed",
+            "ok_button",
+            "confirm_button",
+            "close_button",
+            "next_button",
+            "tap_to_next"
+        ]
+    },
+    "daily_pull_home": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/live_home.png",
+        "roi": [
+            1042,
+            543,
+            238,
+            177
+        ],
+        "threshold": 0.95,
+        "next": [
+            "daily_pull_open_gacha"
+        ]
+    },
+    "daily_pull_back": {
+        "recognition": "TemplateMatch",
+        "template": "daily/button/back_arrow.png",
+        "roi": [
+            0,
+            0,
+            160,
+            160
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "daily_pull"
+        ]
+    },
+    "daily_pull_open_gacha": {
+        "recognition": "OCR",
+        "expected": [
+            "招募"
+        ],
+        "roi": [
+            540,
+            550,
+            380,
+            170
+        ],
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "daily_pull_find_gacha"
+        ]
+    },
+    "daily_pull_find_gacha": {
+        "next": [
+            "daily_pull_on_gacha",
+            "daily_pull_tab_click",
+            "daily_pull_scroll"
+        ]
+    },
+    "daily_pull_on_gacha": {
+        "recognition": "OCR",
+        "expected": [
+            "演出招募"
+        ],
+        "roi": [
+            240,
+            300,
+            560,
+            200
+        ],
+        "next": [
+            "daily_pull_btn_check"
+        ]
+    },
+    "daily_pull_tab_click": {
+        "recognition": "TemplateMatch",
+        "template": "daily/button/gacha_tab_live.png",
+        "roi": [
+            0,
+            60,
+            300,
+            600
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "daily_pull_btn_check"
+        ]
+    },
+    "daily_pull_scroll": {
+        "action": "Swipe",
+        "begin": [
+            110,
+            520,
+            1,
+            1
+        ],
+        "end": [
+            110,
+            180,
+            1,
+            1
+        ],
+        "duration": 400,
+        "post_delay": 800,
+        "next": [
+            "daily_pull_find_gacha"
+        ]
+    },
+    "daily_pull_btn_check": {
+        "next": [
+            "daily_pull_done",
+            "daily_pull_locked",
+            "daily_pull_click_free",
+            "daily_pull_scroll"
+        ]
+    },
+    "daily_pull_done": {
+        "recognition": "OCR",
+        "expected": [
+            "剩余0回",
+            "今日已完成"
+        ],
+        "roi": [
+            1040,
+            510,
+            240,
+            200
+        ],
+        "next": [
+            "daily_pull_exit"
+        ]
+    },
+    "daily_pull_locked": {
+        "recognition": "OCR",
+        "expected": [
+            "尚未完成"
+        ],
+        "roi": [
+            1040,
+            510,
+            240,
+            200
+        ],
+        "next": [
+            "daily_pull_exit"
+        ]
+    },
+    "daily_pull_click_free": {
+        "recognition": "OCR",
+        "expected": [
+            "免费"
+        ],
+        "roi": [
+            1040,
+            510,
+            240,
+            200
+        ],
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "daily_pull_confirm_wait"
+        ]
+    },
+    "daily_pull_confirm_wait": {
+        "recognition": "OCR",
+        "expected": [
+            "确认"
+        ],
+        "roi": [
+            330,
+            180,
+            420,
+            120
+        ],
+        "timeout": 8000,
+        "next": [
+            "daily_pull_confirm_click"
+        ]
+    },
+    "daily_pull_confirm_click": {
+        "recognition": "OCR",
+        "expected": [
+            "招募"
+        ],
+        "roi": [
+            600,
+            420,
+            360,
+            150
+        ],
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "daily_pull_anim_wait"
+        ]
+    },
+    "daily_pull_anim_wait": {
+        "recognition": "OCR",
+        "expected": [
+            "招募结果"
+        ],
+        "roi": [
+            0,
+            20,
+            420,
+            110
+        ],
+        "timeout": 8000,
+        "interrupt": [
+            "ok_button",
+            "confirm_button",
+            "close_button",
+            "next_button"
+        ],
+        "on_error": [
+            "daily_pull_tap_center"
+        ],
+        "next": [
+            "daily_pull_result_check"
+        ]
+    },
+    "daily_pull_tap_center": {
+        "action": "Click",
+        "target": [
+            630,
+            350,
+            20,
+            60
+        ],
+        "post_delay": 800,
+        "next": [
+            "daily_pull_anim_wait"
+        ]
+    },
+    "daily_pull_result_check": {
+        "interrupt": [
+            "ok_button",
+            "confirm_button",
+            "close_button",
+            "next_button"
+        ],
+        "next": [
+            "daily_pull_again",
+            "daily_pull_result_ok"
+        ]
+    },
+    "daily_pull_again": {
+        "recognition": "OCR",
+        "expected": [
+            "免费"
+        ],
+        "roi": [
+            620,
+            530,
+            380,
+            150
+        ],
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "daily_pull_confirm_wait"
+        ]
+    },
+    "daily_pull_result_ok": {
+        "recognition": "OCR",
+        "expected": [
+            "确定"
+        ],
+        "roi": [
+            880,
+            530,
+            400,
+            150
+        ],
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "daily_pull"
+        ]
+    },
+    "daily_pull_exit": {
+        "next": [
+            "daily_pull_exit_back"
+        ]
+    },
+    "daily_pull_exit_back": {
+        "recognition": "TemplateMatch",
+        "template": "daily/button/back_arrow.png",
+        "roi": [
+            0,
+            0,
+            160,
+            160
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "daily_pull_home_final"
+        ]
+    },
+    "daily_pull_home_final": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/live_home.png",
+        "roi": [
+            1042,
+            543,
+            238,
+            177
+        ],
+        "threshold": 0.95,
+        "next": [
+            "stop"
+        ]
+    }
+}

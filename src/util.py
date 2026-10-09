@@ -134,7 +134,18 @@ def compare_semver(v1: str, v2: str) -> int:
     def normalize(v):
         if v.startswith("v") or v.startswith("V"):
             v = v[1:]
-        return [int(x) for x in v.split(".")]
+        # 每段只取**前导数字**:预发布 tag 形如 `1.3.2-rc1`,直接 int() 会抛
+        # ValueError —— 调用方把整段包在 try 里,表现出来就是"更新检查静默失效"
+        # (用户端永远看不到新版本提示)。取不到数字就按 0 算。
+        parts = []
+        for seg in v.split("."):
+            digits = ""
+            for ch in seg:
+                if not ch.isdigit():
+                    break
+                digits += ch
+            parts.append(int(digits) if digits else 0)
+        return parts
 
     parts1 = normalize(v1)
     parts2 = normalize(v2)

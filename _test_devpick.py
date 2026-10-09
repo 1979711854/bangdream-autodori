@@ -114,6 +114,38 @@ def main():
     probes = [P("127.0.0.1:16384", "MuMu-0", installed=True)]
     check("单设备直接选中", A._pick_device_by_probe(probes), 0)
 
+    # === 11. 剔除 adb 连不上的候选(2026-10-09 实机 fatal 的修法) ===
+    # MAA 会把「已创建但没启动」的 MuMu 实例也按 16384+32n 列进候选,那个地址
+    # adb 连不上 → 探测全 None;还会把「只有一台真在跑」撑成「多实例」→ 进自动
+    # 判定 → 真机一旦也探不出邦邦就整体 fatal。修法:先 adb connect 过滤。
+    class FakeDev:
+        def __init__(self, addr):
+            self.address = addr
+            self.adb_path = "adb.exe"
+
+    real_connect = A._adb_connect
+    try:
+        A._adb_connect = lambda _adb, addr, **_kw: addr == "127.0.0.1:16384"
+
+        devs = [FakeDev("127.0.0.1:16384"), FakeDev("127.0.0.1:16416")]
+        kept = A._drop_unreachable_devices(devs)
+        check("连不上的空壳实例被剔除", [d.address for d in kept], ["127.0.0.1:16384"])
+
+        # 只剩一台 → 直接走 len==1 分支,不再 fatal(这就是那次报错的修法)
+        kept = A._drop_unreachable_devices(devs)
+        check("剔除后只剩一台可被直接采用", len(kept) == 1 and kept[0].address == "127.0.0.1:16384", True)
+
+        # 单候选不做 connect(没有误判空间,也省一次启动等待)
+        A._adb_connect = lambda *_a, **_kw: False
+        one = [FakeDev("127.0.0.1:16384")]
+        check("单候选原样返回", A._drop_unreachable_devices(one) is one, True)
+
+        # 全部连不上 → 保留原表(adb 抖动时不能把唯一可用设备误删)
+        A._adb_connect = lambda *_a, **_kw: False
+        check("全连不上时保留原候选表", len(A._drop_unreachable_devices(devs)), 2)
+    finally:
+        A._adb_connect = real_connect
+
     print()
     print("=" * 60)
     print("PASS=%d  FAIL=%d" % (PASS, FAIL))

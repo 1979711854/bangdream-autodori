@@ -115,7 +115,7 @@ def main():
           "预览" in txt_multi and "指定" in txt_multi, True)
     check("且不自动选中任何一个", app.device_address, "")
 
-    print("=== 2b. 只扫到一个且装了邦邦 -> 直接说可用 ===")
+    print("=== 2b. 只扫到一个 -> 提示保持「自动」 ===")
     app._on_devices_scanned({
         "adb": "adb.exe",
         "devices": [FakeDev(16416, installed=True, running=True,
@@ -124,18 +124,22 @@ def main():
     })
     root.update()
     txt = app.device_status.cget("text")
-    check("单实例+装了邦邦 -> 提示可直接用",
-          "1 个实例" in txt and "已装邦邦" in txt, True)
+    # 状态行只报客观的「实例数量 + 下一步」,**不再复述「装了邦邦」**
+    # (10-09 改):多开克隆镜像时每台都装了同一个游戏,那句话退化成零信息量;
+    # 而「哪个实例里装了邦邦」由 bot 侧按包名自动判定(`pm path`),不需要用户看。
+    # 这两条由 10-08 版断言「已装邦邦 / 未检测到邦邦」改成现状。
+    check("单实例 -> 提示保持自动", "1 个实例" in txt and "自动" in txt, True)
+    check("不再复述装没装邦邦", "邦邦" in txt, False)
 
-    print("=== 2c. 单实例但没装邦邦 -> 如实说没有 ===")
+    print("=== 2c. 单实例(未装邦邦时同一句话,状态行不再区分) ===")
     app._on_devices_scanned({
         "adb": "adb.exe",
         "devices": [FakeDev(16384, installed=False, running=False)],
         "shots": {},
     })
     root.update()
-    check("单实例未装邦邦 -> 如实提示",
-          "未检测到邦邦" in app.device_status.cget("text"), True)
+    check("单实例 -> 同样只报数量",
+          "1 个实例" in app.device_status.cget("text"), True)
     # 回到三开状态供后续用例
     app._on_devices_scanned({"adb": "adb.exe", "devices": devs, "shots": {}})
     root.update()

@@ -170,12 +170,75 @@ def test_long_and_flick_untouched():
           "实际 %d 个 move" % len(moves(straight)))
 
 
+def test_no_illegal_minitouch_command():
+    """手指不够时**不得**生成 `d None ...` / `u None` 这类非法 minitouch 指令。
+
+    2026-10-09 实机复现:打 #786(ときめきエクスペリエンス！)三次都没打出结算,
+    db 里零记录。根因之一是 5 指分配对该曲不够(1097 音符/104s,8.6% 的音符
+    抢不到手),而 notes_to_actions 把这些音符的 finger=None 原样带进
+    actions_to_MNTcmd,最终格式化出 `d None 200 590 1` / `u None` ——
+    minitouch 收到非法 contact 会解析失败,把那批命令的语义搅乱。
+
+    这里用**同一时刻 12 个以上音符**的合成谱面强制触发「手指不够」,
+    断言最终下发给minitouch 的指令串里一个 None 都没有。
+    """
+    print("\n[6] 手指耗尽时不产生非法 minitouch 指令")
+
+    # 同一拍上12 个 Single(7 个 lane 循环)+ 每个后面再跟一个占手的长条,
+    # 保证手指被占满,get_finger 返回 None。
+    notes = [BPM_NOTE]
+    for i in range(20):
+        notes.append({"type": "Single", "lane": i % 7, "beat": 1.0})
+    chart = build(notes)
+
+    finger_actions = [a for a in chart.actions if a.get("finger", "x") is None]
+    check("确实触发了手指耗尽(否则本用例测不到东西)", len(finger_actions) > 0,
+          "finger=None 的动作 %d 个" % len(finger_actions))
+
+    chart.actions_to_MNTcmd(
+        RESOLUTION, 0,
+        {"up": 0, "down": 0, "move": 0, "wait": 0, "interval": 0},
+        size=10 ** 9,
+    )
+    cmds = [c.get("command") or "" for c in chart._commands]
+    bad = [s for s in cmds if s.startswith(("d ", "m ", "u ")) and "None" in s]
+    check("最终指令串无 None contact", not bad, "非法 %d 条: %s" % (len(bad), bad[:3]))
+
+    # 每个 contact 必须是正整数 —— minitouch 的 contact id 从 0 开始,
+    # 但本项目手指 id 从 1 起(见 available_fingers),不能出现 0 或负数。
+    import re as _re
+
+    ids = [int(m.group(1)) for s in cmds
+           for m in [_re.match(r"[dmu] (-?\d+)", s)] if m]
+    check("contact id 均为正整数", all(1 <= i <= chart_mod.MAX_FINGERS for i in ids),
+          "越界 id: %s" % sorted({i for i in ids if not 1 <= i <= chart_mod.MAX_FINGERS}))
+    check("contact id 不超 MAX_FINGERS(%d)" % chart_mod.MAX_FINGERS,
+          not ids or max(ids) <= chart_mod.MAX_FINGERS,
+          "最大 %d" % (max(ids) if ids else -1))
+
+
+def test_finger_budget():
+    """可用手指数应≥ minitouch 常规上限,避免密集曲必然漏打。"""
+    print("\n[7] 手指预算")
+    check("MAX_FINGERS >= 10", chart_mod.MAX_FINGERS >= 10,
+          "当前 %d" % chart_mod.MAX_FINGERS)
+
+    # 同步 8 个音符(7 个 lane,首尾同 lane 造重复)时,5 指会漏、10 指不该漏。
+    notes = [BPM_NOTE] + [{"type": "Single", "lane": i % 7, "beat": 1.0} for i in range(8)]
+    chart = build(notes)
+    check("同拍 8 音符时无 finger=None",
+          all(a.get("finger", "x") is not None for a in chart.actions
+              if a["type"] in ("down", "move", "up")))
+
+
 def main():
     test_zero_length_segment()
     test_normal_slide_not_broken()
     test_degenerate_segment_contributes_nothing()
     test_real_song_pattern()
     test_long_and_flick_untouched()
+    test_no_illegal_minitouch_command()
+    test_finger_budget()
     print("\n合计: %d 通过 / %d 失败" % (PASS, FAIL))
     return 1 if FAIL else 0
 

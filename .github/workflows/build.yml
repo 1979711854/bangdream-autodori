@@ -49,5 +49,15 @@ jobs:
           # GitHub 会把单个换行渲染成 <br>,折行会让正文右侧出现大片空白。
           # (上游模板里的 evative7-changeloggen 步骤会覆写 CHANGELOG.md,已移除。)
           body_path: RELEASE_NOTES.md
+          # tag 名带 `-rc` 就发成 GitHub 的 **Pre-release**(2026-10-09 加):
+          #   · 带 Pre-release 角标的版本**不会出现在 `/releases/latest`**
+          #     → 用户端的自动更新检查不会提示它(想小范围试就先发 rc);
+          #   · 但仍能按链接直接下载 → 可以让提 issue 的人先试。
+          # 用法:`git tag v1.3.2-rc1 && git push origin v1.3.2-rc1` 试;
+          #       满意后 `git tag v1.3.2 && git push origin v1.3.2` 发正式版。
+          # ⚠️ 别用 `v1.3.2-rc1` 这种 tag 做长期版本号:`--version` 会把它写进
+          #   build_metadata.json,客户端每段只取前导数字来比较(见 util.compare_semver),
+          #   rc 与正式版会被当成同一个版本 → 只会出现在 GitHub 侧,别拿它当正式版号。
+          prerelease: ${{ contains(github.ref_name, '-rc') }}
           files: |
             dist/*.zip
