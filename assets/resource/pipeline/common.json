@@ -37,7 +37,10 @@
     },
     "skip_button": {
         "recognition": "TemplateMatch",
-        "template": "common/button/skip/pink.png",
+        "template": [
+            "common/button/skip/pink.png",
+            "common/button/skip/white.png"
+        ],
         "action": "Click"
     },
     "next_button": {

@@ -254,7 +254,8 @@
             "ok_button",
             "confirm_button",
             "close_button",
-            "next_button"
+            "next_button",
+            "skip_button"
         ],
         "on_error": [
             "daily_pull_tap_center"
@@ -281,7 +282,8 @@
             "ok_button",
             "confirm_button",
             "close_button",
-            "next_button"
+            "next_button",
+            "skip_button"
         ],
         "next": [
             "daily_pull_again",
