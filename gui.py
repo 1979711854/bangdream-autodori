@@ -103,7 +103,7 @@ OPTION_TREE = (
         ("live.gate", "时基校准", "app-notification"),
     )),
     ("日常", (
-        ("daily", "一键清理日常", "clipboard-check"),
+        ("daily", "日常", "clipboard-check"),
     )),
     ("运行", (
         ("logs", "运行日志", "chat-bubble-check"),
@@ -355,11 +355,14 @@ class AutodoriGUI:
         # adb_path 只兼容「早期版本手填过并留在配置里」的情况 —— 界面上已不再
         # 提供手填入口(需求:删掉该功能)。留读是为了别让老配置里的路径失效。
         self.adb_path = str(cfg.get("adb_path", "") or "")
-        # 一键清理日常的配置(见 Issue #4)
-        # 一键清理日常(见 Issue #4)。总开关本身代表「启动游戏 + 领取每日签到/弹窗奖励」——
-        # 这几步是进主界面的必经流程,没有可关的余地,所以不做成独立勾选项;
-        # 「清火打歌」与「每日三抽」才是真正可选的两步,各自一个开关。
-        self.daily_enabled = bool(cfg.get("daily_enabled", False))
+        # 日常页配置(见 Issue #4)。
+        # 「启动游戏」= 启动游戏 + 领取每日签到奖励 + 领取弹窗赠送奖励 ——
+        # 这几步是进主界面的必经流程,**没有关掉的余地**,所以恒为 True:
+        # 界面上仍显示成一个勾选项(默认勾选),但点不动(见 _detail_daily)。
+        # 真正可选的是「清火打歌」与「每日三抽」,各自一个开关。
+        # 2026-10-10 用户明确:不能做成可选项 —— 之前不勾就点不动清火/三抽,
+        # 新用户会误以为「脚本坏了、啥也干不了」。
+        self.daily_enabled = True
         self.daily_auto_clear_fire = bool(cfg.get("daily_auto_clear_fire", False))
         self.daily_auto_free_pull = bool(cfg.get("daily_auto_free_pull", False))
         self._closing = False         # 关窗口标记:让后台扫描线程及时收手
@@ -586,9 +589,6 @@ class AutodoriGUI:
         self.device_preview_btn = None
         self.challenge_start_btn = None
         self.daily_start_btn = None
-        # 日常的两个可选步骤(清火/三抽)要随总开关置灰,得拿到它们界面上的控件。
-        # 每次进入「日常」页重建卡片时会重新赋值;空元组 = 还没建过卡片。
-        self._daily_vars = ()
         for key, item in self.nav_items.items():
             item.select(key == self.view)
 
@@ -977,30 +977,30 @@ class AutodoriGUI:
         """
         th = T.get()
         card = W.Card(master)
-        W.SectionTitle(card.body, "一键清理日常",
-                       "启动游戏 + 签到 + [清火] + [三抽]").pack(
+        W.SectionTitle(card.body, "日常",
+                       "启动游戏(含签到/弹窗) + [清火] + [三抽]").pack(
             fill="x", pady=(0, 12))
 
-        en = tk.BooleanVar(master=card.body, value=self.daily_enabled)
+        en = tk.BooleanVar(master=card.body, value=True)
         tk.Checkbutton(
-            card.body, text="启用一键清理日常",
+            card.body, text="启动游戏",
             variable=en,
-            command=lambda: self._on_daily_enabled(en.get()),
+            # 点不动:取消勾选立刻弹回。它是必经流程,不给关掉的余地
+            # (2026-10-10 用户明确「不能改成可选项」)。
+            command=lambda: en.set(True),
             bg=th["surface"], fg=th["text"], selectcolor=th["surface"],
             activebackground=th["surface"], activeforeground=th["text"],
             font=T.font(self.font_size), anchor="w",
         ).pack(anchor="w", pady=(0, 2))
         tk.Label(card.body,
-                 text="含:启动游戏 + 领取每日签到奖励 + 领取弹窗赠送奖励\n"
-                      "（这几步是进游戏主界面的必经流程,勾选本项即自动完成）",
+                 text="自动完成:启动游戏 + 领取每日签到奖励 + 领取弹窗赠送奖励",
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1), anchor="w",
                  justify="left").pack(anchor="w", pady=(0, 10))
 
-        # 两个可选步骤。总开关关着时置灰,避免「勾了却没反应」。
+        # 两个可选步骤,各自独立。「启动游戏」恒为勾选,所以这里不需要置灰逻辑。
         # lambda 用默认参数绑住 var/cb —— 循环里的闭包直接引用循环变量会全部
         # 指到最后一项(晚绑定),点哪一个都触发同一个回调。
-        subs = []
         for text, value, cb in (
             ("自动清火打歌（先打歌清火，完成每日演出后自动转入三抽）",
              self.daily_auto_clear_fire, self._on_daily_auto_clear_fire),
@@ -1008,18 +1008,14 @@ class AutodoriGUI:
              self.daily_auto_free_pull, self._on_daily_auto_free_pull),
         ):
             var = tk.BooleanVar(master=card.body, value=value)
-            chk = tk.Checkbutton(
+            tk.Checkbutton(
                 card.body, text=text,
                 variable=var,
                 command=lambda v=var, f=cb: f(v.get()),
                 bg=th["surface"], fg=th["text_2"], selectcolor=th["surface"],
                 activebackground=th["surface"], activeforeground=th["text_2"],
                 font=T.font(self.font_size - 1), anchor="w",
-                state=("normal" if self.daily_enabled else "disabled"),
-            )
-            chk.pack(anchor="w", pady=(0, 4))
-            subs.append((var, chk))
-        self._daily_vars = tuple(subs)
+            ).pack(anchor="w", pady=(0, 4))
 
         self.daily_start_btn = W.PushButton(
             card.body, "开始日常", command=lambda: self.start(mode="daily"),
@@ -1030,25 +1026,6 @@ class AutodoriGUI:
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(8, 0))
         return card
-
-    def _on_daily_enabled(self, value):
-        """一键清理日常的总开关。
-
-        它代表「启动游戏 + 领签到/弹窗」这段**必经流程**(没有单独开关),
-        同时决定下面两个可选步骤(清火 / 三抽)能不能勾 —— 关着时置灰。
-
-        ⚠️ 不再像以前那样"勾上就把子项一起勾上":签到/弹窗本来就是我方必经步骤,
-        而清火/三抽是用户自己要选的,总开关替他勾上容易误打。
-        """
-        self.daily_enabled = bool(value)
-        for _var, chk in (getattr(self, "_daily_vars", None) or ()):
-            try:
-                chk.configure(
-                    state=("normal" if self.daily_enabled else "disabled"))
-            except Exception:
-                # 卡片已被销毁/重建时控件失效:持久状态已改好,界面同步失败可忽略。
-                pass
-        self._save_gui_config()
 
     def _on_daily_auto_clear_fire(self, value):
         self.daily_auto_clear_fire = bool(value)

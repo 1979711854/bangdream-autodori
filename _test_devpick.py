@@ -83,7 +83,9 @@ def main():
     check("按完整地址指定", A._pick_device_by_probe(probes, "127.0.0.1:16416"), 1)
     check("只给端口号", A._pick_device_by_probe(probes, "16448"), 2)
     check("只给序号", A._pick_device_by_probe(probes, "0"), 0)
-    check("指定不存在的端口", A._pick_device_by_probe(probes, "99999"), -1)
+    # 10-10 改:指定的实例**不在候选里**时不再直接 -1,而是回退自动识别。
+    # 这三台都装了邦邦、都在跑、都没在前台 → 自动识别同样收敛不了 → 仍是 -1。
+    check("指定不存在的端口 → 回退自动识别后仍判不出", A._pick_device_by_probe(probes, "99999"), -1)
 
     print("=== 8. 装了邦邦但没运行也算候选(用户常态) ===")
     probes = [
@@ -145,6 +147,22 @@ def main():
         check("全连不上时保留原候选表", len(A._drop_unreachable_devices(devs)), 2)
     finally:
         A._adb_connect = real_connect
+
+    # === 12. 指定的实例不在候选里 → 回退自动识别(2026-10-10 小号实机) ===
+    # 用户上次选的 127.0.0.1:16384 已失效(小号实例实际在 16385),原先这一路直接
+    # fatal,用户看到的就是「勾了三抽但脚本啥也没干」。现在应回退到自动识别;
+    # 只有自动识别同样收敛不了时才仍然 -1(绝不静默挑一个错窗口)。
+    print("=== 12. 指定实例失效 → 回退自动识别(不再直接 fatal) ===")
+    probes = [P("127.0.0.1:16385", "MuMu-1", installed=True, running=True)]
+    check("失效端口回退到唯一装了邦邦的实例",
+          A._pick_device_by_probe(probes, "127.0.0.1:16384"), 0)
+
+    probes = [
+        P("127.0.0.1:16385", "MuMu-1", installed=True, running=True),
+        P("127.0.0.1:16416", "MuMu-2", installed=True, running=True),
+    ]
+    check("回退后仍有多台歧义 → -1(不静默挑错)",
+          A._pick_device_by_probe(probes, "127.0.0.1:16384"), -1)
 
     print()
     print("=" * 60)

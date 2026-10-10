@@ -77,13 +77,13 @@
     "daily_pull_open_gacha": {
         "recognition": "OCR",
         "expected": [
-            "招募"
+            "^招募$"
         ],
         "roi": [
             540,
-            550,
+            620,
             380,
-            170
+            100
         ],
         "action": "Click",
         "post_delay": 1500,
@@ -95,6 +95,7 @@
         "next": [
             "daily_pull_on_gacha",
             "daily_pull_tab_click",
+            "daily_pull_still_home",
             "daily_pull_scroll"
         ]
     },
@@ -218,6 +219,7 @@
         ],
         "timeout": 8000,
         "next": [
+            "daily_pull_costume_ok",
             "daily_pull_confirm_click"
         ]
     },
@@ -234,6 +236,18 @@
         ],
         "action": "Click",
         "post_delay": 1500,
+        "timeout": 4000,
+        "interrupt": [
+            "daily_pull_cut_anim",
+            "skip_button",
+            "ok_button",
+            "confirm_button",
+            "close_button",
+            "next_button"
+        ],
+        "on_error": [
+            "daily_pull_tap_center"
+        ],
         "next": [
             "daily_pull_anim_wait"
         ]
@@ -249,20 +263,24 @@
             420,
             110
         ],
-        "timeout": 8000,
         "interrupt": [
+            "daily_pull_cut_anim",
+            "skip_button",
             "ok_button",
             "confirm_button",
             "close_button",
-            "next_button",
-            "skip_button"
-        ],
-        "on_error": [
-            "daily_pull_tap_center"
+            "next_button"
         ],
         "next": [
             "daily_pull_result_check"
         ]
+    },
+    "daily_pull_cut_anim": {
+        "recognition": "TemplateMatch",
+        "template": "daily/button/touch_to_cut.png",
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 600
     },
     "daily_pull_tap_center": {
         "action": "Click",
@@ -272,13 +290,47 @@
             20,
             60
         ],
-        "post_delay": 800,
+        "post_delay": 600,
+        "timeout": 4000,
+        "interrupt": [
+            "daily_pull_cut_anim",
+            "skip_button",
+            "ok_button",
+            "confirm_button",
+            "close_button",
+            "next_button"
+        ],
+        "on_error": [
+            "daily_pull_tap_retry"
+        ],
         "next": [
             "daily_pull_anim_wait"
         ]
     },
+    "daily_pull_tap_retry": {
+        "next": [
+            "daily_pull_tap_center"
+        ]
+    },
+    "daily_pull_costume_ok": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/confirm/white.png",
+        "roi": [
+            480,
+            490,
+            330,
+            175
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "daily_pull_result_check"
+        ]
+    },
     "daily_pull_result_check": {
         "interrupt": [
+            "daily_pull_cut_anim",
             "ok_button",
             "confirm_button",
             "close_button",
@@ -286,6 +338,7 @@
             "skip_button"
         ],
         "next": [
+            "daily_pull_costume_ok",
             "daily_pull_again",
             "daily_pull_result_ok"
         ]
@@ -304,6 +357,7 @@
         "action": "Click",
         "post_delay": 1500,
         "next": [
+            "daily_pull_costume_ok",
             "daily_pull_confirm_wait"
         ]
     },
@@ -357,6 +411,20 @@
         "threshold": 0.95,
         "next": [
             "stop"
+        ]
+    },
+    "daily_pull_still_home": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/live_home.png",
+        "roi": [
+            1042,
+            543,
+            238,
+            177
+        ],
+        "threshold": 0.95,
+        "next": [
+            "daily_pull_open_gacha"
         ]
     }
 }
