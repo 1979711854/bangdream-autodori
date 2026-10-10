@@ -97,7 +97,21 @@ device: AdbDevice = None
 current_player: player.Player = None
 current_orientation: int = 0
 mnt: MNT = None
-all_songs: dict = BestdoriAPI.get_song_list()
+try:
+    all_songs: dict = BestdoriAPI.get_song_list()
+except Exception as _e:  # noqa: BLE001 —— 这里**绝不能**让异常逃出去
+    # ⚠️ 这一行在模块级,`_main_impl` 的 try 之外 —— 一旦抛出去,PyInstaller 会直接
+    # "Failed to execute script 'autodori'",进程无声无息死掉,GUI 里看起来就是
+    # 「点了开始没反应」(2026-10-10 用户实报,日志:`host='bestdori.com' ...
+    # ConnectTimeout` + MaxRetryError)。
+    # 改用与 init_maa 相同的收尾方式:打一条能看懂的中文再干净退出(CRITICAL 会被
+    # GUI 的「关键事件」显示出来)。
+    logging.fatal(
+        "启动失败:无法获取曲库(bestdori.com)。请检查网络或代理后重试,"
+        "确认能打开 https://bestdori.com/api/songs/all.5.json 再运行。\n原因:%s",
+        _e,
+    )
+    sys.exit(1)
 all_song_name_indexes: dict[str, str] = {
     list(filter(lambda title: title is not None, sinfo["musicTitle"]))[0]: sid
     for sid, sinfo in all_songs.items()
