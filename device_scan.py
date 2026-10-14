@@ -73,8 +73,18 @@ def _run(args, timeout=_TIMEOUT):
 
 def _adb_from_logs(base: str):
     """从最近几次运行日志里恢复 adb 路径 —— 最可靠,顺带尊重用户上次的选择。"""
+    # 不能用 os.path.getmtime 直接当 key:bot 每次运行都会新建日志,而 GUI 又
+    # 提示用户定期清理 —— glob 拿到路径之后、取 mtime 之前文件可能已被删,
+    # 此时 getmtime 抛 FileNotFoundError 冒泡出本函数 → discover() 失败 →
+    # 界面显示「未发现实例」,用户完全看不出是清理日志导致的。
+    def _mtime(path):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
     logs = sorted(glob.glob(os.path.join(base, "debug", "autodori-*.log")),
-                  key=os.path.getmtime, reverse=True)[:5]
+                  key=_mtime, reverse=True)[:5]
     for path in logs:
         try:
             with open(path, encoding="utf-8", errors="replace") as f:

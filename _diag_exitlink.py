@@ -242,7 +242,7 @@ def run_under_pipe(mode: str) -> dict:
     state = {"eof_at": None}
     keep = (
         "[child]", "[probe]", "[ctrl]",
-        "脚本收尾", "游戏已退出", "已请求退出", "强制停止",
+        "MAA 收尾", "游戏已退出", "已请求退出", "强制停止",
         "Ready to exit", "WARN", "ERROR", "Traceback",
     )
 

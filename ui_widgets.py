@@ -1372,7 +1372,9 @@ class DocView(tk.Frame):
     由外层 ScrolledFrame 整页滚动——彻底规避 Tk ``Text`` 固定 ``height``
     截断、且 wrap 后"逻辑行≠屏幕行"导致高度测量失真、不自带滚动条的固有问题。
 
-    - 标题【…】加粗加大；Q: 用强调色；bullet / sub 用缩进模拟；
+    - 小标题 `## …` 与 `Q:` 用强调色(蓝)加粗；`!` 开头是警告色加粗；
+      `- [x] ` 复选项显示为框里打钩；`**…**` 行内加粗；bullet 用黑色；
+      sub 用缩进模拟；
     - 每行 Label 按容器宽度自动 wrap,宽度变化时实时重排；
     - 不使用 Text,故不受其裁剪与滚动限制影响。
     """
@@ -1409,10 +1411,30 @@ class DocView(tk.Frame):
                 sp.pack(fill="x")
                 self._items.append((sp, 0))
                 continue
-            if s.startswith("【"):
+            if s.startswith("## "):
+                # 小标题:强调色加粗,与 Q: 同色。不用中括号【】,源里写 ## 即可
+                # (与「常见问题」的 Q: 行保持同一套视觉层级)。
+                fnt, fg, padx, pady = _f(fs + 1, "bold"), th["accent_text"], 0, (12, 4)
+                disp = s[3:].strip()
+            elif s.startswith("!"):
+                # 警告行:警告色加粗,相当于 Markdown 的 > [!WARNING] 提示框。
+                fnt, fg, padx, pady = _f(fs, "bold"), th["warn"], 0, (8, 2)
+                disp = s[1:].strip()
+            elif s.startswith(("- [x] ", "[x] ")):
+                # 复选项(更新日志用):显示为「框里打钩」☑ + 文本。
+                # ☑(U+2611) 在 Microsoft YaHei UI 里没有字形,直接写会变方框,
+                # 所以这一个字符改用 Windows 自带的 Segoe UI Symbol 渲染,
+                # 其余文字仍用正文字体(横排两个 Label)。
+                fnt, fg, padx, pady = _f(fs), th["text"], 16, (2, 2)
+                self._add_checkbox_line(
+                    th, fs, fg, padx, pady, s.split("] ", 1)[1].strip())
+                continue
+            elif s.startswith("【") and s.endswith("】"):
                 fnt, fg, padx, pady = _f(fs + 2, "bold"), th["text"], 0, (12, 4)
-                disp = s
+                disp = s[1:-1]  # 去掉中括号,UI 不显示(源里保留【】仅用于识别标题)
             elif s.startswith(("•", "·", "・", "- ")):
+                # 子弹点用黑色正文色:小标题 ## 与 Q: 才是强调色(蓝),
+                # 形成「标题=蓝、点=黑、正文=黑」的层级,不再一片蓝没区分。
                 fnt, fg, padx, pady = _f(fs), th["text"], 16, (2, 2)
                 disp = "• " + s[1:].strip()
             elif s.startswith(("Q:", "Q：")):
@@ -1427,17 +1449,72 @@ class DocView(tk.Frame):
             else:
                 fnt, fg, padx, pady = _f(fs), th["text"], 0, (2, 2)
                 disp = s
-            lbl = tk.Label(
-                self, text=disp, bg=th["surface"], fg=fg, font=fnt,
-                anchor="w", justify="left",
-            )
-            lbl.pack(anchor="w", fill="x", padx=padx, pady=pady)
-            self._items.append((lbl, padx))
+            if "**" in disp:
+                self._add_rich_line(th, fs, fg, padx, pady, disp)
+            else:
+                lbl = tk.Label(
+                    self, text=disp, bg=th["surface"], fg=fg, font=fnt,
+                    anchor="w", justify="left",
+                )
+                lbl.pack(anchor="w", fill="x", padx=padx, pady=pady)
+                self._items.append((lbl, padx))
         # 首帧容器宽度可能尚未就绪,wraplength 暂无法正确计算;
         # 延迟两次重排,待布局完成后再按真实宽度换行,确保整页高度正确。
         self.update_idletasks()
         self.after(0, self._relayout)
         self.after(80, self._relayout)
+
+    def _add_checkbox_line(self, th, fs, fg, padx, pady, text):
+        """复选项行:优先显示「框里打钩」☑,否则退回 √。
+
+        ☑(U+2611) 在正文字体(Microsoft YaHei UI)里没有字形,直接写会变
+        方框;Windows 自带的 Segoe UI Symbol 有该字形,所以这一个字符换用
+        它渲染,文字部分仍用正文字体(横排两个 Label)。
+        运行时检测字体可用性:连 Segoe UI Symbol 都没有(极端精简系统)时,
+        退回 √(U+221A,正文字体自带字形,必然能显示)。
+        """
+        try:
+            has_sym = "Segoe UI Symbol" in tkfont.families()
+        except Exception:
+            has_sym = False
+        if has_sym:
+            mark, mfont = "\u2611 ", ("Segoe UI Symbol", fs)
+        else:
+            mark, mfont = "\u221a ", _f(fs)
+        row = tk.Frame(self, bg=th["surface"])
+        tk.Label(
+            row, text=mark, bg=th["surface"], fg=fg,
+            font=mfont, anchor="nw",
+        ).pack(side="left", anchor="nw")
+        tk.Label(
+            row, text=text, bg=th["surface"], fg=fg,
+            font=_f(fs), anchor="nw", justify="left",
+        ).pack(side="left", anchor="nw")
+        row.pack(anchor="w", fill="x", padx=padx, pady=pady)
+        # 横排 Frame 参与 _relayout 时被跳过(只重排 Label 的 wraplength)
+        self._items.append((row, padx))
+
+    def _add_rich_line(self, th, fs, fg, padx, pady, disp):
+        """带 **粗体** 标记的行:按 ** 切段,普通段与粗体段横排成一行。
+
+        Tk 的 Label 不支持一行文字混用两种字体,所以拆成多个 Label
+        左对齐横排(粗体段 weight="bold")。** 需成对;落单的 ** 之后
+        的内容按普通文本处理。
+        注意:富文本行不做自动换行(横排 Label 无法 wrap),文案请保持短行,
+        长文本在源里手动换行。
+        """
+        row = tk.Frame(self, bg=th["surface"])
+        for i, part in enumerate(disp.split("**")):
+            if not part:
+                continue
+            tk.Label(
+                row, text=part, bg=th["surface"], fg=fg,
+                font=_f(fs, "bold" if i % 2 else "normal"),
+                anchor="nw", justify="left",
+            ).pack(side="left", anchor="nw")
+        row.pack(anchor="w", fill="x", padx=padx, pady=pady)
+        # 横排 Frame 参与 _relayout 时被跳过(只重排 Label 的 wraplength)
+        self._items.append((row, padx))
 
 
 class LogConsole(tk.Frame):

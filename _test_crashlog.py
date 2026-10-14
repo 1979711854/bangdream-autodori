@@ -165,8 +165,8 @@ def test_runtime_traceback():
           re.search(r"ZeroDivisionError: %s" % PROBE, log) is not None)
     check("日志含栈帧(File ...)",
           re.search(r'File ".*", line \d+', log) is not None)
-    check("日志含统一收尾记录(脚本收尾: 未捕获异常)",
-          "脚本收尾: 未捕获异常" in log)
+    check("日志含统一收尾记录(MAA 收尾: 未捕获异常)",
+          "MAA 收尾: 未捕获异常" in log)
 
 
 # ---------------------------------------------------------------- C. GUI
@@ -186,7 +186,7 @@ def test_gui_traceback_continuation():
     app.songs_done = 0
 
     lines = [
-        "2026-10-01 16:00:00,123[ERROR][autodori] 脚本异常终止: ZeroDivisionError('%s')" % PROBE,
+        "2026-10-01 16:00:00,123[ERROR][autodori] MAA 异常终止: ZeroDivisionError('%s')" % PROBE,
         "Traceback (most recent call last):",
         '  File "src/autodori.py", line 2223, in _main_impl',
         "    _prepare_special_song(args.special_song)",
@@ -198,7 +198,7 @@ def test_gui_traceback_continuation():
 
     shown = [m for (_stamp, _level, m) in app._log_buf]
     check("首行(ERROR 级)进入关键事件",
-          any("脚本异常终止" in m for m in shown))
+          any("MAA 异常终止" in m for m in shown))
     check("traceback 标题行被保留",
           any("Traceback (most recent call last)" in m for m in shown))
     check("栈帧行被保留",
@@ -209,7 +209,7 @@ def test_gui_traceback_continuation():
           "实际 %d 行: %r" % (len(shown), shown))
 
     # 之后的正常日志必须把「在栈里」这个状态清掉,否则会把无关裸行也当 ERROR 显示。
-    app._handle_line("2026-10-01 16:00:01,000[INFO][autodori] 脚本收尾: 正常结束")
+    app._handle_line("2026-10-01 16:00:01,000[INFO][autodori] MAA 收尾: 正常结束")
     app._handle_line("这条裸行不属于任何 traceback,不该被显示")
     check("新日志记录后不再吞入无关裸行",
           not any("不属于任何 traceback" in m for m in

@@ -22,6 +22,8 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 
+import yaml
+
 import ui_theme as T
 import ui_widgets as W
 
@@ -77,7 +79,7 @@ STRATEGY_HINT = {
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -111,7 +113,7 @@ OPTION_TREE = (
     ("说明", (
         ("docs.notes", "注意事项", "docs"),
         ("docs.preread", "用前必读", "docs"),
-        ("docs.faq", "常见问题", "docs"),
+        ("docs.changelog", "更新日志", "docs"),
     )),
     ("设置", (
         ("settings.ui", "界面", "info-circle"),
@@ -179,124 +181,70 @@ def _calibrate_gate(data, current_ms):
 
 
 # 注意事项内容(只读)
-NOTES = """【模拟器设置】
+NOTES = """## 模拟器设置
 • 使用 MuMu Player 12,分辨率 1280x720,Vulkan 渲染
-• 保持高帧率,不要限制 30fps(会破坏打歌同步)
+• 保持高帧率,不要限制 30fps
+• 取消勾选「禁用安卓系统声音」
 • 打歌期间尽量不要操作电脑,避免性能波动
 
-【游戏设置】
-• 游戏:邦邦国服(bilibili)
-• 支持自由演出(freelive)和挑战演出(challengelive),不支持协力模式
-• 自由演出的选曲列表设为"正常",清空歌曲筛选器
+## 游戏设置
 • 演出设定:将流速调整为 8.0
-• 演出效果·音量设定:关闭"3D切入模式","动作模式"改为"轻量模式"
-• 演出效果·音量设定:启用"FAST/SLOW表示"和"Perfect状态显示"
+• 演出效果·音量设定:关闭 "3D切入模式",将**"动作模式"改为"轻量模式"**
+• 演出效果·音量设定:启用 "FAST/SLOW表示" 和 "Perfect状态显示"
+• 支持自由演出(freelive)和挑战演出(challengelive),不支持协力模式
 
-【使用提醒】
-• 本脚本用于自动挖矿(自动打歌刷取资源/活动奖励),仅供个人使用
-• 请遵守游戏规则与用户协议,不要用于破坏游戏秩序或影响其他玩家
-• MuMu 多开时:在「自由演出设置 → 模拟器实例」里选要连的那台,选择会被记住。
-  多开通常是克隆镜像,每个实例都装了同一个游戏,脚本看不出哪个才是邦邦,
-  所以请务必手动指定 —— 连错会点到别的游戏窗口上
-• 如有问题,先查看 debug 目录下的日志
+## 多开模拟器
+• 多开时，需要手动指定要连接的实例
+• 点击「预览」可确认是否为目标窗口
+
+! 本MAA助手仅供个人挖矿使用
+! 请遵守游戏规则与用户协议
 """
 
 
-# 常见问题(只读)
-FAQ = """Q:多开模拟器时怎么指定连哪个窗口?
-A:在「自由演出设置 → 模拟器实例」里点刷新按钮,列表会列出所有在线实例(名称 + 端口)。
-选对的那个即可,选择会被记住,下次启动自动沿用。点「预览」可以看某个实例当前的画面,
-确认它是不是你要操作的那台。
+# 用前必读(只读)
+PRE_READ = """Q:打歌总是 FAST,怎么办?
 
-列表只显示「实例名 + 端口」(以前还会附「装了邦邦 / 运行中」,太长会把框挤爆,
-已去掉)。装没装邦邦不需要你看 —— 脚本启动时会自己去每个实例上按包名探测,
-挑出装了邦邦的那台;多开克隆镜像时每台都一样,同样靠端口或「预览」逐个确认。
-
-保持「自动」时,只有一个在线实例可以直接用;有多个时脚本会用启发式挑,
-不确定就手动指定。
-
-端口规律:MuMu 12 第 n 个实例是 127.0.0.1:(16384+32n),第一个 16384,第二个 16416。
-命令行也支持:`--device 16416`(端口)、`--device 127.0.0.1:16416`(完整地址)、
-`--device 0`(序号)三种写法都接受。
-
-Q:提示「无法确定哪个实例是邦邦游戏」怎么办?
-A:脚本在多个实例中无法唯一判断时会直接停止并列出候选,不会随便挑一个去乱点别的窗口。
-按顺序排查:
-① 点「刷新」重新扫描;② 确认模拟器已完全启动(不是停在启动画面);
-③ 用「预览」逐个看画面,在下拉框里手动指定正确的实例;
-④ 若列表里根本没有你的实例,确认 MuMu 是否为多开器版本、端口是否被占用。
-
-Q:打歌总是 FAST(狂爆 FAST / 整体按早),怎么办?
 A:先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选——若勾选请取消
-(允许系统声音),这是 FAST 偏移最常见的原因,关闭后即完全正常;若还不行,再在「时基校准」里开自动校准 photogate。
 
 Q:为什么无法正常打歌?
-A:请查看注意事项和 README.md,检查游戏和模拟器设置是否正确。
+
+A:请查看「注意事项」和 README.md,检查游戏和模拟器设置是否正确。
 
 Q:为什么有些歌会爆很多 GREAT 和 MISS?
-A:个别歌曲难度较大,机器识别可能存在一定延迟;
-模拟器长时间运行后发热/内存占用上升,触控输入延迟波动变大,精度下降。
-建议:偶尔重启模拟器、保证电脑不过热、保持高帧率。
 
-如果几乎每首都 GREAT 偏多(而不是个别难歌),通常是 photogate(打歌时基)没对准,需要调节:
-• 最简单:在「时基校准」里打开自动校准 photogate,正常打几首歌,脚本会根据
-每首的 FAST/SLOW 分布自动微调,几首内收敛,不用自己算;
-• 也可以手动改 photogate 数值:结算页 GREAT 偏 SLOW(按晚)就减小,
-偏 FAST(按早)就增大,每次调 10ms 左右,范围建议 0~150ms。
+A:个别歌曲难度较大,机器识别可能存在一定延迟;
+ 模拟器长时间运行后发热/内存占用上升
+ 触控输入延迟波动变大,精度下降。
+
+ 若几乎每首 GREAT 都偏多,通常是 photogate没对准:
+ 打开主界面「自动校准 photogate」正常打几首歌即可自动收敛
 
 Q:使用脚本有封号的风险吗?
-A:存在封号的可能性,但只要不用于冲榜,封号的概率就不大。
 
-Q:我发现了 BUG?
-A:可以反馈到 GitHub Issues。
+A:存在封号的可能性,但只要不用于冲榜,封号的概率就会小一些。
 
 Q:如何指定打某一首歌?
-A:自由演出可手动把想打的歌加入游戏内的收藏,让脚本只从收藏里选;
-挑战演出请先在游戏里选好歌曲和乐队,再从「挑战演出清 CP」页启动。
+
+A:代码本身暂不支持直接指定某首歌,但可以手动切换到「收藏」列表, 把想打的歌加入游戏内的「收藏」列表,让脚本只从收藏里选歌。
+
+Q:我发现了 BUG?
+
+A:可以反馈到 GitHub Issues。
 """
 
 
-# 用前必读:photogate 校准说明(只读)
-PRE_READ = """【先看这里 · 狂爆 FAST / 整体按早?】
-先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选,
-若勾选请取消(允许系统声音)。这是 FAST 偏移最常见的原因,关闭后即完全正常。
-
-【photogate 是什么】
-bot 以光闸确定打歌起点:第一个音符进入屏幕检测带时按下秒表,
-再等 photogate(毫秒)后开始整首歌。
-这个值代表音符从检测带到判定线的耗时,还和每台电脑的截屏/触控延迟有关,
-所以每台机器的最佳值不一样,默认 30 不一定适合你。
-
-【怎么知道没对准】
-先把注意事项里的设置都配好(流速 8.0 / 分辨率 1280x720 / 高帧率)。
-正常打歌应基本全 PERFECT。
-如果几乎每首 GREAT 都偏多(而不是个别难歌),就是 photogate 没对准。
-
-【最简单:自动校准】
-在「时基校准」里打开自动校准 photogate,正常打几首歌。
-脚本会读每首结算的 FAST/SLOW 分布自动微调,几首内收敛,不用自己算。
-每首结算后日志会显示一行判定: PERFECT … · GREAT …(FAST x/SLOW y),
-若偏 FAST/SLOW,校准状态会出现自动校准: photogate 30 → 40 …。
-
-【也可以手动调】
-时基校准页的 photogate 数值:
-• GREAT 偏 SLOW(按晚了)→ 减小
-• GREAT 偏 FAST(按早了)→ 增大
-每次调 10ms 左右,范围建议 0~150ms。
-提示:(SLOW偏多则减小,FAST偏多则增大)
-
-【注意】
-• 本脚本并不保证每次都能 AP(全完美),目标是尽量稳定 FC(全连);个别难歌或
-  电脑偶发波动出现 GREAT / 少量 MISS 属正常现象,不用反复纠结。
-• 自动校准值会在下一首歌开始前生效,无需重启;
-• 校准和每台机器绑定,换模拟器/电脑后建议重新校准;
-• 打歌期间别动电脑,性能波动也会造成 GREAT。
+# 更新日志(只读)
+CHANGELOG = """## v1.3.2更新内容
+- [x] 新增“日常清理”功能，支持自动领取弹窗奖励、自动打歌、自动完成每日三抽
+- [x] 优化了MAA代码运行逻辑
+- [x] 优化了GUI的说明事项
 """
 
 DOCS = {
     "docs.notes": NOTES,
     "docs.preread": PRE_READ,
-    "docs.faq": FAQ,
+    "docs.changelog": CHANGELOG,
 }
 
 
@@ -426,10 +374,20 @@ class AutodoriGUI:
             pass
 
     def _read_gate(self):
+        # 同 _write_config / _apply_photogate:config.yml 是 YAML,用 json 读会在
+        # 用户手写 YAML 时失败 → 静默退回默认 30ms,把用户的校准值丢掉。
         try:
             with open(CONFIG, encoding="utf-8") as f:
-                data = json.load(f)
-            return int(data.get("timing", {}).get("photogate_latency_ms", 30))
+                text = f.read()
+            if not text.strip():
+                return 30
+            data = yaml.safe_load(text)
+            if not isinstance(data, dict):
+                return 30
+            timing = data.get("timing")
+            if not isinstance(timing, dict):
+                return 30
+            return int(timing.get("photogate_latency_ms", 30))
         except Exception:
             return 30
 
@@ -787,7 +745,7 @@ class AutodoriGUI:
         """超高难度 SPECIAL 活动(hard-coded 单曲,独立于自由演出配置)。
 
         这个模式的接管点很窄:玩家手动进入活动、把界面停在「选择乐队」页
-        (右下角有「演出开始」按钮那一页),脚本只负责补点开演,然后按固定谱面
+        (右下角有「演出开始」按钮那一页),MAA 只负责补点开演,然后按固定谱面
         打这一首,打完停在结算页并点掉「确定」,随即停止。
         """
         th = T.get()
@@ -810,8 +768,8 @@ class AutodoriGUI:
                  font=T.font(self.font_size, "bold")).pack(anchor="w")
         for i, line in enumerate((
             "1. 在游戏里手动进入到「选择乐队」界面(选好乐队,停在右下角「演出开始」按钮那一页)",
-            "2. 回到 GUI 点击下面的「开始(超高难度活动)」,脚本会接管开演",
-            "3. 打完歌后会停在结算页面,不会继续下一首(点「确定」后脚本自动停止)",
+            "2. 回到 GUI 点击下面的「开始(超高难度活动)」,MAA 会接管开演",
+            "3. 打完歌后会停在结算页面,不会继续下一首(点「确定」后 MAA 自动停止)",
         ), 1):
             tk.Label(card.body, text=line, bg=th["surface"], fg=th["text_2"],
                      font=T.font(self.font_size - 1),
@@ -1280,16 +1238,23 @@ class AutodoriGUI:
         if sg is not None and sg.winfo_exists():
             sg.configure(text="photogate %d ms" % self.gate)
         try:
+            # data/config.yml 是 YAML —— bot 侧(src/autodori.py)用 yaml.safe_load 读,
+            # 这里必须用同一个解析器。原来用 json.loads:用户手写成 YAML 风格
+            # (注释 / 无引号 key)时解析失败 → cfg={} → 紧接着的写回把
+            # stop_when_game_exits、device.filter、song_strategy_reject_limit
+            # 全部抹掉。开了自动校准时这条路径**每首歌结算都会走一次**。
             cfg = {}
+            content = ""
             try:
                 with open(CONFIG, encoding="utf-8") as f:
                     content = f.read()
-                if content.strip():
-                    cfg = json.loads(content)
-            except Exception:
-                cfg = {}
-            if not isinstance(cfg, dict):
-                cfg = {}
+            except FileNotFoundError:
+                pass
+            if content.strip():
+                loaded = yaml.safe_load(content)
+                if not isinstance(loaded, dict):
+                    raise ValueError("config.yml 顶层不是映射")
+                cfg = loaded
             timing = cfg.get("timing")
             if not isinstance(timing, dict):
                 timing = {}
@@ -1297,9 +1262,10 @@ class AutodoriGUI:
             timing["photogate_latency_ms"] = new_val
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+                yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
         except Exception as e:
-            self._emit("", "ERROR", "写入 photogate 配置失败: {}".format(e))
+            # 解析失败时**不要**写回:宁可这次校准不落盘,也不能静默清空配置
+            self._emit("", "ERROR", "写入 photogate 配置失败(未修改文件): {}".format(e))
             return
         self._emit("", "CAL", "photogate: {} → {} ms".format(old, new_val))
 
@@ -1401,7 +1367,7 @@ class AutodoriGUI:
         "演出失败",
         "提前结束",
         "游戏已退出",
-        "脚本收尾",
+        "MAA 收尾",
         "强制停止",
         "Failed to init",
         "Traceback",
@@ -1784,7 +1750,7 @@ class AutodoriGUI:
             self.device_status.configure(
                 text=("已选择 %s — 启动时按此实例连接"
                       % self._label_of(self.device_address))
-                if self.device_address else "自动：脚本自行选择实例")
+                if self.device_address else "自动：MAA 自行选择实例")
 
     def _device_row(self, master):
         """自由演出设置卡片里的「模拟器实例」一行。"""
@@ -1931,14 +1897,19 @@ class AutodoriGUI:
             # 但 bot 会实时读取的键(如 stop_when_game_exits、song_strategy_reject_limit、
             # device.filter 等)。整份重写会在每次点「开始演出」时把它们抹掉,
             # 让用户手改的设置悄悄失效。
+            #
+            # 用 yaml 而不是 json(与 bot 侧口径一致):文件不存在 → 从空表开始;
+            # 存在但解析不了 → **中止写入并报错**,绝不静默覆盖成 {}
+            # (那正是"用户手改的设置悄悄失效"的成因)。
             merged = {}
-            try:
+            if os.path.exists(CONFIG):
                 with open(CONFIG, "r", encoding="utf-8") as f:
-                    old = json.load(f)
-                if isinstance(old, dict):
+                    text = f.read()
+                if text.strip():
+                    old = yaml.safe_load(text)
+                    if not isinstance(old, dict):
+                        raise ValueError("config.yml 顶层不是映射")
                     merged = old
-            except Exception:
-                merged = {}
             # timing 也要逐键合并,别丢掉用户加的其他 timing 项
             old_timing = merged.get("timing")
             if isinstance(old_timing, dict):
@@ -1947,9 +1918,12 @@ class AutodoriGUI:
                 cfg["timing"] = timing
             merged.update(cfg)
             with open(CONFIG, "w", encoding="utf-8") as f:
-                json.dump(merged, f, ensure_ascii=False, indent=2)
+                yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
         except Exception as e:
-            self._emit("", "ERROR", "写入配置失败: {}".format(e))
+            self._emit(
+                "", "ERROR",
+                "写入配置失败(未修改 data/config.yml): {}".format(e),
+            )
 
 
 def main():

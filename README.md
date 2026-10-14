@@ -170,6 +170,9 @@ A:可以反馈到 GitHub Issues。
 
 1. 推荐使用最新版 MuMu 模拟器;雷电模拟器测试较少,且存在性能问题。
 2. 本项目尚不完善,可能发生错误,欢迎 Issue 和 PR。
+3. `data/config.yml` 现在由 GUI 按 **YAML** 写入,bot 侧也用 `yaml.safe_load` 读。
+   手改时请写成合法 YAML —— JSON 是 YAML 的子集,旧版导出的 JSON 内容仍然兼容;
+   但别用奇形怪状的写法(未闭合引号 / Tab 缩进 / 全角空格),读不到 bot 会静默退回默认值。
 
 
 ## 📌 致谢与来源说明

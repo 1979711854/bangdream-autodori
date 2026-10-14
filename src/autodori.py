@@ -1081,7 +1081,7 @@ def _shutdown(exit_code: int = 0, reason: str = "") -> None:
             return
         _shutting_down = True
     try:
-        logging.info("脚本收尾: %s", reason or "正常结束")
+        logging.info("MAA 收尾: %s", reason or "正常结束")
     except Exception:
         pass
 
@@ -1185,7 +1185,7 @@ def _exit_watchdog_loop() -> None:
             continue
         gap = time.time() - absent_since
         if gap >= _GAME_EXIT_GRACE_S:
-            logging.warning("游戏已退出(连续 %.0fs 未检测到进程),停止脚本", gap)
+            logging.warning("游戏已退出(连续 %.0fs 未检测到进程),停止 MAA", gap)
             _game_seen_running = False
             _request_exit("游戏已退出")
             _force_post_stop()
@@ -1214,10 +1214,10 @@ def _exit_game_and_stop_task(context, reason: str = "退出游戏") -> None:
     _request_exit(reason)
     _run_node_once(context, "close_app")
     if _wait_game_exit(6.0):
-        logging.info("游戏已退出,停止脚本")
+        logging.info("游戏已退出,停止 MAA")
         _game_seen_running = False
     else:
-        logging.warning("关闭游戏后未确认到进程消失,仍继续停止脚本")
+        logging.warning("关闭游戏后未确认到进程消失,仍继续停止 MAA")
     _run_node_once(context, "stop")
 
 
@@ -1451,6 +1451,11 @@ class SavePlayResult(CustomAction):
             global current_song_id, play_failed_times
             succeed: bool = json.loads(argv.custom_action_param).get("succeed")
             if succeed:
+                # 成功即归零:MAX_FAILED_TIMES 的语义是「连续失败」而不是
+                # 「本次运行累计失败」。原来只在失败时 +1、从不归零,挂机久了
+                # (尤其 EXPERT/SPECIAL 偶发失败)会累计到 10 次,在某首歌之后
+                # 突然关掉游戏,日志只有一句「演出失败次数超限」,极难解释。
+                play_failed_times = 0
                 playresult = argv.reco_detail.best_result.detail
                 if isinstance(playresult, str):
                     playresult = json.loads(argv.reco_detail.best_result.detail)
@@ -2090,9 +2095,19 @@ def wait_first_note():
     # 取 12s 既容得下前奏偏长的曲子,又不会等到歌都快结束了还在等。
     FREEZE_TIMEOUT_S = 12.0
 
+    # 抓屏失败计数(对应下方 except)。
+    # 原来这里只有一行 `logging.error` —— 抓屏**持续**失败时(模拟器 IPC 断连、
+    # 游戏崩了、分辨率被改、MuMu 被切后台)整个 while 就成了无退避的死循环:
+    # 实测约 53 万次/秒,play_song() 永不返回,只能等 playsong 节点的
+    # timeout:50000 把整首判失败,日志里只剩一堆 "Failed to get screen"。
+    # 改成:每次失败退避 50ms,连续 CAPTURE_FAIL_MAX 次仍失败就抛出,走 on_error。
+    CAPTURE_FAIL_MAX = 20
+    capture_failures = 0
+
     while True:
         try:
             screen = current_player.ipc_capture_display()
+            capture_failures = 0
             frame_t = time.perf_counter()
             # 冻结阶段超时判定(只在冻结未完成时有意义)。
             if not freezed and (frame_t - t_start) * 1000.0 >= FREEZE_TIMEOUT_S * 1000.0:
@@ -2234,6 +2249,14 @@ def wait_first_note():
             _maybe_log(change_score, band_avg)
         except Exception as e:
             logging.error(f"Failed to get screen: {e}")
+            capture_failures += 1
+            if capture_failures >= CAPTURE_FAIL_MAX:
+                # 再等下去也没有意义:让 Play 捕获并走 on_error,而不是空转到超时
+                raise RuntimeError(
+                    "连续 %d 次抓屏失败,放弃等待首音" % capture_failures
+                ) from e
+            time.sleep(0.05)
+            continue
 
 
 def init_maa():
@@ -2260,7 +2283,11 @@ def init_maa():
                 (d.name, d.address) for d in _device
             ]:
                 _device.append(device)
-    filter_str = config.get("device", {}).get("filter", "devices")
+    # config 可能不是 dict:config.yml 为空文件时 yaml.safe_load 返回 None。
+    # 本文件 :87 与 :2625 都做了这个判空,这里也必须做,否则空配置直接
+    # AttributeError(启动阶段崩,且没有任何有用日志)。
+    _cfg = config if isinstance(config, dict) else {}
+    filter_str = _cfg.get("device", {}).get("filter", "devices")
     _device = eval(filter_str, {}, {"devices": _device})
 
     # 用户显式指定了实例,但它可能不在 MAA 枚举结果里 ——
@@ -2343,38 +2370,41 @@ def mnt_callback(event: MNTEvent, data: MNTEventData):
             cmd_log_list.append(data)
         cmd_type = cmd.split(" ")[0]
 
-        callback_data_lock.acquire()
-
-        if (last_cmd_endtime := callback_data.get("last_cmd_endtime")) != -1:
-            callback_data["interval"]["total"] += 1
-            callback_data["interval"]["total_offset"] += (
-                data.start_time - last_cmd_endtime
-            )
-        callback_data["last_cmd_endtime"] = data.end_time
-        if cmd_type in ["w"]:
-            callback_data["wait"]["total"] += 1
-            callback_data["wait"]["total_offset"] += cost - int(cmd.split(" ")[-1])
-        elif cmd_type in ["u", "d", "m"]:
-            type_ = {
-                "u": "up",
-                "d": "down",
-                "m": "move",
-            }[cmd_type]
-            callback_data[type_]["uncommited"] += 1
-            callback_data[type_]["total"] += 1
-            callback_data[type_]["total_offset"] += cost
-        elif cmd_type in ["c"]:
-            total_uncommited = 0
-            for type_ in ["up", "down", "move"]:
-                total_uncommited += callback_data[type_]["uncommited"]
-
-            if total_uncommited != 0:
+        # 必须用 with 而不是裸 acquire/release:正文里任何一句抛异常
+        # (例如 `int(cmd.split(" ")[-1])` 遇到非预期指令格式)都会跳过 release,
+        # 锁就永远不释放 —— 打歌主循环在 _adjust_offset() 处永久等待,整首卡死。
+        with callback_data_lock:
+            if (last_cmd_endtime := callback_data.get("last_cmd_endtime")) != -1:
+                callback_data["interval"]["total"] += 1
+                callback_data["interval"]["total_offset"] += (
+                    data.start_time - last_cmd_endtime
+                )
+            callback_data["last_cmd_endtime"] = data.end_time
+            if cmd_type in ["w"]:
+                callback_data["wait"]["total"] += 1
+                callback_data["wait"]["total_offset"] += cost - int(
+                    cmd.split(" ")[-1]
+                )
+            elif cmd_type in ["u", "d", "m"]:
+                type_ = {
+                    "u": "up",
+                    "d": "down",
+                    "m": "move",
+                }[cmd_type]
+                callback_data[type_]["uncommited"] += 1
+                callback_data[type_]["total"] += 1
+                callback_data[type_]["total_offset"] += cost
+            elif cmd_type in ["c"]:
+                total_uncommited = 0
                 for type_ in ["up", "down", "move"]:
-                    callback_data[type_]["total_offset"] += cost * (
-                        callback_data[type_]["uncommited"] / total_uncommited
-                    )
-                    callback_data[type_]["uncommited"] = 0
-        callback_data_lock.release()
+                    total_uncommited += callback_data[type_]["uncommited"]
+
+                if total_uncommited != 0:
+                    for type_ in ["up", "down", "move"]:
+                        callback_data[type_]["total_offset"] += cost * (
+                            callback_data[type_]["uncommited"] / total_uncommited
+                        )
+                        callback_data[type_]["uncommited"] = 0
 
 
 def init_player_and_mnt():
@@ -2684,7 +2714,7 @@ def main():
     except BaseException as e:
         # logging.exception 会把完整栈写进 FileHandler(GUI 也读得到第一行),
         # 然后走统一收尾 —— _shutdown 不返回。
-        logging.exception("脚本异常终止: %r", e)
+        logging.exception("MAA 异常终止: %r", e)
         _shutdown(1, "未捕获异常: %s" % (e,))
 
 

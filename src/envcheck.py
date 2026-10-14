@@ -214,7 +214,7 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
     cores = os.cpu_count() or 0
     if 0 < cores < 4:
         findings.append(
-            ("WARN", f"CPU 仅 {cores} 核, 难以同时承载模拟器与脚本。")
+            ("WARN", f"CPU 仅 {cores} 核, 难以同时承载模拟器与 MAA。")
         )
 
     return findings

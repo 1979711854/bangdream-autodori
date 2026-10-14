@@ -70,25 +70,61 @@ if maa_bin_path2 is None:
 add_data_param2 = f"{maa_bin_path2}{os.pathsep}MaaAgentBinary"
 
 
+def _local_minitouch_ok(path):
+    """本地那份 assets/minitouch_EvATive7 有没有真货:至少一个 ABI 下有非空二进制。"""
+    try:
+        for abi in os.listdir(path):
+            exe = os.path.join(path, abi, "minitouch")
+            if os.path.isfile(exe) and os.path.getsize(exe) > 0:
+                return True
+    except OSError:
+        pass
+    return False
+
+
 # 下载 minitouch.zip 并解压
 def download_and_extract_minitouch():
-    # GitHub 最新 release 页面
-    url = "https://github.com/EvATive7/minitouch/releases/latest/download/minitouch.zip"
+    """下载并解压 minitouch.zip,返回临时目录(内含 minitouch/ 子目录)。
 
-    # 下载文件
-    print("Downloading minitouch.zip...")
-    response = requests.get(url)
-    if response.status_code == 200:
-        with ZipFile(BytesIO(response.content)) as zip_ref:
-            # 解压到临时目录
-            temp_dir = os.path.join(current_dir, "minitouch_temp")
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)  # 清理旧的临时文件夹
-            zip_ref.extractall(temp_dir)
+    下载失败时退回仓库里已提交的 assets/minitouch_EvATive7 —— 目录结构与解压后的
+    `minitouch/` 完全一致,所以两者可以互换。没有这个兜底,任何拿不到 github.com
+    的机器都完全无法构建:2026-10-13 实测本机 requests 访问 github.com 必报
+    SSLCertVerificationError,而 PowerShell / 浏览器正常 —— 两边用的证书库不同
+    (requests 只认 certifi 自带的那份)。注意 bot 运行时依赖的 bestdori.com 与
+    api.github.com 走的是另外的证书链,不受影响。
+    """
+    url = "https://github.com/EvATive7/minitouch/releases/latest/download/minitouch.zip"
+    temp_dir = os.path.join(current_dir, "minitouch_temp")
+
+    try:
+        # 下载文件
+        print("Downloading minitouch.zip...")
+        response = requests.get(url, timeout=60)
+        if response.status_code == 200:
+            with ZipFile(BytesIO(response.content)) as zip_ref:
+                # 解压到临时目录
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)  # 清理旧的临时文件夹
+                zip_ref.extractall(temp_dir)
             print("minitouch.zip downloaded and extracted.")
             return temp_dir
-    else:
-        raise Exception(f"Failed to download minitouch.zip: {response.status_code}")
+        print(f"warning: minitouch.zip download returned HTTP {response.status_code}")
+    except Exception as e:
+        print(f"warning: minitouch.zip download failed: {e}")
+
+    local_dir = os.path.join(current_dir, "assets", "minitouch_EvATive7")
+    if _local_minitouch_ok(local_dir):
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir)
+        shutil.copytree(local_dir, os.path.join(temp_dir, "minitouch"))
+        print("fallback: staged committed assets/minitouch_EvATive7 instead.")
+        return temp_dir
+
+    raise Exception(
+        "Failed to obtain minitouch: download failed and "
+        "assets/minitouch_EvATive7 has no usable binaries."
+    )
 
 
 # 将 minitouch 文件夹移动到 dist/assets/minitouch_EvATive7 目录
@@ -133,7 +169,16 @@ if os.path.exists(dist_dir):
 DLL_DIR = os.path.join(current_dir, "assets", "misc", "windows", "dll")
 
 
-def build_exe(entry: str, name: str, console: bool):
+def build_exe(entry: str, name: str, console: bool, bundle_maa: bool):
+    """bundle_maa=False 时不把 maa/bin 与 MaaAgentBinary 打进包。
+
+    只有 bot 需要它们。GUI 侧(gui.py / ui_theme.py / ui_widgets.py /
+    device_scan.py)**从不 import maa** —— 2026-10-13 实测:autodori_gui.exe 的
+    PYZ 里 maa* 模块数为 0,autodori.exe 是 13 个;而给 GUI 也塞 --add-data
+    会让它白白多出 92 个数据文件、体积从 31.8MB 涨到 62.7MB,发布 zip 跟着从
+    ~124MB 顶到 ~155MB。device_scan.py 顶部的注释本来就写明「打包的
+    autodori_gui.exe 不含 maa/bin」,所以这是修回原状,不是新行为。
+    """
     cmd = [
         sys.executable,
         "-m",
@@ -142,9 +187,10 @@ def build_exe(entry: str, name: str, console: bool):
         "--onefile",
         "--noconfirm",
         f"--name={name}",
-        f"--add-data={add_data_param}",
-        f"--add-data={add_data_param2}",
     ]
+    if bundle_maa:
+        cmd.append(f"--add-data={add_data_param}")
+        cmd.append(f"--add-data={add_data_param2}")
     if not console:
         cmd.append("--noconsole")
     if sys.platform == "win32":
@@ -154,11 +200,11 @@ def build_exe(entry: str, name: str, console: bool):
     subprocess.run(cmd, check=True)
 
 
-for _entry, _name, _console in (
-    (os.path.join(current_dir, "src", "autodori.py"), "autodori.exe", True),
-    (os.path.join(current_dir, "gui.py"), "autodori_gui.exe", False),
+for _entry, _name, _console, _bundle_maa in (
+    (os.path.join(current_dir, "src", "autodori.py"), "autodori.exe", True, True),
+    (os.path.join(current_dir, "gui.py"), "autodori_gui.exe", False, False),
 ):
-    build_exe(_entry, _name, _console)
+    build_exe(_entry, _name, _console, _bundle_maa)
 
 
 # 使用 shutil 复制整个文件夹
@@ -219,7 +265,13 @@ for _doc in ("README.md", "CHANGELOG.md", "RELEASE_NOTES.md"):
         shutil.copy(_doc_src, os.path.join(dist_dir, _doc))
     else:
         print(f"warning: {_doc} not found, skipped")
-shutil.copy(os.path.join(current_dir, "run_challenge_live.bat"), dist_dir)
+# 同上面的文档/截图:缺了就跳过并告警,不能让构建整体崩掉 ——
+# 此时 dist_dir 早已被 rmtree 清空,抛异常会让整轮产物全部丢失。
+_challenge_bat = os.path.join(current_dir, "run_challenge_live.bat")
+if os.path.exists(_challenge_bat):
+    shutil.copy(_challenge_bat, dist_dir)
+else:
+    print("warning: run_challenge_live.bat not found, skipped")
 if os.path.isdir(os.path.join(current_dir, "screenshots")):
     shutil.copytree(
         os.path.join(current_dir, "screenshots"),
