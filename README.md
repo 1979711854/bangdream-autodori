@@ -43,7 +43,7 @@
 - **运行日志**:只显示关键事件,可打开日志目录 / 导出完整日志 / 清空
 - 设置持久化在 `data/gui_config.json`(主题 / 字号 / 窗口 / 当前页等)
 
-![GUI 主界面](screenshots/gui.png)
+![GUI 主界面](screenshots/gui.jpg)
 
 ## 🎯 挑战演出清 CP
 

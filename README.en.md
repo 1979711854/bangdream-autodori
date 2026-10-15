@@ -45,7 +45,7 @@ Auto-play script for BanG Dream! (Chinese server) + GUI launcher
 - **Run log**: key events only; open log folder / export the full log / clear
 - Settings are persisted in `data/gui_config.json` (theme / font size / window / current page, ...)
 
-![GUI main window](screenshots/gui.png)
+![GUI main window](screenshots/gui.jpg)
 
 ## 🎯 Challenge Live CP clearing
 
