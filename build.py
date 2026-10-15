@@ -32,7 +32,10 @@ if args.version is None:
     VERSION = "unknown"
 else:
     VERSION = args.version
-ZIP_FILENAME = f"autodori_{VERSION}_{args.os}_{args.arch}.zip"
+#: 产物名固定为 bangdream-autodori_win64.zip:README(中/英)与 Release 资产统一用它,
+#: 不再拼 version/os/arch —— 同一版本号换包(gh release upload --clobber)时不用改名字,
+#: 用户侧下载链接也稳定。
+ZIP_FILENAME = "bangdream-autodori_win64.zip"
 
 
 # 获取当前工作目录
@@ -259,7 +262,8 @@ json.dump(
 
 # 把发布说明与截图一并放进包内,与历史发布包的结构保持一致
 # (放在 assets 复制之后 —— PyInstaller 会以 --noconfirm 操作 dist/,不要先放东西进去)
-for _doc in ("README.md", "CHANGELOG.md", "RELEASE_NOTES.md"):
+# README.md / README.en.md 都进包:中英双语说明随包分发(用户 2026-10-15 要求)。
+for _doc in ("README.md", "README.en.md", "CHANGELOG.md", "RELEASE_NOTES.md"):
     _doc_src = os.path.join(current_dir, _doc)
     if os.path.exists(_doc_src):
         shutil.copy(_doc_src, os.path.join(dist_dir, _doc))

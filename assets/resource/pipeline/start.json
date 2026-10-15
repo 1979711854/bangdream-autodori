@@ -3,6 +3,8 @@
         "action": "StartApp",
         "package": "com.bilibili.star.bili",
         "next": [
+            "comfirm_song",
+            "select_song",
             "find_startpage_menu",
             "live_home_button"
         ],

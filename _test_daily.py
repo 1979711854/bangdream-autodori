@@ -15,6 +15,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 sys.path.insert(0, "src")
 sys.path.insert(0, ".")
 
@@ -115,11 +117,14 @@ def test_gui_config_keys():
         check("旧键 daily_auto_start 已不再写", "daily_auto_start" in saved, False)
         check("旧键 daily_claim_login 已不再写", "daily_claim_login" in saved, False)
 
-        # _write_config 写的是 bot 实时读的 data/config.yml,daily 块同样只该有 3 个键
+        # _write_config 写的是 bot 实时读的 data/config.yml,daily 块同样只该有 3 个键。
+        # **它写的是 YAML**(见 gui._write_config:与 bot 侧口径一致,还要逐键合并用户手改的
+        # 配置),所以这里必须 yaml.safe_load —— 早先写的是 json.loads,实现切成 YAML 之后就
+        # 一直抛 JSONDecodeError,而那是个未捕获异常,连带后面所有用例都不跑。
         cfg = Path(d) / "config.yml"
         with patch.object(gui, "CONFIG", str(cfg)):
             app._write_config()
-        written = json.loads(cfg.read_text(encoding="utf-8"))
+        written = yaml.safe_load(cfg.read_text(encoding="utf-8"))
         check("config.yml 的 daily 块", sorted(written["daily"]),
               ["auto_clear_fire", "auto_free_pull", "enabled"])
 
@@ -154,8 +159,11 @@ def test_rename_and_default_on():
     check("新增 still_home 兜底节点", "daily_pull_still_home" in d, True)
     nxt = d["daily_pull_find_gacha"]["next"]
     check("兜底排在滑动之前", nxt.index("daily_pull_still_home") < nxt.index("daily_pull_scroll"), True)
+    # still_home 的 next 允许在前面挂「回到主页先把公告点掉」的节点 ——
+    # 公告弹窗每次回主页都会再出现(见 SKILL.md 铁律),所以 song_announce_confirm
+    # 排第一是对的;这里只要求**最后**必须交回 open_gacha。
     check("兜底把控制权交回 open_gacha",
-          d["daily_pull_still_home"]["next"], ["daily_pull_open_gacha"])
+          d["daily_pull_still_home"]["next"][-1], "daily_pull_open_gacha")
 
 
 def test_gui_render_daily():
@@ -276,6 +284,72 @@ def test_costume_popup():
     check("「免费」仍在候选里", "daily_pull_again" in d["daily_pull_result_check"]["next"], True)
 
 
+class FakeBoostCtx:
+    """记录被请求执行的节点名(HandleLiveBoost 通过 run_action 请求 stop/close_app)。"""
+
+    def __init__(self):
+        self.actions = []
+
+    def run_action(self, entry):
+        self.actions.append(entry)
+
+
+class _BoostArgv:
+    """HandleLiveBoost 只读 argv.reco_detail.best_result.detail(OCR 出的火量文本)。"""
+
+    def __init__(self, text):
+        class _Best:
+            detail = text
+
+        class _Detail:
+            best_result = _Best()
+
+        self.reco_detail = _Detail()
+
+
+def _run_boost(text, clear_fire, play_at_zero):
+    """跑一次 HandleLiveBoost,返回它实际请求执行的节点列表。"""
+    ctx = FakeBoostCtx()
+    with patch.object(A, "_DAILY_CLEAR_FIRE", clear_fire), \
+         patch.object(A, "MIN_LIVEBOOST", 1), \
+         patch.object(A, "_runtime_config", lambda: {"play_at_zero_boost": play_at_zero}), \
+         patch.object(A, "_wait_game_exit", lambda *_: True), \
+         patch.object(A, "_request_exit", lambda *_: None):
+        A.HandleLiveBoost().run(ctx, _BoostArgv(text))
+    return ctx.actions
+
+
+def test_clear_fire_ends_on_low_boost():
+    """清火阶段的收工判据必须是**火量**,且在 play_at_zero_boost 之前判。
+
+    2026-10-15 实机:开着「火罐0继续」(play_at_zero_boost=True),火为 0 之后又连打
+    3 首,阶段3「每日免费三抽」始终没执行 —— 收工点当时错挂在 HandleLifeExhausted
+    (生命值耗尽)上,正常打完根本走不到那一步。
+    """
+    print("=== 9. 清火完成:火量不足即收工(阶段3 才接得上) ===")
+
+    check("清火模式 + 火量0 -> 只请求 stop(不关游戏,外层才能接着三抽)",
+          _run_boost("0", True, True), ["stop"])
+    check("清火模式 + 火量0(即便关掉 play_at_zero) -> 同样只 stop",
+          _run_boost("0", True, False), ["stop"])
+    check("清火模式 + 火量够 -> 什么都不做,继续打",
+          _run_boost("5", True, True), [])
+    check("非清火模式 + 火量0 + 火罐0继续 -> 继续打(旧行为不变)",
+          _run_boost("0", False, True), [])
+    check("非清火模式 + 火量0 + 不继续 -> 关游戏退出",
+          _run_boost("0", False, False), ["close_app", "stop"])
+
+    # 源码级防回退:收工点必须在 HandleLiveBoost,且排在 play_at_zero_boost 之前
+    src = Path("src/autodori.py").read_text(encoding="utf-8")
+    boost = src[src.index("class HandleLiveBoost"):src.index("class HandleLifeExhausted")]
+    check("清火判定在 HandleLiveBoost 里", "_DAILY_CLEAR_FIRE" in boost, True)
+    check("清火判定排在 play_at_zero_boost 之前",
+          boost.index("if _DAILY_CLEAR_FIRE:")
+          < boost.index("play_at_zero = _runtime_config()"), True)
+    life = src[src.index("class HandleLifeExhausted"):][:900]
+    check("HandleLifeExhausted 不再挂清火分支", "_DAILY_CLEAR_FIRE" not in life, True)
+
+
 def main():
     test_flow_gating()
     test_bot_reads_both_switches()
@@ -283,6 +357,7 @@ def main():
     test_rename_and_default_on()
     test_anim_wait_contract()
     test_costume_popup()
+    test_clear_fire_ends_on_low_boost()
     test_gui_render_daily()
     print()
     print("=" * 60)

@@ -66,8 +66,9 @@ SPECIAL_MODE = False
 # 流程分三段,开关各自独立(结构由用户 10-09 定):
 #   ① 启动游戏 + 点掉开场公告/赠送弹窗(每日签到奖励也在这里领取)
 #      —— **必经流程,没有开关**:不点掉就进不了主界面,做成开关是误导。
-#   ② daily.auto_clear_fire 开启时:清火阶段复用常规打歌主循环,火量耗尽即视为
-#      清火完成(HandleLifeExhausted 走清火分支,只 StopTask 不请求进程退出)。
+#   ② daily.auto_clear_fire 开启时:清火阶段复用常规打歌主循环,火量不足即视为
+#      清火完成(HandleLiveBoost 走清火分支,只 StopTask 不请求进程退出)。
+#      **判据是火量,不是生命值** —— 别把收工点挪回 HandleLifeExhausted。
 #   ③ daily.auto_free_pull 开启时:每日免费三抽。三抽固定 3 次(游戏内置每日上限)。
 _DAILY_CLEAR_FIRE = False
 _DAILY_FREE_PULL = False
@@ -1226,6 +1227,19 @@ class HandleLiveBoost(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         liveboost = int(argv.reco_detail.best_result.detail)
         if liveboost < MIN_LIVEBOOST:
+            # 清火模式(Issue #4)的收工判据就在这里 —— 清火要的就是"把火用完"。
+            # **必须放在 play_at_zero_boost 之前**:那个开关(默认 True)的语义是
+            # "0 火也接着打",先判它的话清火阶段永远不会结束。2026-10-15 实测:
+            # 火为 0 之后连打 3 首,阶段3「每日免费三抽」一直没执行。
+            # 只 StopTask、不请求进程退出,外层 _run_daily_flow 还要继续三抽。
+            if _DAILY_CLEAR_FIRE:
+                logging.info(
+                    "清火完成:火量 %d 不足 %d,结束打歌阶段,转入每日免费三抽",
+                    liveboost,
+                    MIN_LIVEBOOST,
+                )
+                _run_node_once(context, "stop")
+                return CustomAction.RunResult(False)
             # GUI 配置 data/config.yml 的 play_at_zero_boost:
             #   True = 火罐为0也继续打歌; False = 火罐为0退出游戏
             play_at_zero = _runtime_config().get("play_at_zero_boost", True)
@@ -1250,13 +1264,9 @@ class HandleLiveBoost(CustomAction):
 @maaresource.custom_action("HandleLifeExhausted")
 class HandleLifeExhausted(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
-        if _DAILY_CLEAR_FIRE:
-            # 清火模式(Issue #4):火量耗尽 = 打歌阶段完成。只结束当前任务
-            # (StopTask),不请求进程退出 —— 外层 _run_daily_flow 还要继续三抽。
-            # 必须放在 on_life_exhausted 模式判断之前:清火不消耗火罐等道具。
-            logging.info("清火完成:火量耗尽,结束打歌阶段,转入每日免费三抽")
-            _run_node_once(context, "stop")
-            return CustomAction.RunResult(False)
+        # 这里**不是**清火阶段的收工点:生命值耗尽只说明这一首打崩了,只要还有火
+        # 就该接着打下一首。「清火完成」的判据是**火量不足**,由 HandleLiveBoost
+        # 在选曲确认页判定 —— 2026-10-15 之前错挂在这里,正常打完永远等不到收工。
         # GUI 配置 data/config.yml 的 on_life_exhausted:
         #   auto = 回到主页后自动继续打歌; wait = 停在主页等用户手动操作
         mode = str(_runtime_config().get("on_life_exhausted", "auto") or "auto")
@@ -1384,6 +1394,86 @@ class SpecialFinish(CustomAction):
         return CustomAction.RunResult(True)
 
 
+#: 结算页数字的形近字符归一表。
+#: 数字是补零的浅灰细体(实拍 `0848`、`0000`),OCR 常把 0 读成 `O`/`D`、8 读成 `B`、
+#: 1 读成 `I`/`l`。不先归一的话 int() 直接抛异常,整项退化成 -1 —— 2026-10-15 实测
+#: FAST/SLOW 长期显示 -1 就是这么来的。
+_OCR_DIGIT_MAP = str.maketrans(
+    {
+        "O": "0",
+        "o": "0",
+        "D": "0",
+        "Q": "0",
+        "I": "1",
+        "l": "1",
+        "|": "1",
+        "Z": "2",
+        "z": "2",
+        "A": "4",
+        "S": "5",
+        "s": "5",
+        "G": "6",
+        "b": "6",
+        "B": "8",
+        "g": "9",
+        "q": "9",
+    }
+)
+
+#: 判定明细;它们的和 = 本曲总音符数
+_RESULT_COUNTS = ("perfect", "great", "good", "bad", "miss")
+
+
+def _ocr_to_int(text) -> int:
+    """结算页 OCR 文本 → 整数;读不出数字返回 -1(未知)。
+
+    不能直接 int():见 _OCR_DIGIT_MAP。先归一形近字符,再滤掉千分位逗号/空格等
+    噪声,最后解析。
+    """
+    if text is None:
+        return -1
+    s = re.sub(r"[^0-9]", "", str(text).strip().translate(_OCR_DIGIT_MAP))
+    return int(s) if s else -1
+
+
+def _reconcile_play_result(result: dict) -> dict:
+    """用判定字段之间**必然成立**的关系,纠正/剔除不可信的 OCR 读数。
+
+    三条关系都不是经验拟合:
+      1. GREAT 与 GOOD 同为 0 ⇒ 本曲没有非 PERFECT 判定 ⇒ `fast = slow = 0`
+         (实拍结算页该处正是 `0000`)。
+      2. miss 与 bad 同为 0 ⇒ 全程没有断连 ⇒ `maxcombo` 必等于总音符数
+         (`perfect+great+good+bad+miss`)。
+      3. `k = miss + bad` 次断连把全曲切成 k+1 段,最长一段至少
+         `ceil(total/(k+1))`,且不可能超过 total。
+
+    2026-10-15 实测的错值全被覆盖:全连曲把 `499` 读成 `439`、`830` 读成 `630`
+    (关系 2 直接纠正);`maxcombo 6514` 超过总数(关系 3 判无效)。
+    关系算不出确切值的一律置 -1(未知),**不猜数字**。
+    """
+    r = dict(result)
+    counts = {}
+    for key in _RESULT_COUNTS:
+        value = r.get(key, -1)
+        counts[key] = value if isinstance(value, int) and value >= 0 else -1
+    if min(counts.values()) < 0:
+        # 判定项本身没读全,推算的基数不可信,原样返回
+        return r
+
+    if counts["great"] == 0 and counts["good"] == 0:
+        r["fast"] = r["slow"] = 0
+
+    total = sum(counts.values())
+    breaks = counts["bad"] + counts["miss"]
+    maxcombo = r.get("maxcombo", -1)
+    maxcombo = maxcombo if isinstance(maxcombo, int) else -1
+    if breaks == 0:
+        r["maxcombo"] = total
+    elif not (-(-total // (breaks + 1)) <= maxcombo <= total):
+        r["maxcombo"] = -1
+    return r
+
+
 @maaresource.custom_recognition("PlayResultRecognition")
 class PlayResultRecognition(CustomRecognition):
     def analyze(
@@ -1419,7 +1509,8 @@ class PlayResultRecognition(CustomRecognition):
                 "roi": [1088, 323, 91, 28],
             },
         }
-        result = {type_: {} for type_ in types.keys()}
+        result = {type_: -1 for type_ in types.keys()}
+        raw_texts = {}
         pipeline = {
             f"_PlayResultRecognition_ocr_{type_}": {
                 "recognition": "OCR",
@@ -1428,18 +1519,23 @@ class PlayResultRecognition(CustomRecognition):
             }
             for type_, type_value in types.items()
         }
-        for type_, _ in types.items():
+        for type_ in types:
             try:
-                ocrtext = context.run_recognition(
+                reco = context.run_recognition(
                     f"_PlayResultRecognition_ocr_{type_}",
                     argv.image,
                     pipeline,
-                ).best_result.text
-                type_result = int(ocrtext)
-            except:
-                type_result = -1
-            result[type_] = type_result
+                )
+                ocrtext = reco.best_result.text if reco and reco.best_result else ""
+            except Exception as e:
+                ocrtext = ""
+                logging.debug("Play result ocr error [{}]: {}".format(type_, e))
+            raw_texts[type_] = ocrtext
+            result[type_] = _ocr_to_int(ocrtext)
 
+        # 原始文本一并落盘:读数异常时能分清"压根没识别到"和"识别成了别的数字"
+        logging.debug("Play result raw: {}".format(raw_texts))
+        result = _reconcile_play_result(result)
         logging.debug("Play result: {}".format(result))
         return CustomRecognition.AnalyzeResult([0, 0, 0, 0], json.dumps(result))
 
@@ -2724,8 +2820,11 @@ def _run_daily_flow(entry: str) -> None:
     阶段1 daily       启动游戏 + 点掉开场公告/赠送弹窗(每日签到奖励也在这里领取),
                       回主界面。**必经流程,没有开关** —— 不点掉就进不了主界面。
     阶段2 main        仅 daily.auto_clear_fire 开启时:复用常规挖矿打歌主循环清火;
-                      火量耗尽时 HandleLifeExhausted 走清火分支,用 stop 节点
+                      火量不足时 HandleLiveBoost 走清火分支,用 stop 节点
                       (StopTask)结束本阶段 —— 不请求进程退出,以便继续阶段3。
+                      判据只能是火量:play_at_zero_boost(默认 True)的语义是
+                      "0 火也接着打",它一旦先判,本阶段就永远不会结束
+                      (2026-10-15 实测:火为 0 后连打 3 首,三抽一直没执行)。
     阶段3 daily_pull  仅 daily.auto_free_pull 开启时:每日免费三抽 —— 招募 →
                       演出招募,按按钮状态幂等推进(免费→确认→抽; 剩余0回/
                       今日已完成→收尾; 尚未完成每日演出→跳过),完成后退回主界面停止。

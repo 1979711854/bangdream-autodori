@@ -144,6 +144,19 @@ def _parse_play_result(line):
     return None
 
 
+def _fmt_count(value):
+    """结算字段 → 展示文本;-1 是 OCR 失败的哨兵,显示成 `-`。
+
+    直接打出 -1 会让人以为"打出了 -1 个判定"(用户 2026-10-15 反馈),
+    实际含义是"这一项没识别出来"。上面那行 GREAT 括号里的 FAST/SLOW 同理。
+    """
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return "-"
+    return "-" if count < 0 else str(count)
+
+
 def _calibrate_gate(data, current_ms):
     """根据本曲 FAST/SLOW 判定,返回建议的 photogate 值;信号不足返回 None。
 
@@ -235,7 +248,16 @@ A:可以反馈到 GitHub Issues。
 
 
 # 更新日志(只读)
-CHANGELOG = """## v1.3.2更新内容
+# 每发一版在上方**追加**一段,旧版本段落保留不删(用户要求);格式与 v1.3.2 保持一致:
+# `## vX.Y.Z更新内容` + 每行一条 `- [x] ...`(DocView 会把 `- [x] ` 渲染成打钩框)。
+CHANGELOG = """## v1.3.3更新内容
+- [x] 修复游戏弹出新曲公告弹窗时MAA空转、日常三抽被跳过的问题
+- [x] 修复「自动清火打歌」火量耗尽后仍继续打歌、每日三抽不执行的问题
+- [x] 修复结算日志里读数显示-1的问题,识别不到的项现在显示为 -
+- [x] 修复重启MAA时游戏停在选曲页面会原地空转的问题
+- [x] 新增英文版说明文档 README.en.md
+
+## v1.3.2更新内容
 - [x] 新增“日常清理”功能，支持自动领取弹窗奖励、自动打歌、自动完成每日三抽
 - [x] 优化了MAA代码运行逻辑
 - [x] 优化了GUI的说明事项
@@ -1187,11 +1209,11 @@ class AutodoriGUI:
         self._emit(
             "", "OK",
             "结算 · 分数 {} · COMBO {} · PERFECT {} · GREAT {}(FAST {}/SLOW {}) · GOOD {}/BAD {}/MISS {}".format(
-                data.get("score", -1), data.get("maxcombo", -1),
-                data.get("perfect", -1), data.get("great", -1),
-                data.get("fast", -1), data.get("slow", -1),
-                data.get("good", -1), data.get("bad", -1),
-                data.get("miss", -1),
+                _fmt_count(data.get("score")), _fmt_count(data.get("maxcombo")),
+                _fmt_count(data.get("perfect")), _fmt_count(data.get("great")),
+                _fmt_count(data.get("fast")), _fmt_count(data.get("slow")),
+                _fmt_count(data.get("good")), _fmt_count(data.get("bad")),
+                _fmt_count(data.get("miss")),
             ),
         )
         if not self.auto_cal:
