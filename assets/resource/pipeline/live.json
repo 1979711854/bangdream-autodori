@@ -5,6 +5,7 @@
   "action": "Click",
   "post_delay": 800,
   "next": [
+   "song_announce_confirm",
    "select_live_mode",
    "live_home_button"
   ],

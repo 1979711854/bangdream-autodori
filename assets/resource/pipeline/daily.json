@@ -25,11 +25,13 @@
         ],
         "threshold": 0.95,
         "next": [
+            "song_announce_confirm",
             "stop"
         ]
     },
     "daily_pull": {
         "next": [
+            "song_announce_confirm",
             "daily_pull_home",
             "daily_pull_back"
         ],
@@ -55,6 +57,7 @@
         ],
         "threshold": 0.95,
         "next": [
+            "song_announce_confirm",
             "daily_pull_open_gacha"
         ]
     },
@@ -88,11 +91,13 @@
         "action": "Click",
         "post_delay": 1500,
         "next": [
+            "song_announce_confirm",
             "daily_pull_find_gacha"
         ]
     },
     "daily_pull_find_gacha": {
         "next": [
+            "song_announce_confirm",
             "daily_pull_on_gacha",
             "daily_pull_tab_click",
             "daily_pull_still_home",
@@ -152,6 +157,7 @@
     },
     "daily_pull_btn_check": {
         "next": [
+            "song_announce_confirm",
             "daily_pull_done",
             "daily_pull_locked",
             "daily_pull_click_free",
@@ -410,6 +416,7 @@
         ],
         "threshold": 0.95,
         "next": [
+            "song_announce_confirm",
             "stop"
         ]
     },
@@ -424,6 +431,7 @@
         ],
         "threshold": 0.95,
         "next": [
+            "song_announce_confirm",
             "daily_pull_open_gacha"
         ]
     }

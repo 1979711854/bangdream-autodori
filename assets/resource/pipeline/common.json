@@ -56,6 +56,19 @@
         ],
         "action": "Click"
     },
+    "song_announce_confirm": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/confirm/white.png",
+        "roi": [
+            430,
+            440,
+            420,
+            170
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1200
+    },
     "exit_button": {
         "recognition": "TemplateMatch",
         "template": [
