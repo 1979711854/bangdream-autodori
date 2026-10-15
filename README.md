@@ -25,15 +25,15 @@
 
 **战绩可查!👇**
 
-![](screenshots/record1.png)
+![](screenshots/record1.jpg)
 
-![](screenshots/record2.png)
+![](screenshots/record2.jpg)
 
-![](screenshots/record3.png)
+![](screenshots/record3.jpg)
 
 **超高难度 SPECIAL 活动:**
 
-![](screenshots/special_record.png)
+![](screenshots/special_record.jpg)
 
 ## 🖥 GUI 说明(Maa/SukiUI 风格)
 
@@ -82,7 +82,7 @@ CP 无法识别或设置后的消耗与选定倍率不符时停止。点击「�
 
 游戏内需要停在这一页,从这里交给脚本:
 
-![](screenshots/special_start.png)
+![](screenshots/special_start.jpg)
 
 **注意:**
 
@@ -136,22 +136,22 @@ python src/autodori.py --mode main --difficulty expert --livemode freelive
 
 ## ❓ 常见问题
 
-**Q:打歌总是 FAST(狂爆 FAST / 整体按早),怎么办?**
+**Q:打歌总是 FAST 怎么办?**
 
-A:先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选——若勾选请取消,这是 FAST 偏移最常见的原因,关闭后即完全正常;若还不行,再开「自动校准 photogate」。
+A:先检查 MuMu 模拟器「设置 → 设备 → 声音」里的「禁用安卓系统声音」是否被勾选——若勾选请取消,关闭后即完全正常，若还不行, 打开「自动校准 photogate」功能。
 
 **Q:为什么无法正常打歌?**
 
-A:请查看「注意事项」和 README.md,检查游戏和模拟器设置是否正确。
+A:请查看「注意事项」和 README.md, 检查游戏和模拟器设置是否正确。
 
-**Q:为什么有些歌会爆很多 GREAT 和 MISS?**
+**Q:为什么有些歌会爆很多 GREAT 和 MISS ?**
 
 A:个别歌曲难度较大,机器识别可能存在一定延迟;
 模拟器长时间运行后发热/内存占用上升,触控输入延迟波动变大,精度下降。
 
-若几乎每首 GREAT 都偏多,通常是 photogate没对准:
+若几乎每首 GREAT 都偏多,通常是 photogate 没对准:
 打开主界面「自动校准 photogate」正常打几首歌即可自动收敛;
-也可手动调:GREAT 偏 SLOW 减小、偏 FAST 增大,每次约 10ms,范围建议 0~150ms。
+
 
 **Q:使用脚本有封号的风险吗?**
 

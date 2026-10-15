@@ -672,3 +672,8 @@ _exp_resolve689.py
 # ---- 会话记忆(本地) ----
 # 跨会话的工作笔记,含内部排查细节与临时路径,不进公开仓库。
 .workbuddy/
+
+# ---- CodeBuddy 技能打包产物(本地) ----
+# package_skill.py 不带输出目录参数时会把 zip 打到当前工作目录,
+# 在仓库里跑一次就会多出 autodori.zip;技能包本身应留在 ~/.codebuddy/skills/。
+autodori.zip
