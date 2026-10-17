@@ -43,6 +43,10 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
+          # Release 标题(用户 2026-10-17 定):统一「BanG Dream · 邦邦自动挖矿助手 <tag>」,
+          # tag 带 `-rc` 时补「(预发布)」后缀。不写 name 时 GitHub 会直接拿 tag 当标题,
+          # 与 releases 列表里历史版本的样式对不上。
+          name: ${{ contains(github.ref_name, '-rc') && format('BanG Dream · 邦邦自动挖矿助手 {0}(预发布)', github.ref_name) || format('BanG Dream · 邦邦自动挖矿助手 {0}', github.ref_name) }}
           # release 正文取仓库根的 RELEASE_NOTES.md —— 它只写**当前版本**的内容。
           # 不要用 CHANGELOG.md:那是全量历史,正文会带上所有旧版本条目。
           # 该文件由维护者在发版前手写,排版要求「每段一行、不按列折行」——
