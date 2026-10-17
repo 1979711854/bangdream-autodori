@@ -5,9 +5,10 @@
 - 游戏判定时钟锚定在音频轨上。MuMu 开启「禁用安卓系统声音」
   (shell_config.json 的 renderer.audio_out_hardware_off = "1")会让音频管道
   不推进, 游戏时钟相对真实时间漂移 → 开局正常、越打越偏。这是第一杀手。
-- Windows「平衡/节能」电源计划会动态调节 CPU 频率, 打歌中偶发长停顿 →
-  批量 miss。高性能计划下明显好转。
 - 模拟器帧率上限过低(fps_limit < 60)会放大判定量化与卡顿。
+
+2026-10-17:删掉「Windows 电源计划」自检项。用户实测反馈"作用不大"——
+提示只说明了原理,既不能自动修正,又每次启动刷一条 WARN。
 
 本模块只做读取与诊断, 不修改任何配置(避免动用户的模拟器设置)。
 """
@@ -17,30 +18,7 @@ import ctypes
 import glob
 import json
 import os
-import re
-import subprocess
 from pathlib import Path
-
-# Windows 电源计划 GUID -> 性能档位(按 GUID 判定, 不依赖显示名, 跨语言/自定义改名均稳)
-# 档位: good=高性能类(无需警告); balanced=平衡(建议改); saver=省电/能效类(建议改);
-#       unknown=GUID 不在下表(中性提示, 建议人工确认)
-POWER_PLAN_TIER = {
-    "381b4222-f694-41f0-9685-ff5bb260df2e": "balanced",  # 平衡
-    "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c": "good",      # 高性能
-    "a1841308-3541-4fab-bc81-f71556f20b4a": "saver",      # 节能(部分系统改名: 最佳效能)
-    "e9a42b02-d5df-448d-aa00-03f14749eb61": "good",      # 卓越性能
-}
-# 显示名兜底档位(仅当 GUID 不在上表时使用, 覆盖 OEM/自定义改名:
-# "最佳效能"="最佳能效"类省电计划, "最佳性能"=高性能类)
-_NAME_TIER_HINT = {
-    "最佳性能": "good",
-    "高性能": "good",
-    "卓越性能": "good",
-    "最佳能效": "saver",
-    "最佳效能": "saver",
-    "节能": "saver",
-    "平衡": "balanced",
-}
 
 
 def _mumu_config_path(emulator_path) -> Path | None:
@@ -89,47 +67,6 @@ def _memory_load_percent() -> int:
         return -1
 
 
-_GUID_RE = re.compile(
-    r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
-)
-_NAME_RE = re.compile(r"\(([^()]*)\)")  # powercfg 输出中计划名在括号内, 如 "(平衡)"
-
-
-def active_power_plan() -> tuple[str, str]:
-    """返回 (显示名, 档位)。
-
-    显示名直接取自 powercfg /getactivescheme 的真实输出(你的系统可能显示为
-    "最佳效能"/"平衡"/"最佳性能" 等), 档位按 GUID 判定, 不受改名影响。
-    无法获取时显示名为空串、档位为 ''。
-    """
-    try:
-        raw = subprocess.check_output(
-            ["powercfg", "/getactivescheme"], timeout=5
-        )
-    except Exception:
-        return "", ""
-    # 中文 Windows 下 powercfg 输出为 GBK, 不能直接按 utf-8 解码
-    out = ""
-    for enc in ("utf-8", "gbk"):
-        try:
-            out = raw.decode(enc)
-            break
-        except Exception:
-            continue
-    if not out:
-        out = raw.decode("utf-8", "ignore")
-    m = _GUID_RE.search(out)
-    if m:
-        guid = m.group(1).lower()
-        nm = _NAME_RE.search(out)
-        name = nm.group(1).strip() if nm else ""
-        tier = POWER_PLAN_TIER.get(guid)
-        if tier is None and name:
-            tier = _NAME_TIER_HINT.get(name, "unknown")
-        return (name or "自定义", tier or "unknown")
-    return out.strip(), ""
-
-
 def check(emulator_path=None) -> list[tuple[str, str]]:
     """返回 [(级别, 说明)], 级别: ERROR/WARN/INFO。"""
     findings: list[tuple[str, str]] = []
@@ -174,32 +111,7 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
                 )
             )
 
-    # 2. Windows 电源计划(按 GUID 判档位, 显示真实计划名)
-    plan_name, plan_tier = active_power_plan()
-    if plan_tier in ("balanced", "saver"):
-        findings.append(
-            (
-                "WARN",
-                f"Windows 电源计划为「{plan_name}」, CPU 频率动态调节会造成打歌中"
-                "偶发长停顿并批量 miss。",
-            )
-        )
-    elif plan_tier == "good":
-        findings.append(
-            ("INFO", f"Windows 电源计划: {plan_name} (高性能类, 适合打歌)")
-        )
-    elif plan_tier == "unknown":
-        findings.append(
-            (
-                "WARN",
-                f"Windows 电源计划「{plan_name}」不在已知档位表中, 无法判定是否会影响"
-                "打歌稳定性。",
-            )
-        )
-    elif plan_name:
-        findings.append(("INFO", f"Windows 电源计划: {plan_name}"))
-
-    # 3. 内存压力
+    # 2. 内存压力
     load = _memory_load_percent()
     if load >= 85:
         findings.append(
@@ -210,7 +122,7 @@ def check(emulator_path=None) -> list[tuple[str, str]]:
             )
         )
 
-    # 4. CPU 核数
+    # 3. CPU 核数
     cores = os.cpu_count() or 0
     if 0 < cores < 4:
         findings.append(

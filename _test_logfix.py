@@ -41,6 +41,8 @@ class Stub:
     _should_show = gui.AutodoriGUI._should_show
     _KEEP = gui.AutodoriGUI._KEEP
     _LEVEL_KEEP = gui.AutodoriGUI._LEVEL_KEEP
+    # 2026-10-17 _should_show 新增噪声黑名单,Stub 也要转发,否则 AttributeError
+    _NOISE = gui.AutodoriGUI._NOISE
     _handle_line = gui.AutodoriGUI._handle_line
     _on_play_result = gui.AutodoriGUI._on_play_result
 

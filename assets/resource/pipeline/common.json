@@ -20,6 +20,13 @@
     "reader_menu": {
         "recognition": "TemplateMatch",
         "template": "common/reader/menu.png",
+        "roi": [
+            1000,
+            0,
+            280,
+            120
+        ],
+        "threshold": 0.8,
         "action": "Click",
         "next": "reader_skip"
     },
@@ -34,6 +41,27 @@
         "recognition": "TemplateMatch",
         "template": "common/reader/readafter.png",
         "action": "Click"
+    },
+    "story_loading_wait": {
+        "recognition": "OCR",
+        "expected": [
+            "LOADING",
+            ".*MB/.*"
+        ],
+        "roi": [
+            0,
+            540,
+            1280,
+            180
+        ],
+        "timeout": 3000,
+        "post_delay": 3000,
+        "next": [
+            "story_loading_wait",
+            "reader_menu",
+            "reader_skip",
+            "skip_button"
+        ]
     },
     "skip_button": {
         "recognition": "TemplateMatch",
@@ -55,6 +83,19 @@
             "common/button/ok/white.png"
         ],
         "action": "Click"
+    },
+    "tutorial_close": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/tutorial_close.png",
+        "roi": [
+            990,
+            600,
+            290,
+            120
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1200
     },
     "song_announce_confirm": {
         "recognition": "TemplateMatch",

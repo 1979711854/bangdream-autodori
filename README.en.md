@@ -15,14 +15,14 @@ Auto-play script for BanG Dream! (Chinese server) + GUI launcher
 ## ✨ Features
 
 - [x] **A more modern-looking GUI**: **Maa/SukiUI style** — custom-drawn widgets with left sidebar navigation, card-based settings, always-on run status and current song, light/dark themes, font scaling
-- [x] **One-click daily cleanup**: launches the game, claims the daily login reward, claims popup gift rewards, **auto-clears live boost by playing** and runs the **3 free daily pulls**
+- [x] **Daily cleanup**: launches the game, claims the daily login reward, claims popup gift rewards, **auto-clears live boost by playing** and runs the **3 free daily pulls**
 - [x] **Multiple song-selection strategies**: **mining-oriented**, **random**
 - [x] **"SPECIAL extra-high difficulty event" support**: walk to the "Select Band" screen in game manually, the script takes over the start, plays that one fixed chart and stops — no loop (see the dedicated section below)
 - [x] **Challenge Live CP clearing**: started separately from the GUI, it picks 8x / 4x / 2x / 1x based on your balance each song and stops when less than 200 CP is left
 - [x] **GUI launcher**: difficulty / song-selection strategy / boost strategy / photogate / life-exhausted strategy
 - [x] **Automatic photogate calibration**: after each song the timing is nudged from the FAST/SLOW distribution and converges within a few songs — no manual tuning needed on a different PC
 - [x] **Auto select song, auto play, and re-play after the result screen**: handles PT reward popups, character dialogue, failed lives, event stories and the rest of the result flow
-- [x] When life is exhausted you can choose **auto-exit and re-select a song** or **wait for manual action**; when boost is 0 you can choose **keep playing** or **exit the game**
+- [x] When life is exhausted you can choose **auto-exit and re-select a song** or **wait for manual action**; when boost is 0 you can choose **stop on the game home screen**, **keep mining** (playing at 0 boost, no rewards) or **exit the game**
 - [x] **Emulator compatibility**: MuMu 12 / MuMu V5 / LDPlayer (MuMu recommended); pick which MuMu multi-instance to use
 
 **Proof is in the pudding! 👇**
@@ -39,10 +39,11 @@ Auto-play script for BanG Dream! (Chinese server) + GUI launcher
 
 ## 🖥 GUI (Maa/SukiUI style)
 
-- Top **app bar**: difficulty quick segments, version number, light/dark theme switch, font size
+- Top **app bar**: app name, version number, start/stop buttons; the light/dark theme switch sits at the bottom of the left sidebar and the font size lives under **Settings → Interface**
 - **Persistent run card**: status indicator, **current song**, elapsed time, songs finished, start/stop buttons
-- **Left navigation**: Live (Free Live settings / Challenge Live CP / SPECIAL event / Timing calibration), Daily, Run log, Docs (Notes / Before you start / FAQ), Settings (Interface / About)
-- **Run log**: key events only; open log folder / export the full log / clear
+- **Left navigation**: Live (Free Live settings / Challenge Live CP / SPECIAL event / Timing calibration), Daily cleanup, Run log, Docs (Notes / Before you start / Update log), Settings (Interface / About)
+- **A single start entry**: **Start Daily**. The old standalone "Start Free Live" overlapped with it (same song picking / difficulty / boost logic) and has been merged into it; difficulty, song-selection strategy and the zero-boost strategy all live under **Free Live settings**
+- **Run log**: key events only; open log folder / export the full log / clear; logs older than 7 days are removed automatically on startup
 - Settings are persisted in `data/gui_config.json` (theme / font size / window / current page, ...)
 
 ![GUI main window](screenshots/gui.jpg)
@@ -51,7 +52,7 @@ Auto-play script for BanG Dream! (Chinese server) + GUI launcher
 
 1. In game, pick your challenge song and team and stop on the challenge song-select screen.
 2. Start the GUI and go to **Challenge Live CP** in the left sidebar, pick a difficulty (HARD by default).
-   For multi-instance setups, pick the target instance under "Emulator instance" on that page — the setting is shared with Free Live.
+   For multi-instance setups, pick the target instance under "Emulator instance" on that page — the setting is shared with **Start Daily**.
 3. Choose "exit the game after CP is cleared": checked = exit the game, unchecked = go back to the home screen. Then click **Start CP clearing**.
 
 Before every song the balance is read again and the CP ratio is set to the highest one you can pay:
@@ -88,8 +89,8 @@ The game must be left on this page, from where the script takes over:
 
 **Note:**
 
-- The **difficulty of the event song is fixed to SPECIAL by the event**; difficulty / song-selection strategy / boost strategy and the other options on the Free Live page have no effect in this mode
-- The **Start Live** button in the **top-right corner** of the GUI runs the regular Free Live flow and has nothing to do with the SPECIAL event page
+- The **difficulty of the event song is fixed to SPECIAL by the event**; difficulty / song-selection strategy / boost strategy and the other options on the Free Live settings page have no effect in this mode
+- The **Start Daily** button in the **top-right corner** of the GUI runs the regular live flow and has nothing to do with the SPECIAL event page
 - If the song you want is not in the dropdown, add it to `SPECIAL_SONGS` in `gui.py` using the Simplified Chinese client title (a Bestdori song id also works)
 
 ## 🛠 Requirements (important, otherwise playing will not work properly)
@@ -110,10 +111,10 @@ The game must be left on this page, from where the script takes over:
 
 ### Option 1: Standalone build (no Python needed, recommended for regular users)
 
-1. Download `bangdream-autodori_win64.zip` from [Releases](https://github.com/1979711854/bangdream-autodori/releases)
+1. Download `autodori_v1.x.x_Windows_X64.zip` from [Releases](https://github.com/1979711854/bangdream-autodori/releases) (the version number changes per release, e.g. `autodori_v1.3.3_Windows_X64.zip`)
 2. Extract it to any folder
 3. Double-click **`autodori_gui.exe`**
-4. Pick difficulty and other parameters in the main window and click **Start**
+4. Pick difficulty and other parameters in the main window and click **Start Daily**
 
 > The standalone build bundles the bot runtime (`autodori.exe` + `assets`), so it works right after extraction; the first run creates `data/` and `debug/` next to it. The exe files inside the archive are not affected by .gitignore and can be distributed directly.
 
@@ -128,16 +129,16 @@ pip install -r requirements.txt
 python build.py          # organizes / downloads dependencies automatically
 python gui.py            # start the GUI
 # or run the bot directly on the command line:
-python src/autodori.py --mode main --difficulty expert --livemode freelive
+python src/autodori.py --mode daily --difficulty expert
 ```
 
-> Package the GUI as an exe: `pyinstaller --onefile --windowed --name autodori_gui gui.py`
+> To build, run `python build.py --version vX.Y.Z --os windows --arch amd64`; the artifacts land in `dist/` (assets and the version metadata are bundled).
 
 ## ❓ FAQ
 
 **Q: Playing always comes out FAST, what should I do?**
 
-A: First check whether "Disable Android system sound" under MuMu settings → Device → Sound is checked — if it is, uncheck it; that alone fixes it completely. If not, turn on **automatic photogate calibration**.
+A: First check whether "Disable Android system sound" under MuMu settings → Device → Sound is checked; if it is, uncheck it. If timing is still off, turn on **automatic photogate calibration** and play a few songs normally — it converges by itself.
 
 **Q: Why can't the script play properly?**
 
@@ -145,11 +146,9 @@ A: Read the "Notes" page and README.md and check that your game and emulator set
 
 **Q: Why do some songs get lots of GREAT and MISS?**
 
-A: A few charts are hard and the machine recognition may lag a bit;
-after the emulator has been running for a while, heat and memory pressure make touch input latency fluctuate and accuracy drop.
+A: A few charts are hard and the machine recognition may lag a bit. After the emulator has been running for a while, heat and memory pressure make touch input latency fluctuate and accuracy drop.
 
-If almost every song gets too many GREAT, the photogate is usually misaligned:
-open **automatic photogate calibration** on the main window and play a few songs normally and it converges by itself.
+If almost every song gets too many GREAT, the photogate is usually misaligned. Open **automatic photogate calibration** on the main window and play a few songs normally — it converges by itself.
 
 
 **Q: Is there a ban risk for using the script?**
@@ -168,7 +167,7 @@ A: Please report it on GitHub Issues.
 ## ⚠️ Notes
 
 1. The latest version of MuMu emulator is recommended; LDPlayer has been tested less and has performance issues.
-2. This project is not complete yet and errors may occur. Issues and PRs are welcome.
+2. This project is under active maintenance; you may still run into issues. Issues and PRs are welcome.
 3. `data/config.yml` is now written by the GUI as **YAML**, and the bot side reads it with `yaml.safe_load` too.
    Edit it by hand as valid YAML — JSON is a subset of YAML and content exported by older versions still works;
    but do not get creative (unclosed quotes / tab indentation / full-width spaces): if it cannot be read the bot silently falls back to the defaults.
@@ -184,7 +183,9 @@ This project is modified from the **GPLv3**-licensed [EvATive7/autodori](https:/
 - Support for **FULL** songs
 - Multiple song-selection strategies: **mining-oriented / random**
 - Result-screen popup handling (PT rewards, character dialogue, failed lives, event stories)
-- Life-exhausted strategies (auto-exit and re-select a song / wait for manual action) and a zero-boost strategy
+- Life-exhausted strategies (auto-exit and re-select a song / wait for manual action) and a zero-boost strategy (stop on the home screen / keep mining / exit the game)
+- An About page (author info, repository link) and per-stage daily progress in the run log
+- Song entry merged into **Daily cleanup**; once the 3 daily pulls are confirmed, songs keep playing without returning to the home screen after each one
 - Several popup / template fixes, plus log filtering and GUI preferences
 
 **Under GPLv3, modifications and distribution in this repository must:**

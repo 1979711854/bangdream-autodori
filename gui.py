@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from tkinter import messagebox
 
 import yaml
@@ -54,7 +55,9 @@ CONFIG = os.path.join(BASE, "data", "config.yml")
 GUI_CONFIG = os.path.join(BASE, "data", "gui_config.json")
 BUILD_META = os.path.join(BASE, "assets", "build_metadata.json")
 
-# 顶栏的常规演出固定使用自由演出；挑战演出由独立按钮启动。
+# 常规打歌固定走自由演出(freelive);挑战演出由独立按钮启动。
+# 2026-10-17 起 GUI 不再单独给 main 模式传 --livemode(顶栏按钮已并入「日常」),
+# 保留这个常量是为了离线脚本与文档引用不断。
 LIVE_MODE = "freelive"
 DIFFICULTIES = ["easy", "normal", "hard", "expert", "special"]
 CHALLENGE_DIFFICULTIES = ["easy", "normal", "hard", "expert"]
@@ -76,10 +79,36 @@ STRATEGY_HINT = {
     "挖矿为主": "优先没打过 / 没全连 / 没全完美的歌(推荐)",
     "随机选歌": "无指定偏好,抽到哪首就打哪首",
 }
+# 火罐为 0 时(2026-10-17 合并「开始自由演出」与「日常」后只保留这一处配置):
+# 显示名 → data/config.yml 的 on_zero_boost。
+#   stop = 停打歌,退回游戏主界面(日常照常收尾,该做的三抽还会做)
+#   play = 继续挖矿(0 火也能开演出,只是没有报酬)
+#   exit = 停打歌 + 三抽收尾后关闭游戏
+BOOST_MODES = ("停在游戏主界面", "继续挖矿", "退出游戏")
+BOOST_TO_CFG = {"停在游戏主界面": "stop", "继续挖矿": "play", "退出游戏": "exit"}
+# gui_config.json 里存的是**显示名**,所以每次改名都要在这里补一条映射,
+# 否则老用户的选择读不回来、会被静默打回默认值(踩过一次:三态改名后再打开
+# 界面,「继续打歌刷奖励」变成了「停止日常」)。
+LEGACY_BOOST = {
+    "停止日常": "停在游戏主界面",
+    "继续打歌刷奖励": "继续挖矿",
+    "继续打歌": "继续挖矿",
+    "退出游戏": "退出游戏",
+}
+BOOST_DEFAULT = "停在游戏主界面"
 WINDOW_SIZES = ["960x640", "1120x720", "1280x800", "1440x900", "1600x1000"]
 DEFAULT_WINDOW = "1440x900"
 DEFAULT_VIEW = "live.show"
 APP_VERSION = "1.3.3"
+
+# 关于页(2026-10-17 用户要求):仓库行改成可点击超链接、版本行旁边加 Star 提示、
+# 顶部显示作者头像与名字。地址沿用 1979711854/bangdream-autodori(用户确认)。
+REPO_URL = "https://github.com/1979711854/bangdream-autodori"
+REPO_DISPLAY = "github.com/1979711854/bangdream-autodori"
+STAR_HINT = "您的 Star 是我持续更新的动力！"
+# 头像随程序分发(assets 里),不联网加载 —— 断网也要能显示。
+AVATAR_PATH = os.path.join(BASE, "assets", "resource", "image", "common",
+                           "avatar", "henceforth.png")
 
 # photogate 自动校准参数(见 _calibrate_gate)
 CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
@@ -105,7 +134,7 @@ OPTION_TREE = (
         ("live.gate", "时基校准", "app-notification"),
     )),
     ("日常", (
-        ("daily", "日常", "clipboard-check"),
+        ("daily", "清理日常", "clipboard-check"),
     )),
     ("运行", (
         ("logs", "运行日志", "chat-bubble-check"),
@@ -251,10 +280,15 @@ A:可以反馈到 GitHub Issues。
 # 每发一版在上方**追加**一段,旧版本段落保留不删(用户要求);格式与 v1.3.2 保持一致:
 # `## vX.Y.Z更新内容` + 每行一条 `- [x] ...`(DocView 会把 `- [x] ` 渲染成打钩框)。
 CHANGELOG = """## v1.3.3更新内容
-- [x] 修复游戏弹出新曲公告弹窗时MAA空转、日常三抽被跳过的问题
-- [x] 修复「自动清火打歌」火量耗尽后仍继续打歌、每日三抽不执行的问题
-- [x] 修复结算日志里读数显示-1的问题,识别不到的项现在显示为 -
-- [x] 修复重启MAA时游戏停在选曲页面会原地空转的问题
+- [x] 修改了GUI主界面
+- [x] 优化每日三抽实现逻辑
+- [x] 修改了「火罐为0时」的说明
+- [x] 添加了处理「暂停」界面的逻辑
+- [x] 优化打歌时的资源占用
+- [x] 运行日志显示日常各阶段进度
+- [x] 添加了跳过角色对话剧情的逻辑
+- [x] 修复结算日志里读数显示异常的问题
+- [x] 修复MAA停在选曲页面空转的问题
 - [x] 新增英文版说明文档 README.en.md
 
 ## v1.3.2更新内容
@@ -308,7 +342,12 @@ class AutodoriGUI:
         if self.challenge_difficulty not in CHALLENGE_DIFFICULTIES:
             self.challenge_difficulty = "hard"
         self.challenge_exit_game = bool(cfg.get("challenge_exit_game", False))
-        self.boost_mode = cfg.get("boost_mode", "继续打歌")
+        # 火罐为 0 的策略:默认「停在游戏主界面」;老配置的显示名经 LEGACY_BOOST
+        # 映射到新名字(2026-10-17 二次改名:停止日常→停在游戏主界面、
+        # 继续打歌刷奖励→继续挖矿)
+        _boost = str(cfg.get("boost_mode", BOOST_DEFAULT) or BOOST_DEFAULT)
+        _boost = LEGACY_BOOST.get(_boost, _boost)
+        self.boost_mode = _boost if _boost in BOOST_MODES else BOOST_DEFAULT
         self.life_mode = cfg.get("life_mode", "自动退出重新选歌")
         self.auto_cal = bool(cfg.get("auto_cal", False))
         self.song_strategy = cfg.get("song_strategy", "挖矿为主")
@@ -383,8 +422,8 @@ class AutodoriGUI:
             "device_address": self.device_address,
             # 手填的 adb 路径;空串 = 自动发现
             "adb_path": self.adb_path,
-            # 一键清理日常(见 Issue #4)
-            "daily_enabled": bool(self.daily_enabled),
+            # 日常(2026-10-17 起「启动游戏」是必经流程、不再是可配置项,
+            # 所以 daily_enabled 不再落盘)
             "daily_auto_clear_fire": bool(self.daily_auto_clear_fire),
             "daily_auto_free_pull": bool(self.daily_auto_free_pull),
         }
@@ -473,13 +512,22 @@ class AutodoriGUI:
                  fg=th["accent_text"],
                  font=T.font(self.font_size - 1)).pack(padx=7, pady=2)
 
+        # 2026-10-17 用户要求:把「您的 Star 是我持续更新的动力！」放在版本号右边,
+        # 纯文本展示(不做超链接、不可点击),颜色用次要色以免抢标题。
+        tk.Label(bar, text=STAR_HINT, bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(side="left", padx=(16, 0))
+
         # 运行控制按钮常驻顶栏右侧。
         # 顶栏高度固定、宽度只跟随窗口，不受内容区（歌曲名/日志/文档）影响，
         # 因此任何视图下按钮位置都恒定，不会被长文本挤出或遮挡(需求 1/2)。
         self.stop_btn = W.PushButton(bar, "停止", command=self.stop,
                                      kind="secondary", width=88, height=34)
         self.stop_btn.pack(side="right", padx=(0, 16))
-        self.start_btn = W.PushButton(bar, "开始自由演出", command=self.start,
+        # 2026-10-17 用户要求合并冗余:原来顶栏「开始自由演出(main)」与「日常」两套
+        # 打歌流程重合(难度/选曲/清火都是同一套),现在只留「日常」一个入口。
+        # main 模式仍在,只给命令行调试与挑战演出用,不再占 GUI 按钮。
+        self.start_btn = W.PushButton(bar, "开始日常",
+                                      command=lambda: self.start(mode="daily"),
                                       kind="primary", width=144, height=34)
         self.start_btn.pack(side="right", padx=(0, 8))
 
@@ -573,7 +621,10 @@ class AutodoriGUI:
             item.select(key == self.view)
 
         th = T.get()
-        scroll = W.ScrolledFrame(self.host)
+        # 说明类页面(尤其更新日志)内容会越积越长,给一条常驻滚动条;
+        # 其他页面保持隐藏滚动条以维持干净观感(用户 2026-10-17 要求更新内容可上下滑动)。
+        scroll = W.ScrolledFrame(
+            self.host, show_scrollbar=self.view.startswith("docs."))
         scroll.pack(fill="both", expand=True)
 
         grid = tk.Frame(scroll.inner, bg=th["app_bg"])
@@ -669,7 +720,7 @@ class AutodoriGUI:
     def _detail_show(self, master):
         th = T.get()
         card = W.Card(master)
-        W.SectionTitle(card.body, "自由演出设置", "仅支持自由演出").pack(
+        W.SectionTitle(card.body, "自由演出设置", "自由演出与日常共用").pack(
             fill="x", pady=(0, 12))
 
         r = W.Row(card.body, "难度")
@@ -694,10 +745,13 @@ class AutodoriGUI:
         self._device_row(card.body)
 
         r = W.Row(card.body, "火罐为 0 时")
-        r.pack(fill="x", pady=(0, 16))
-        W.DropdownBox(r.slot, ["继续打歌", "退出游戏"],
+        r.pack(fill="x", pady=(0, 2))
+        # 选项名自带语义(停在哪 / 继续挖矿 / 关游戏),不再配一行解释文字
+        # (用户 2026-10-17 明确要求删掉提示词)。
+        W.DropdownBox(r.slot, list(BOOST_MODES),
                       value=self.boost_mode, width=200, min_width=180,
                       on_change=self._on_boost).pack(side="left")
+        tk.Frame(card.body, bg=th["surface"], height=14).pack(anchor="w")
 
         r = W.Row(card.body, "生命值耗尽后")
         r.pack(fill="x", pady=(0, 16))
@@ -732,14 +786,9 @@ class AutodoriGUI:
                      font=T.font(self.font_size - 1), anchor="w",
                      justify="left").pack(anchor="w", pady=(0, 6))
 
-        # 用户 10-09 反馈「点错了按钮、以为挑战难度没生效」——两个开始按钮(顶栏
-        # 那个是自由演出)确实容易混,和「超高难度活动」页一样加一句显式提示。
-        tk.Label(card.body,
-                 text="注意:GUI 右上角的「开始自由演出」按钮走的是常规自由演出,与本页无关",
-                 bg=th["surface"], fg=th["text_3"],
-                 font=T.font(self.font_size - 1), anchor="w",
-                 justify="left").pack(anchor="w", pady=(6, 0))
-
+        # 2026-10-17 顶栏「开始自由演出」已删除,GUI 上只剩「开始日常」与
+        # 「开始清 CP」两个打歌入口,原来那句"注意右上角按钮与本页无关"的提示
+        # 已经过时,一并删掉。
         exit_game = tk.BooleanVar(master=card.body, value=self.challenge_exit_game)
         tk.Checkbutton(
             card.body, text="清完 CP 后退出游戏（未勾选则返回主页面）",
@@ -798,7 +847,7 @@ class AutodoriGUI:
                      anchor="w", justify="left").pack(anchor="w", pady=(6 if i == 1 else 2, 0))
 
         tk.Label(card.body,
-                 text="注意:GUI 右上角的「开始自由演出」按钮走的是常规自由演出,与本页无关",
+                 text="注意:顶栏的「开始日常」走的是常规打歌流程,与本页无关",
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(14, 8))
 
@@ -877,11 +926,11 @@ class AutodoriGUI:
 
         hint = tk.Label(
             card.body,
-            text="界面只显示关键事件（选歌 / 开演 / 结算 / 错误），完整调试信息在「导出日志」"
-                 "与 debug 目录的 autodori-YYYYMMDD-HHMMSS.log 中，遇到问题请一并上传 "
-                 "autodori-*.log 和 maa.log。\n"
-                 "提示:长期使用后 debug 目录会积累很多历史日志,请定期点「打开日志目录」"
-                 "清理没用的 autodori-*.log(全部删除不影响运行)。",
+            text="界面只显示关键事件（选歌 / 开演 / 结算 / 日常各阶段 / 错误），完整调试信息在"
+                 "「导出日志」与 debug 目录的 autodori-YYYYMMDD-HHMMSS.log 中，遇到问题请一并"
+                 "上传 autodori-*.log 和 maa.log。\n"
+                 "提示:debug 目录只保留最近 7 天的 autodori-*.log,更早的会在启动时自动删除;"
+                 "maa.log 不受影响。",
             bg=th["surface"], fg=th["text_3"], font=T.font(self.font_size - 1),
             justify="left", anchor="w",
         )
@@ -957,9 +1006,16 @@ class AutodoriGUI:
         """
         th = T.get()
         card = W.Card(master)
-        W.SectionTitle(card.body, "日常",
+        W.SectionTitle(card.body, "清理日常",
                        "启动游戏(含签到/弹窗) + [清火] + [三抽]").pack(
             fill="x", pady=(0, 12))
+        # 2026-10-17 合并入口:清火打歌的难度/选歌策略/火罐为0策略全部取自
+        # 「自由演出设置」页,日常页不再重复摆一份(以前界面上的难度对日常根本不生效)。
+        tk.Label(card.body,
+                 text="打歌难度、选歌策略、「火罐为0时」都取自左侧「自由演出设置」",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(0, 12))
 
         en = tk.BooleanVar(master=card.body, value=True)
         tk.Checkbutton(
@@ -981,10 +1037,12 @@ class AutodoriGUI:
         # 两个可选步骤,各自独立。「启动游戏」恒为勾选,所以这里不需要置灰逻辑。
         # lambda 用默认参数绑住 var/cb —— 循环里的闭包直接引用循环变量会全部
         # 指到最后一项(晚绑定),点哪一个都触发同一个回调。
+        # 勾选项只留标题,推进细节(先查三抽/确认后连打)写在卡片底部提示里,
+        # 标题后跟长括号说明会撑爆窄窗口(用户 2026-10-17 要求精简)。
         for text, value, cb in (
-            ("自动清火打歌（先打歌清火，完成每日演出后自动转入三抽）",
+            ("自动清火打歌",
              self.daily_auto_clear_fire, self._on_daily_auto_clear_fire),
-            ("每日免费三抽（固定 3 次，游戏内置上限；需先完成每日演出才解锁）",
+            ("每日免费三抽（固定3次，需先完成每日演出）",
              self.daily_auto_free_pull, self._on_daily_auto_free_pull),
         ):
             var = tk.BooleanVar(master=card.body, value=value)
@@ -1002,9 +1060,11 @@ class AutodoriGUI:
             kind="primary", width=160, height=36)
         self.daily_start_btn.pack(anchor="w", pady=(10, 4))
         tk.Label(card.body,
-                 text="清火与三抽都不勾时,只做「启动游戏 + 领签到/弹窗」两件事",
+                 text="清火与三抽都不勾时,只做「启动游戏 + 领签到/弹窗」两件事\n"
+                      "每日三抽完成后，收尾时会再次检查是否完成",
                  bg=th["surface"], fg=th["text_3"],
-                 font=T.font(self.font_size - 1)).pack(anchor="w", pady=(8, 0))
+                 font=T.font(self.font_size - 1), justify="left").pack(
+            anchor="w", pady=(8, 0))
         return card
 
     def _on_daily_auto_clear_fire(self, value):
@@ -1019,12 +1079,25 @@ class AutodoriGUI:
         th = T.get()
         card = W.Card(master)
         W.SectionTitle(card.body, "关于").pack(fill="x", pady=(0, 10))
+
+        # 作者区(2026-10-17 用户要求):头像 + 名字。头像随程序分发,断网也能显示。
+        head = tk.Frame(card.body, bg=th["surface"])
+        head.pack(fill="x", pady=(0, 16))
+        self._about_avatar(head, th)
+        col = tk.Frame(head, bg=th["surface"])
+        col.pack(side="left", padx=(14, 0))
+        tk.Label(col, text="Henceforth", bg=th["surface"], fg=th["text"],
+                 font=T.font(self.font_size + 3, "bold")).pack(anchor="w")
+        tk.Label(col, text="BanG Dream · 邦邦自动挖矿助手", bg=th["surface"],
+                 fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w", pady=(4, 0))
+
         for k, v in (
             ("项目", "BanG Dream · 邦邦自动挖矿助手"),
             ("版本", "v" + self._version()),
-            ("演出模式", "自由演出 / 挑战演出"),
+            ("演出模式", "日常(自由演出) / 挑战演出 / 超高难度活动"),
             ("分辨率", "1280 × 720 · MuMu Player 12"),
-            ("仓库", "github.com/1979711854/bangdream-autodori"),
+            ("仓库", REPO_DISPLAY),
             ("提醒", "仅供个人学习使用,请遵守游戏规则与用户协议"),
         ):
             row = tk.Frame(card.body, bg=th["surface"])
@@ -1032,10 +1105,56 @@ class AutodoriGUI:
             tk.Label(row, text=k, bg=th["surface"], fg=th["text_2"],
                      font=T.font(self.font_size - 1), width=8,
                      anchor="w").pack(side="left")
+            if k == "仓库":
+                # 可点击超链接:蓝色 + 下划线 + 手型光标
+                link = tk.Label(row, text=v, bg=th["surface"],
+                                fg=th["accent_text"],
+                                font=T.font(self.font_size - 1, "underline"),
+                                cursor="hand2", anchor="w")
+                link.pack(side="left")
+                link.bind("<Button-1>", lambda e, u=REPO_URL: self._open_url(u))
+                continue
             tk.Label(row, text=v, bg=th["surface"], fg=th["text"],
                      font=T.font(self.font_size - 1), anchor="w",
                      justify="left").pack(side="left")
         return card
+
+    def _about_avatar(self, parent, th, size=88):
+        """圆形头像。图片缺失或 PIL 不可用时退回占位圆,不让关于页崩掉。"""
+        photo = None
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+            im = Image.open(AVATAR_PATH).convert("RGBA")
+            im = im.resize((size, size), Image.LANCZOS)
+            # 4 倍超采样画圆再缩回:直接按目标尺寸画椭圆边缘会有锯齿
+            mask = Image.new("L", (size * 4, size * 4), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size * 4 - 1, size * 4 - 1),
+                                         fill=255)
+            mask = mask.resize((size, size), Image.LANCZOS)
+            im.putalpha(mask)
+            photo = ImageTk.PhotoImage(im)
+        except Exception:
+            photo = None
+        if photo is None:
+            cv = tk.Canvas(parent, width=size, height=size, bg=th["surface"],
+                           highlightthickness=0, bd=0)
+            cv.create_oval(1, 1, size - 1, size - 1,
+                           fill=th["accent_soft"], outline="")
+            cv.create_text(size // 2, size // 2, text="H",
+                           fill=th["accent_text"],
+                           font=T.font(int(size * 0.45), "bold"))
+            cv.pack(side="left")
+            return
+        lbl = tk.Label(parent, image=photo, bg=th["surface"], bd=0)
+        lbl.image = photo  # 必须留引用,否则 PhotoImage 会被 GC 变成空白
+        lbl.pack(side="left")
+
+    def _open_url(self, url):
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            messagebox.showerror("打开链接失败",
+                                 "{}\n{}".format(url, e), parent=self.root)
 
     # ---------- 交互回调 ----------
     def _on_difficulty(self, value):
@@ -1303,17 +1422,17 @@ class AutodoriGUI:
             args = ["--mode", "main", "--difficulty", str(self.challenge_difficulty),
                     "--livemode", "challengelive", "--challenge-finish",
                     "exit" if self.challenge_exit_game else "home"]
-        elif mode == "daily":
-            args = ["--mode", "daily"]
         else:
-            args = ["--mode", "main", "--difficulty", str(self.difficulty),
-                    "--livemode", LIVE_MODE]
+            # 2026-10-17 合并入口:「日常」是唯一的常规打歌入口(main 按钮已删)。
+            # 难度/选歌策略/火罐策略都取自「自由演出设置」,日常阶段2 现在真读 --difficulty
+            # (此前不传,难度恒为 bot 模块默认的 hard)。
+            args = ["--mode", "daily", "--difficulty", str(self.difficulty)]
         if self.device_address:
             args += ["--device", str(self.device_address)]
         return args
 
-    def start(self, mode="main"):
-        """按按钮指定的模式拉起 bot。顶栏始终启动自由演出。"""
+    def start(self, mode="daily"):
+        """按按钮指定的模式拉起 bot。顶栏按钮与日常页按钮都是「日常」。"""
         if self.proc is not None and self.proc.poll() is None:
             messagebox.showwarning("已在运行", "bot 已在运行,请先停止。")
             return
@@ -1373,9 +1492,9 @@ class AutodoriGUI:
         self.q.put("__EOF__")
 
     # 「关键事件」模式只显示高价值事件:进程/初始化、选歌、开演、结算、生命耗尽、
-    # 以及真正的错误(ERROR/CRITICAL/Traceback)。其余 DEBUG 噪声(指令流 wfF/wfT、
-    # Adjust offset 校准、life check OCR、火罐数值、SurfaceOrientation 等)一律隐藏,
-    # 与「全部输出」形成明显差异。
+    # 日常各阶段进度、以及真正的错误(ERROR/CRITICAL/Traceback)。其余 DEBUG 噪声
+    # (指令流 wfF/wfT、Adjust offset 校准、life check OCR、火罐数值、
+    # SurfaceOrientation 等)一律隐藏,完整内容走「导出日志」。
     _KEEP = (
         "MAA inited",
         "Mumu and MNT inited",
@@ -1393,19 +1512,37 @@ class AutodoriGUI:
         "强制停止",
         "Failed to init",
         "Traceback",
+        # 2026-10-17 补:日常各阶段的进度以前全是 INFO 级、又不在白名单里,
+        # 界面上只看到"选曲/结算",用户无法判断现在是打歌还是三抽、为什么停了。
+        # 这些都是每阶段最多一两行,不会刷屏。
+        "日常开始",          # 阶段1 结束,带当前火罐数
+        "自动清火",          # 打歌循环开始 / 第 N 轮
+        "每日免费三抽",      # 抽完 / 未解锁
+        "执行每日免费三抽",  # 开始抽
+        "三抽已确认完成",    # 切连打的提示
+        "火罐不足",          # 收工(INFO 级,以前看不到)
+        "收尾回主页",        # 连打结束回主页
+        "环境自检",          # 自检结论(有风险项时本来就是 WARN)
+        "已清理",            # 启动时清理历史日志
+        "识别到邦邦实例",    # 确认操作的是哪个模拟器
     )
 
     # 「关键事件」里仍然要显示的、但只以"错误级别"出现的标记(不靠行内关键词,
     # 而靠日志级别判断)。INFO/DEBUG 即使命中上面的 _KEEP 之外的词也隐藏。
     _LEVEL_KEEP = {"ERROR", "CRITICAL", "WARNING"}
 
+    # 无论什么级别都不进界面的噪声(仍然完整写进 debug 日志与「导出日志」)。
+    _NOISE = (
+        "Unknown type",   # 谱面解析警告,每次选歌都刷
+        "改用 adb tap",   # 点击失败降级成功,偶发且不影响结果
+        "Adjust offset",  # 打歌中时序微调,一首能刷几十行
+    )
+
     def _should_show(self, line, level=""):
+        if any(n in line for n in self._NOISE):
+            return False
         if level in self._LEVEL_KEEP:
             # 错误/严重/警告级别一律显示(它们是真正的关键事件)。
-            # 但排除「Unknown type」这类谱面解析噪声警告——它们每次选歌都刷屏,
-            # 对用户无意义,归入全部输出。
-            if "Unknown type" in line:
-                return False
             return True
         return any(m in line for m in self._KEEP)
 
@@ -1484,6 +1621,10 @@ class AutodoriGUI:
                     except Exception:
                         pass
                 self._emit(stamp, "INFO", "选曲 · {}".format(name))
+            # 歌名已经以「选曲 · …」显示过,原始日志行(Save song / 打歌: …)不再
+            # 重复输出 —— 用户 2026-10-17 反馈「选曲 · 歌名」与「Save song: 歌名」
+            # 两行同时出现,冗余。这里直接结束处理。
+            return
 
         data = _parse_play_result(line)
         if data is not None:
@@ -1775,7 +1916,7 @@ class AutodoriGUI:
                 if self.device_address else "自动：MAA 自行选择实例")
 
     def _device_row(self, master):
-        """自由演出设置卡片里的「模拟器实例」一行。"""
+        """「自由演出设置」卡片里的「模拟器实例」一行。"""
         th = T.get()
         r = W.Row(master, "模拟器实例")
         r.pack(fill="x", pady=(0, 6))
@@ -1896,19 +2037,23 @@ class AutodoriGUI:
 
     def _write_config(self):
         life = "auto" if self.life_mode == "自动退出重新选歌" else "wait"
-        play_at_zero = self.boost_mode == "继续打歌"
         cfg = {
             "timing": {"photogate_latency_ms": self.gate},
             "on_life_exhausted": life,
-            "play_at_zero_boost": play_at_zero,
+            # 火罐为 0 的三态(2026-10-17 合并「开始自由演出」与「日常」后,
+            # 选项只留一处,日常也读它):
+            #   stop = 停止打歌(日常照常收尾,该做的三抽还会做)
+            #   play = 继续打歌刷奖励(0 火也能开演出,只是没有报酬)
+            #   exit = 停止打歌 + 三抽收尾后关闭游戏
+            "on_zero_boost": BOOST_TO_CFG.get(self.boost_mode, "stop"),
             "song_strategy": STRATEGY_TO_CFG.get(self.song_strategy, "mine"),
             # 活动曲目也落一份到运行配置:直接手跑
             # `python src/autodori.py --mode special` 时能沿用界面里选的那首
             "special_song": str(self.special_song),
-            # 一键清理日常(见 Issue #4):bot 实时读 data/config.yml 的 daily.*。
+            # 日常:bot 实时读 data/config.yml 的 daily.*。
             # 三抽为固定3次(游戏内置每日免费上限);弹窗赠送领取并入启动流程。
+            # (2026-10-17 去掉 daily.enabled —— bot 侧从来没读过它,是死配置)
             "daily": {
-                "enabled": bool(self.daily_enabled),
                 "auto_clear_fire": bool(self.daily_auto_clear_fire),
                 "auto_free_pull": bool(self.daily_auto_free_pull),
             },

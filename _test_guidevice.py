@@ -254,8 +254,8 @@ def _args_for(app):
     if getattr(app, "view", "") == "live.special":
         args = ["--mode", "special", "--special-song", str(app.special_song)]
     else:
-        args = ["--mode", "main", "--difficulty", str(app.difficulty),
-                "--livemode", G.LIVE_MODE]
+        # 2026-10-17 合并入口:常规打歌统一走日常(难度来自「打歌设置」)
+        args = ["--mode", "daily", "--difficulty", str(app.difficulty)]
     if app.device_address:
         args += ["--device", str(app.device_address)]
     return args

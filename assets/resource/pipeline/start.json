@@ -3,14 +3,43 @@
         "action": "StartApp",
         "package": "com.bilibili.star.bili",
         "next": [
+            "story_loading_wait",
+            "reader_menu",
+            "tutorial_close",
+            "next_button",
+            "tap_to_next",
             "comfirm_song",
             "select_song",
+            "select_live_home_back",
             "find_startpage_menu",
             "live_home_button"
         ],
         "interrupt": [
             "ok_button",
             "confirm_button"
+        ]
+    },
+    "select_live_home_back": {
+        "recognition": "OCR",
+        "expected": [
+            "选择演出"
+        ],
+        "roi": [
+            90,
+            30,
+            320,
+            70
+        ],
+        "action": "Click",
+        "target": [
+            29,
+            40,
+            130,
+            90
+        ],
+        "post_delay": 1500,
+        "next": [
+            "start_app"
         ]
     },
     "find_startpage_menu": {

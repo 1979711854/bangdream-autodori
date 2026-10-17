@@ -25,6 +25,8 @@ import logging
 import re
 import sys
 import unicodedata
+
+import yaml
 from pathlib import Path
 from typing import Optional
 
@@ -518,7 +520,7 @@ def test_gui():
     check("导航项 live.special 已注册", '("live.special", "超高难度活动", "live")' in src)
     check("_card_detail 路由到 _detail_special",
           "self.view == \"live.special\"" in src and "_detail_special(master)" in src)
-    check("start 支持 mode 参数", 'def start(self, mode="main")' in src)
+    check("start 支持 mode 参数", 'def start(self, mode="daily")' in src)
     check("活动模式透传 --special-song", '"--special-song"' in src)
     check("活动按钮走 special 模式", 'self.start(mode="special")' in src)
     check("special_song 持久化到 gui_config", '"special_song": self.special_song' in src)
@@ -642,12 +644,13 @@ def test_gui_render():
         backup = cfg_path.read_text(encoding="utf-8") if cfg_path.exists() else None
         try:
             app._write_config()
-            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            # config.yml 是 YAML:早先这里用 json.loads 读,一直抛 JSONDecodeError
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
             check("运行配置里写入了 special_song",
                   cfg.get("special_song") == str(app.special_song),
                   cfg.get("special_song"))
             check("_write_config 仍是合并写入(未抹掉其它键)",
-                  "play_at_zero_boost" in cfg and "song_strategy" in cfg)
+                  "on_zero_boost" in cfg and "song_strategy" in cfg)
         finally:
             if backup is not None:
                 cfg_path.write_text(backup, encoding="utf-8")

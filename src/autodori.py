@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import Counter, deque
 from pathlib import Path
 from typing import Optional, Union
 
@@ -27,6 +28,7 @@ if not config_path.exists():
     config_path.write_text("{}", encoding="utf-8")
 
 
+import cv2
 import numpy as np
 from fuzzywuzzy import fuzz as fzwzfuzz
 from maa.context import Context
@@ -34,6 +36,7 @@ from maa.controller import AdbController
 from maa.custom_action import CustomAction, CustomRecognitionResult
 from maa.custom_recognition import CustomRecognition
 from maa.define import RectType
+from maa.notification_handler import NotificationHandler, NotificationType
 from maa.resource import Resource
 from maa.tasker import Tasker
 from maa.toolkit import AdbDevice, Toolkit
@@ -72,6 +75,35 @@ SPECIAL_MODE = False
 #   ③ daily.auto_free_pull 开启时:每日免费三抽。三抽固定 3 次(游戏内置每日上限)。
 _DAILY_CLEAR_FIRE = False
 _DAILY_FREE_PULL = False
+#: 本次进程跑的是不是日常模式(--mode daily)。日常模式下 _get_override_pipeline
+#: 要把「选择演出」界面的返回节点接回 daily_home(走完整阶段1:火罐检查+签到弹窗),
+#: 而 main 模式(命令行调试/挑战演出)保持默认的 start_app 重试。
+#: 2026-10-17 GUI 重构:顶栏「开始自由演出」已删除,日常是唯一的 GUI 打歌入口,
+#: main 模式只留给命令行调试与挑战演出。
+_DAILY_MODE = False
+#: 清火与三抽**同时**开启时的交替模式(用户 2026-10-17 定的新流程):
+#: 每成功打完一首歌,检查一次每日免费三抽,三抽完再回去继续打歌,
+#: 直到火量不足收工。只有两个开关同时打开才生效。
+_DAILY_PULL_EACH_SONG = False
+#: 清火阶段刚被 HandleLiveBoost 判定"火量不足"(_run_daily_flow 的循环出口)。
+_daily_fire_exhausted = False
+#: 日常入口火罐检查(用户 2026-10-17 需求):阶段1 回主页时火罐就是 0,
+#: 整个日常直接停止 —— 与打歌循环里的火量判定是两个独立入口。
+_daily_boost_zero = False
+#: 本次进程内已确认"今日免费三抽已做完 / 当前不可抽"。由管线节点
+#: daily_pull_done / daily_pull_locked 上的 MarkDailyPullDone 动作置位。
+#: 背景(用户 2026-10-17):每首打完都跑一遍三抽太慢(每首白耗 20-40s),
+#: 标记后每首打完只跳过,收尾时再复核一次。
+_daily_pull_done = False
+#: 交替模式下 main 任务是否"打完一首就停(回主页)"。
+#:    True  = 尚未确认三抽:每首打完必须回主页,才能进抽卡页检查(_get_override_pipeline
+#:            里把结算/打崩三处 next 改写成 daily_song_done)。
+#:    False = 三抽已确认完成:改用原生 main 连打链(结算页点「再次演出」→ 选曲 → 开打),
+#:            不再逐首回主页 —— 用户 2026-10-17 反馈"每次打完都回主界面太麻烦"。
+#: 只有 _DAILY_PULL_EACH_SONG(清火+三抽同开)时才有意义。
+_daily_song_stop = True
+#: 交替模式下单轮打歌的安全上限,防止 main 任务因异常反复重启却永不收工。
+_DAILY_MAX_ROUNDS = 60
 # 默认曲目:简中客户端标题(曲库 musicTitle 下标 3)。也可写纯数字曲目 id,
 # 见 resolve_special_song()。换活动批次时改这里或 GUI 下拉。
 DEFAULT_SPECIAL_SONG = "[超高难易度 新SPECIAL] SENSENFUKOKU"
@@ -92,7 +124,151 @@ if _timing_cfg.get("photogate_latency_ms") is not None:
 maaresource = Resource()
 maaresource.register_custom_recognition("ChallengeCPRecognition", ChallengeCPRecognition())
 maaresource.register_custom_action("SelectChallengeCP", SelectChallengeCP())
-maatasker = Tasker()
+
+
+# ---------------------------------------------------------------------------
+# 卡死看门狗(用户 2026-10-17 定的 L2 机制:兜底动作 1A + 60s 阈值,不做 L3 总超时)
+#
+# 背景:实机不可能把所有异常弹窗/界面都测到 —— 这类情况的共同特征是"少数几个
+# 节点在原地反复命中、流程不推进"(2026-10-17 实测:「想精进演出技巧的话」弹窗
+# 挡住返回箭头,daily→start_app→daily 空转)。MAA 的节点识别回调给了观测点:
+#   同一节点在 60s 滑动窗口内命中 >= 8 次  => 判定卡死
+# 正常流程不会触发:打歌单节点要阻塞一两分钟,三抽每步只命中一两次。
+#
+# 兜底按强度递进,绝不无限乱点:
+#   1) 按一次安卓返回键(绝大多数弹窗/子页面都响应),等冷却;
+#   2) 仍在打转就再按一次;
+#   3) 还卡 => post_stop 停任务 + warning 写明卡在哪个节点,交给外层统一收尾。
+#
+# 白名单:故事/公告的"下一步"连点、三抽滚动、随机兜底点击本身就设计成可重复
+# 命中,不能算卡死。special(故事)模式不启动本看门狗。
+# ---------------------------------------------------------------------------
+
+_WATCHDOG_STATIC_S = 75.0        # 画面与脚本都没有任何进展持续多久判卡死
+_WATCHDOG_BACK_COOLDOWN_S = 4.0  # 两次返回键的最小间隔
+_WATCHDOG_SCAN_INTERVAL_S = 2.0  # 后台扫描周期
+_WATCHDOG_MAX_BACKS = 2          # 返回键最多按几次,之后停任务(方案 1A)
+_WATCHDOG_SAMPLE_STEP = 8        # 采样图每隔多少像素取一个点
+_WATCHDOG_PIXEL_DIFF = 0.8       # 采样点灰度平均差 >= 该值算"画面有变化"
+# 脚本侧最近这么多秒内有活动(打歌心跳等)就**连图都不抓**:打歌期间保持零额外抓图,
+# 不给时序敏感的发布线程添任何 GIL 竞争(实测单次抓图 ~5ms,虽小但没必要)。
+_WATCHDOG_BUSY_QUIET_S = 10.0
+# 抓图会被打歌线程(生命/暂停检测)和看门狗线程同时用到,串行化避免 IPC 串包
+_SCREEN_CAP_LOCK = threading.Lock()
+
+
+def _watchdog_sample():
+    """给看门狗用的粗采样灰度图;抓不到(游戏没起来/IPC 忙)返回 None。"""
+    if current_player is None:
+        return None
+    try:
+        with _SCREEN_CAP_LOCK:
+            arr = np.ascontiguousarray(
+                current_player.ipc_capture_display(), dtype=np.uint8
+            )
+    except Exception as e:  # noqa: BLE001 —— 看门狗自己绝不能把主流程带崩
+        logging.debug("看门狗抓图失败: %s", e)
+        return None
+    arr = arr[::_WATCHDOG_SAMPLE_STEP, ::_WATCHDOG_SAMPLE_STEP]
+    if arr.ndim == 3:
+        arr = arr.mean(axis=2)
+    return arr.astype(np.float32)
+
+
+def _sample_diff(a, b) -> float:
+    if a.shape != b.shape:
+        return 999.0
+    return float(np.abs(a - b).mean())
+
+
+class _StuckWatchdog(NotificationHandler):
+    """卡死看门狗:「画面长期静止 + 脚本侧无进展」=> 按返回键,两次无效则停任务。
+
+    2026-10-17 重写 —— 老实现的两个判据在本 MAA 版本上全部失效:
+      MAA 4.4.0 只把**任务级**通知(Tasker.Task.*)送到 Python,**节点级**
+      (Node.Recognition.* / Node.NextList.*)一条也收不到(实测见本机脚本
+      _diag_notify.py:跑一个必然命中的节点,只打印出两条 Tasker 事件)。
+      于是「同一节点 60s 内命中 ≥8 次」和「90s 没有任何节点命中」都退化成与节点
+      无关的定时器:后者等于「启动 90 秒后按一次返回键」,而打歌中按返回键会让
+      游戏弹【暂停】界面 —— 2026-10-17 12:59 那次"莫名其妙暂停"就是这么来的。
+    新判据(不依赖节点通知):
+      · 每 2s 抓一张粗采样图,画面有变化就刷新活动时间;
+      · 打歌线程每 1s 调 ping() 刷新活动时间(音符本来就在动,双保险);
+      · 连续 _WATCHDOG_STATIC_S 秒既没画面变化也没 ping => 按返回键;
+      · 按完进入同样长的观察窗口,连续 2 次无效 => post_stop 停任务。
+    剧情资源下载时进度数字在变,算"有变化"(继续等);真卡在 0% 才会被按返回键
+    救出来 —— 这是刻意的,总比永久挂着好。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._last_activity = time.time()
+        self._prev_sample = None
+        self._backs = 0
+        self._last_back = 0.0
+        self._observe_until = 0.0      # 按下返回键后的观察窗口截止时间
+
+    def ping(self) -> None:
+        """脚本侧"还在推进"(打歌中的检测节拍等)时调用。"""
+        with self._lock:
+            self._last_activity = time.time()
+            self._backs = 0
+            self._prev_sample = None
+
+    def on_tasker_task(self, noti_type, detail):
+        # 任务级通知在这个 MAA 版本是**能收到**的,同样算一次进展
+        self.ping()
+
+    def check(self) -> bool:
+        """扫描一次。返回 True = 已停任务(调用方应结束看门狗线程)。"""
+        now = time.time()
+        if now < self._observe_until:
+            return False
+        with self._lock:
+            quiet_for = now - self._last_activity
+        if quiet_for < _WATCHDOG_BUSY_QUIET_S:
+            # 脚本侧刚有进展(打歌心跳/任务切换):这个窗口内连抓图都省掉,
+            # 打歌期间看门狗的额外开销 = 0。
+            return False
+        sample = _watchdog_sample()
+        with self._lock:
+            changed = sample is not None and (
+                self._prev_sample is None
+                or _sample_diff(self._prev_sample, sample) >= _WATCHDOG_PIXEL_DIFF
+            )
+            if sample is not None:
+                self._prev_sample = sample
+            if changed:
+                self._last_activity = now
+                self._backs = 0
+            last_activity = self._last_activity
+            backs = self._backs
+        if now - last_activity <= _WATCHDOG_STATIC_S:
+            return False                  # 画面在动 / 脚本在跑,正常
+        if now - self._last_back < _WATCHDOG_BACK_COOLDOWN_S:
+            return False                  # 冷却中,别连按
+        self._last_back = now
+        if backs < _WATCHDOG_MAX_BACKS:
+            self._backs = backs + 1
+            # 按完给同样长的观察窗口,否则 4s 冷却一过就会立刻连按
+            self._observe_until = now + _WATCHDOG_STATIC_S
+            logging.warning(
+                "卡死看门狗:%.0fs 内画面和脚本都没有任何进展,疑似卡在弹窗/未知界面,"
+                "按返回键(%d/%d)",
+                _WATCHDOG_STATIC_S, self._backs, _WATCHDOG_MAX_BACKS,
+            )
+            _adb_shell(["input", "keyevent", "4"])
+            return False
+        logging.warning(
+            "卡死看门狗:按了 %d 次返回键画面仍然没有变化,停止任务",
+            _WATCHDOG_MAX_BACKS,
+        )
+        _force_post_stop()
+        return True
+
+
+_STUCK_WATCHDOG = _StuckWatchdog()
+maatasker = Tasker(notification_handler=_STUCK_WATCHDOG)
 maacontroller: AdbController = None
 device: AdbDevice = None
 current_player: player.Player = None
@@ -282,6 +458,28 @@ def _runtime_config() -> dict:
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+def _zero_boost_policy() -> str:
+    """火罐为 0 时的策略(用户 2026-10-17 定的三态,只在 GUI「自由演出设置」一处配置)。
+
+    三态在 GUI 的显示名(2026-10-17 二次改名):停在游戏主界面 / 继续挖矿 / 退出游戏。
+
+    - "stop"(默认):停打歌,退回游戏主界面 —— 日常照常收尾(该做的三抽还会做);
+    - "play":继续挖矿(0 火也能开演出,只是没有报酬);
+    - "exit":停打歌 + 三抽收尾后关闭游戏。
+
+    兼容旧配置:早先只有一个布尔键 play_at_zero_boost(true 继续 / false 退出),
+    那个键**只对 main 模式生效**(日常历来是火尽即停)。所以没有新键时:
+    日常一律按 stop(不改变老用户行为),main/挑战按旧布尔值回退。
+    """
+    cfg = _runtime_config()
+    val = str(cfg.get("on_zero_boost") or "").strip().lower()
+    if val in ("stop", "play", "exit"):
+        return val
+    if not _DAILY_MODE and "play_at_zero_boost" in cfg:
+        return "play" if cfg.get("play_at_zero_boost") else "exit"
+    return "stop" if _DAILY_MODE else "play"
 
 
 def _song_strategy() -> str:
@@ -1082,7 +1280,7 @@ def _shutdown(exit_code: int = 0, reason: str = "") -> None:
             return
         _shutting_down = True
     try:
-        logging.info("MAA 收尾: %s", reason or "正常结束")
+        logging.info("MAA : %s", reason or "正常结束")
     except Exception:
         pass
 
@@ -1199,6 +1397,29 @@ def _start_exit_watchdog() -> None:
     ).start()
 
 
+def _watchdog_loop() -> None:
+    """卡死看门狗的后台扫描线程(2s 一次,daemon,不会拖住进程退出)。"""
+    while True:
+        try:
+            if _STUCK_WATCHDOG.check():
+                break
+        except Exception as e:  # noqa: BLE001 —— 看门狗自己绝不能把主流程带崩
+            logging.debug("卡死看门狗检查异常: %s", e)
+        time.sleep(_WATCHDOG_SCAN_INTERVAL_S)
+
+
+def _start_stuck_watchdog() -> None:
+    """启动卡死看门狗。special(故事)模式不启动:连续点「下一步」是正常行为。"""
+    threading.Thread(
+        target=_watchdog_loop, name="stuck-watchdog", daemon=True
+    ).start()
+    logging.info(
+        "卡死看门狗已启动(画面与脚本连续 %.0fs 都没有进展判定卡死,"
+        "最多按 %d 次返回键)",
+        _WATCHDOG_STATIC_S, _WATCHDOG_MAX_BACKS,
+    )
+
+
 def _exit_game_and_stop_task(context, reason: str = "退出游戏") -> None:
     """关闭游戏并终止当前任务,同时登记退出请求。
 
@@ -1227,26 +1448,30 @@ class HandleLiveBoost(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         liveboost = int(argv.reco_detail.best_result.detail)
         if liveboost < MIN_LIVEBOOST:
-            # 清火模式(Issue #4)的收工判据就在这里 —— 清火要的就是"把火用完"。
-            # **必须放在 play_at_zero_boost 之前**:那个开关(默认 True)的语义是
-            # "0 火也接着打",先判它的话清火阶段永远不会结束。2026-10-15 实测:
-            # 火为 0 之后连打 3 首,阶段3「每日免费三抽」一直没执行。
-            # 只 StopTask、不请求进程退出,外层 _run_daily_flow 还要继续三抽。
-            if _DAILY_CLEAR_FIRE:
+            # 日常模式(Issue #4)的收工判据就在这里 —— 清火要的就是"把火用完",
+            # **判据是火量,不是生命值**(别把收工点挪回 HandleLifeExhausted)。
+            # 2026-10-17 用户定的三态策略(见 _zero_boost_policy):
+            #   stop = 停打歌,退回游戏主界面(日常照常收尾,该做的三抽还会做)
+            #   play = 继续挖矿(0 火也能开演出,只是没有报酬)
+            #   exit = 停打歌,日常收尾(含三抽)后关闭游戏
+            # 只 StopTask、不请求进程退出,收尾统一由 _run_daily_flow 做;
+            # "退回主界面"也在那一层做(这里是管线动作,同步 post 另一个 task 容易死锁)。
+            policy = _zero_boost_policy()
+            global _daily_fire_exhausted
+            if policy == "play":
                 logging.info(
-                    "清火完成:火量 %d 不足 %d,结束打歌阶段,转入每日免费三抽",
-                    liveboost,
-                    MIN_LIVEBOOST,
+                    "火罐不足(火量 %d),按设置「继续挖矿」继续", liveboost
                 )
+                return CustomAction.RunResult(True)
+            # 交替模式(清火+三抽同开)下,_run_daily_flow 的循环靠这个标志
+            # 判断"该收工了";非清火模式不读它,无副作用。
+            _daily_fire_exhausted = True
+            if _DAILY_CLEAR_FIRE:
+                logging.info("火罐不足，日常已停止(火量 %d)", liveboost)
                 _run_node_once(context, "stop")
                 return CustomAction.RunResult(False)
-            # GUI 配置 data/config.yml 的 play_at_zero_boost:
-            #   True = 火罐为0也继续打歌; False = 火罐为0退出游戏
-            play_at_zero = _runtime_config().get("play_at_zero_boost", True)
-            if play_at_zero:
-                logging.debug("Live boost is 0, continue playing")
-            else:
-                # 火罐不足且配置为「退出游戏」。
+            if policy == "exit":
+                # 非日常(命令行 main / 挑战演出):保持旧的"退出游戏"语义。
                 # 这里必须显式终止任务,不能只靠 ensure_liveboost 的
                 # on_error("stop"): ensure_liveboost 是 comfirm_song 的 next
                 # 节点,它返回 False 时 MaaFramework 会把错误归到**父节点**
@@ -1258,6 +1483,76 @@ class HandleLiveBoost(CustomAction):
                 logging.info("Live boost not enough, ready to exit")
                 _exit_game_and_stop_task(context, "火罐不足,按配置退出游戏")
                 return CustomAction.RunResult(False)
+            logging.info("火罐不足(火量 %d),按设置停止打歌", liveboost)
+            _run_node_once(context, "stop")
+            return CustomAction.RunResult(False)
+        return CustomAction.RunResult(True)
+
+
+@maaresource.custom_action("HandleDailyBoostZero")
+class HandleDailyBoostZero(CustomAction):
+    """日常入口(阶段1 回主页后)的火罐检查(用户 2026-10-17 需求)。
+
+    火罐为 0 ⇒ 按「自由演出设置 → 火罐为0时」策略处理(停在主界面 / 继续挖矿 /
+    退出游戏);火罐 >0 ⇒ 放行,继续阶段2/3。
+    OCR 读不出(-1)时同样放行 —— 不能因为一次识别失败就误停用户的日常
+    (宁可多跑,不可错停)。
+    """
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        liveboost = int(argv.reco_detail.best_result.detail)
+        if liveboost == 0:
+            policy = _zero_boost_policy()
+            if policy == "play":
+                logging.info("火罐不足(0),按设置「继续挖矿」继续")
+                return CustomAction.RunResult(True)
+            global _daily_boost_zero
+            _daily_boost_zero = True
+            if policy == "exit":
+                logging.info("火罐不足，日常已停止(按设置退出游戏)")
+                _exit_game_and_stop_task(context, "火罐不足,按配置退出游戏")
+                return CustomAction.RunResult(False)
+            logging.info("火罐不足，日常已停止")
+            _run_node_once(context, "stop")
+            return CustomAction.RunResult(False)
+        if liveboost > 0:
+            logging.info("日常开始:当前火罐 %d", liveboost)
+        else:
+            logging.debug("日常入口火罐检查:OCR 未读出火量,放行")
+        return CustomAction.RunResult(True)
+
+
+@maaresource.custom_action("MarkDailyPullDone")
+class MarkDailyPullDone(CustomAction):
+    """把"今日免费三抽已做完/当前不可抽"标记到进程内(用户 2026-10-17 需求)。
+
+    挂在管线节点 daily_pull_done(剩余0回/今日已完成)与 daily_pull_locked
+    (尚未完成每日演出)上:这两条都是"这次抽不了"的终局状态。
+
+    背景:原来每首打完都跑一遍三抽,一次 20-40 秒;标记之后
+    _run_daily_flow 每首只跳过,收尾再复核一次。
+    """
+
+    def run(self, context: Context, argv: CustomAction.RunArg):
+        global _daily_pull_done
+        _daily_pull_done = True
+        # reason 由管线节点的 custom_action_param 传入(2026-10-17 加):
+        #   done   = 今日次数已抽完;locked = 需先完成每日演出,当前抽不了。
+        # 原来两种情况共用一句"已确认今日没有可抽次数",读日志时分不清是哪种,
+        # 排查"三抽为什么没抽"时会被误导。
+        reason = ""
+        try:
+            reason = str(
+                (json.loads(argv.custom_action_param or "{}") or {}).get("reason") or ""
+            )
+        except Exception:
+            reason = ""
+        if reason == "locked":
+            logging.info(
+                "每日免费三抽:需先完成每日演出,当前抽不了(收尾会再查一次)"
+            )
+        else:
+            logging.info("每日免费三抽:今日次数已抽完")
         return CustomAction.RunResult(True)
 
 
@@ -1474,6 +1769,33 @@ def _reconcile_play_result(result: dict) -> dict:
     return r
 
 
+#: 结算页 FAST/SLOW 的数字是**淡灰细体**:实拍 `0000` 的前三位灰度 ~210(背景
+#: 250+、常规深色字 ~124),OCR 对整片淡灰细体直接返回空文本 —— 表现为
+#: `GREAT 75(FAST -/SLOW -)`(2026-10-17 用户反馈"识别不正确")。
+#: 阈值 235:背景(>=250)留白,淡灰字与深色字一律涂黑,得到黑字白底。
+_RESULT_DIGIT_BINARIZE_THRESH = 235
+
+
+def _binarize_result_rois(image, rois, thresh=_RESULT_DIGIT_BINARIZE_THRESH):
+    """把结算页各数字 ROI 二值化成黑字白底,返回增强后的全图副本。
+
+    只改 ROI 内部:背景(亮)保持白色,淡灰细体与深色字都拉黑 —— ppocr 对
+    低对比度细体失效,对干净的黑字白底稳定。ROI 越界时裁掉,不抛异常。
+    """
+    out = image.copy()
+    height, width = out.shape[:2]
+    for x, y, w, h in rois:
+        x0, y0 = max(0, x), max(0, y)
+        x1, y1 = min(width, x + w), min(height, y + h)
+        if x1 <= x0 or y1 <= y0:
+            continue
+        region = out[y0:y1, x0:x1]
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, thresh, 255, cv2.THRESH_BINARY)
+        out[y0:y1, x0:x1] = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+    return out
+
+
 @maaresource.custom_recognition("PlayResultRecognition")
 class PlayResultRecognition(CustomRecognition):
     def analyze(
@@ -1519,6 +1841,8 @@ class PlayResultRecognition(CustomRecognition):
             }
             for type_, type_value in types.items()
         }
+        # 二值化增强图(懒加载:只有字段读不出时才构造)
+        enhanced = None
         for type_ in types:
             try:
                 reco = context.run_recognition(
@@ -1532,6 +1856,29 @@ class PlayResultRecognition(CustomRecognition):
                 logging.debug("Play result ocr error [{}]: {}".format(type_, e))
             raw_texts[type_] = ocrtext
             result[type_] = _ocr_to_int(ocrtext)
+            if result[type_] == -1:
+                # 原图读不出(典型:FAST/SLOW 的淡灰细体 0000,OCR 直接返回空文本)。
+                # 用二值化增强图再试一次;原图能读到的值一律保留,不拿增强图覆盖 ——
+                # 增强只兜底,不改变已验证可行的字段(perfect/maxcombo 等)。
+                if enhanced is None:
+                    enhanced = _binarize_result_rois(
+                        argv.image, [v["roi"] for v in types.values()]
+                    )
+                try:
+                    reco = context.run_recognition(
+                        f"_PlayResultRecognition_ocr_{type_}",
+                        enhanced,
+                        pipeline,
+                    )
+                    ocrtext2 = reco.best_result.text if reco and reco.best_result else ""
+                except Exception as e:
+                    ocrtext2 = ""
+                    logging.debug(
+                        "Play result ocr error (enhanced) [{}]: {}".format(type_, e)
+                    )
+                if ocrtext2:
+                    raw_texts[type_] = "{} => {}".format(ocrtext, ocrtext2)
+                    result[type_] = _ocr_to_int(ocrtext2)
 
         # 原始文本一并落盘:读数异常时能分清"压根没识别到"和"识别成了别的数字"
         logging.debug("Play result raw: {}".format(raw_texts))
@@ -1604,8 +1951,11 @@ _LIFE_PIPELINE = {
 }
 
 
-def _life_exhausted_on_screen(context) -> str:
+def _life_exhausted_on_screen(context, screen=None) -> str:
     """检测当前画面是否出现「演出失败」弹窗(生命值耗尽)。
+
+    screen 传入时复用调用方已抓的帧(打歌期间与暂停检测共用一张图,抓图次数保持
+    1 次/秒,不给发布时序添额外开销)。
 
     返回 "hit" / "no_match" / "precheck_rejected" / "error" 而不是布尔值。
     「卡在演出失败弹窗、脚本没反应」有好几种成因(检测没机会跑、亮度预检把
@@ -1618,9 +1968,7 @@ def _life_exhausted_on_screen(context) -> str:
     打歌时机。
     """
     try:
-        screen = np.ascontiguousarray(
-            current_player.ipc_capture_display(), dtype=np.uint8
-        )
+        screen = screen if screen is not None else _grab_screen()
         x, y, w, h = _LIFE_ROI
         region = screen[y : y + h, x : x + w]
         if float(region.mean()) < 150:
@@ -1634,6 +1982,105 @@ def _life_exhausted_on_screen(context) -> str:
         return "error"
 
 
+class LivePauseInterrupted(Exception):
+    """打歌中出现「暂停」弹窗,已点「中断」把本局收掉(本局无报酬)。"""
+
+
+# 打歌中「暂停」弹窗检测:
+#  2026-10-17 用户实况:打歌途中弹出暂停框(标题「暂停」,三个键:中断/重新开始/继续),
+#  脚本完全没反应。根因同生命耗尽:Play 自定义动作阻塞期间 MAA 不检查 pipeline 的
+#  interrupt,playsong 的 interrupt 在打歌中不生效 → 这一局永远打不完。
+#  用户定的处置:点「中断」退出本局(拿不到报酬,好过卡死)。
+#  判据用「中断」按钮做模板(白底深字、位置固定,实测在本弹窗命中 1.0000、在
+#  普通打歌画面/主页/二次确认弹窗上都远低于阈值),比 OCR 标题稳。
+_PAUSE_ROI = [230, 395, 300, 120]
+_PAUSE_PIPELINE = {
+    "pause_check": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/pause_interrupt.png",
+        "roi": _PAUSE_ROI,
+        "threshold": 0.8,
+    },
+}
+# 二次确认弹窗里的粉色「中断」。这里只能 OCR:同一块粉色按钮在第一个暂停弹窗里
+# 是「继续」,用模板实测 0.9138(远超阈值)会点错成"继续演出"。
+_CONFIRM_ROI = [640, 410, 270, 95]
+_CONFIRM_PIPELINE = {
+    "live_pause_confirm": {
+        "recognition": "OCR",
+        "expected": ["中断"],
+        "roi": _CONFIRM_ROI,
+    },
+}
+
+
+def _grab_screen():
+    """抓一张当前画面(ndarray)。抓图串行化,避免与看门狗线程的 IPC 抓图串包。"""
+    with _SCREEN_CAP_LOCK:
+        return np.ascontiguousarray(
+            current_player.ipc_capture_display(), dtype=np.uint8
+        )
+
+
+def _pause_dialog_on_screen(context, screen=None) -> bool:
+    """打歌中当前画面是否是「暂停」弹窗。异常一律当没弹,绝不带崩打歌。
+
+    screen 传入时复用同一帧(见 _life_exhausted_on_screen 的说明)。
+    """
+    try:
+        screen = screen if screen is not None else _grab_screen()
+        reco = context.run_recognition("pause_check", screen, _PAUSE_PIPELINE)
+        return bool(reco and reco.best_result)
+    except Exception as e:
+        logging.debug("pause check error: {}".format(e))
+        return False
+
+
+def _click_at_box(box) -> bool:
+    """按识别框中心点一下。box = [x, y, w, h]。"""
+    if not box:
+        return False
+    try:
+        x, y, w, h = (int(v) for v in list(box)[:4])
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        maacontroller.post_click(x + w // 2, y + h // 2).wait()
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("点击失败(%s),改用 adb tap", e)
+        _adb_shell(["input", "tap", str(x + w // 2), str(y + h // 2)])
+        return True
+
+
+def _interrupt_paused_live(context) -> None:
+    """点「中断」→ 二次确认弹窗的粉色「中断」,把这一局收掉回到主页。
+
+    ⚠ 不能直接用 _run_node_once(它是 run_action):run_action 不带识别结果,
+    Click 动作拿不到框,会退化到 (0,0) 乱点(2026-10-17 实况踩到)。
+    所以这里自己做"识别 → 按识别框中心点"两步,坐标全部来自识别。
+    """
+    logging.warning("打歌中出现「暂停」弹窗,点「中断」退出本局(本局将没有演出报酬)")
+    try:
+        reco = context.run_recognition(
+            "pause_check", _grab_screen(), _PAUSE_PIPELINE
+        )
+        box = reco.best_result.box if reco and reco.best_result else None
+        _click_at_box(box)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("点「中断」失败: %s", e)
+    time.sleep(1.0)
+    try:
+        reco2 = context.run_recognition(
+            "live_pause_confirm", _grab_screen(), _CONFIRM_PIPELINE
+        )
+        box2 = reco2.best_result.box if reco2 and reco2.best_result else None
+        _click_at_box(box2)
+    except Exception as e:  # noqa: BLE001
+        logging.warning("点二次确认「中断」失败: %s", e)
+    time.sleep(1.5)
+
+
 @maaresource.custom_action("Play")
 class Play(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
@@ -1642,6 +2089,11 @@ class Play(CustomAction):
             return CustomAction.RunResult(True)
         except LifeExhaustedDetected:
             # 打歌中生命耗尽:返回失败,playsong 的 on_error 接管(记录+退出)
+            return CustomAction.RunResult(False)
+        except LivePauseInterrupted:
+            # 打歌中暂停弹窗:已点「中断」,同样返回失败让 on_error 链收尾
+            # (save_failed_playresult 记一条失败 → life_exhausted_exit 在主页认不出
+            #  「退出」就 stop,任务结束在主界面,后续三抽正好从主页起手)
             return CustomAction.RunResult(False)
         except Exception as e:
             logging.error(f"Failed when play song: {e}", stack_info=True)
@@ -2032,6 +2484,13 @@ def play_song(context=None):
     pub_margin_ms = 3.0
     overrun_ema = 0.0
     prev_sleep_end = None
+    # 漏点诊断:每批发布时记录「实际发布时刻 vs 该批首个动作的谱面时间」。
+    # 偏差 >判定窗口(约 ±50ms)的批次就是漏音符的嫌疑对象 —— 2026-10-17 用户
+    # 反馈 I wonder/Merry Merry Thanks!! 固定漏 1-2 个且"完全没打",静态审计
+    # (手指分配/交接顺序/坐标/判定点数)全部正确,只剩发布时序这一层可查。
+    batch_no = 0
+    batch_first_time = 0.0
+    timeline_t0 = time.perf_counter()
 
     while True:
         now = time.perf_counter()
@@ -2045,16 +2504,31 @@ def play_song(context=None):
                     "发布余量已提升到 %.0fms(主机抖动 EMA %.1fms)",
                     pub_margin_ms, overrun_ema,
                 )
+        if batch_no > 0:
+            # 本批(刚 publish 的)首个动作的谱面时间 vs 实际发布时间
+            drift_ms = (time.perf_counter() - timeline_t0) * 1000.0 - batch_first_time
+            if abs(drift_ms) > 20.0:
+                logging.debug(
+                    "发布批次#%d 漂移 %.1fms(谱面起点 %.0fms, margin=%.1fms)",
+                    batch_no, drift_ms, batch_first_time, pub_margin_ms,
+                )
         current_chart.command_builder.publish(mnt, block=False)
         wait_time = _get_wait_time()
         sleep_s = max(0, wait_time - pub_margin_ms) / 1000.0
+        # 告诉卡死看门狗「脚本还在推进」:打歌期间 Play 动作阻塞,而看门狗现在
+        # 靠"画面静止"判卡死,这里再补一个脚本侧的进展心跳(音符密集时切片短、
+        # 画面也一直在动,双保险)。
+        _STUCK_WATCHDOG.ping()
 
         now = time.perf_counter()
         if context is not None and now - last_life_check >= LIFE_CHECK_INTERVAL:
             if sleep_s >= 0.2:
                 starve_since = None
                 check_t0 = time.perf_counter()
-                life_result = _life_exhausted_on_screen(context)
+                # 本拍只抓一张图,生命检测与暂停检测共用(抓图实测 ~5ms,
+                # 一秒抓两次纯属浪费,而且会吃掉下一批音符的时间预算)
+                frame = _grab_screen()
+                life_result = _life_exhausted_on_screen(context, frame)
                 life_stats["checks"] += 1
                 # 注意:_life_exhausted_on_screen 返回的状态名与统计键名不同名
                 # (函数给 "precheck_rejected",统计键是 "precheck"),早期写法是
@@ -2071,6 +2545,13 @@ def play_song(context=None):
                     logging.info("打歌中生命值耗尽,提前结束本次演出")
                     _log_life_stats()
                     raise LifeExhaustedDetected()
+                # 暂停弹窗(2026-10-17 用户实况):不点「中断」这一局永远挂着。
+                # 复用同一个 1s 检测节拍,模板匹配本身很便宜;检测耗时同样从
+                # sleep 预算里扣,不影响下一批音符的时间线。
+                if _pause_dialog_on_screen(context, frame):
+                    _log_life_stats()
+                    _interrupt_paused_live(context)
+                    raise LivePauseInterrupted()
                 sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
                 last_life_check = time.perf_counter()
             else:
@@ -2091,7 +2572,10 @@ def play_song(context=None):
         prev_sleep_end = time.perf_counter()
 
         index = current_chart.actions_to_cmd_index
-        if current_chart.actions[index : index + CMD_SLICE_SIZE]:
+        upcoming = current_chart.actions[index : index + CMD_SLICE_SIZE]
+        if upcoming:
+            batch_no += 1
+            batch_first_time = upcoming[0]["time"]
             with callback_data_lock:
                 _adjust_offset()
                 reset_callback_data()
@@ -2534,6 +3018,41 @@ def init_player_and_mnt():
     logging.info("Mumu and MNT inited.")
 
 
+#: 启动时清理 debug/ 下超过这么多天的 autodori-*.log(用户 2026-10-17 要求)。
+#: 只清自己写的日志:maa.log 由 MAA 覆盖写、*.png 是人工调试截图,都不动。
+_LOG_KEEP_DAYS = 7
+
+
+def _purge_old_logs(keep_days: int = _LOG_KEEP_DAYS):
+    """删掉 debug/ 里超过 keep_days 天的 autodori-*.log,返回 (个数, 字节数)。
+
+    背景:原来日志只增不删,长期使用 debug/ 会累积几十上百 MB(用户实测
+    47 个 .log 已有 28MB)。在 basicConfig 之后调用也安全:当天新建的日志
+    文件 mtime 就是现在,远在 cutoff 之内,不会被误删。删除失败(被占用/
+    无权限)只跳过,绝不阻断启动。顺手 makedirs,保证 FileHandler 不因
+    目录缺失直接崩。
+    """
+    log_dir = Path("debug")
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return 0, 0
+    cutoff = time.time() - keep_days * 86400
+    removed = 0
+    freed = 0
+    for item in log_dir.glob("autodori-*.log"):
+        try:
+            stat = item.stat()
+            if stat.st_mtime >= cutoff:
+                continue
+            freed += stat.st_size
+            item.unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed, freed
+
+
 def configure_log():
     # Force UTF-8 on stdout so the log lines (Japanese song names etc.) read
     # correctly by the GUI subprocess pipe instead of being locale-encoded.
@@ -2559,6 +3078,13 @@ def configure_log():
             ),
         ],
     )
+    # 清理历史日志(放在 basicConfig 之前删,这里只报一行结果)。
+    _purged_n, _purged_bytes = _purge_old_logs()
+    if _purged_n:
+        logging.info(
+            "已清理 %d 个超过 %d 天的历史日志(释放 %.1f MB)",
+            _purged_n, _LOG_KEEP_DAYS, _purged_bytes / 1048576.0,
+        )
     # 静音刷屏的 logger:打歌时 minitouch 会为每条触控指令打 DEBUG(一首歌上万行、
     # 占日志 ~98%),peewee 打 SQL、urllib3 打 HTTP 细节,对用户都无意义。
     # 想恢复这些调试信息时,把对应名字从下面列表里去掉即可。
@@ -2627,6 +3153,23 @@ def _get_override_pipeline():
         }
         return all_pipelines
 
+    if _DAILY_MODE:
+        # 日常模式:「选择演出」界面(live 首页)点返回箭头回主页后,接回 daily_home
+        # 走完整阶段1(火罐检查 + 点公告 + 停),而不是 start_app 重试掉进打歌循环
+        # —— 后者会跳过火罐0停日常的检查(2026-10-17 用户在该界面点「开始日常」
+        # 实测空转:start_app.next 六个节点全不命中 → 无限循环)。
+        # main 模式用 start.json 里的默认定义(next=start_app,回主页后
+        # live_home_button 命中进打歌循环,即"重启接管"的既有行为)。
+        all_pipelines["select_live_home_back"] = {
+            "recognition": "OCR",
+            "expected": ["选择演出"],
+            "roi": [90, 30, 320, 70],
+            "action": "Click",
+            "target": [29, 40, 130, 90],
+            "post_delay": 1500,
+            "next": ["daily_home"],
+        }
+
     # set_difficulty
     difficulty: str = DIFFICULTY
     roi = {
@@ -2668,6 +3211,57 @@ def _get_override_pipeline():
     if LIVEMODE == "challengelive":
         for name, override in challenge_overrides(CHALLENGE_FINISH).items():
             all_pipelines.setdefault(name, {}).update(override)
+
+    # _daily_song_stop 只有"还没确认三抽"时才为 True:那时每首打完都得回主页,
+    # 才能进抽卡页检查。三抽确认完成后置 False,main 走 live.json 的原生连打链
+    # (结算页「再次演出」→ 选曲 → 下一首),不再逐首回主页(用户 2026-10-17 要求)。
+    if _DAILY_PULL_EACH_SONG and _daily_song_stop:
+        # 一键日常的交替模式(清火+三抽同开):main 任务必须**打完一首就停**,
+        # 由 _run_daily_flow 在 Python 层串"打歌 → 三抽 → 打歌"。
+        # 改三处(都写完整定义,与 live.json 逐字一致,只动 next):
+        #   save_succeed_playresult: 结算页点「再次演出」→ 左上返回 → 主页 → 停;
+        #   event_reward_confirm:     奖励弹窗点掉后同样先认再次演出,再回主页;
+        #   handle_life_exhausted:    打崩一首也回主页停,照常去做三抽。
+        # daily_song_done = 认 live_home(主页「演出」按钮)后 stop(见 live.json)。
+        all_pipelines["save_succeed_playresult"] = {
+            "recognition": "Custom",
+            "custom_recognition": "PlayResultRecognition",
+            "action": "Custom",
+            "custom_action": "SavePlayResult",
+            "custom_action_param": {"succeed": True},
+            # 2026-10-17 用户实况(竞演演出活动的「活动分数」结算页,即桌面 1.png):
+            # 右下并排「再次演出」+「确定」,原 next 里只有用不到的两项,于是落到
+            # interrupt 的 confirm_button → 点「确定」→ 进活动剧情(那屏底部还有
+            # LOADING/0MB/3MB 下载条)→ 所有识别全不命中 → 永久卡住。
+            # 用户定的口径:只点「再次演出」,「确定」彻底不点。
+            # activity_liveagain = 点再次演出 → 左上返回 → 主页 → 停(daily_song_done)。
+            "next": ["event_reward_confirm", "activity_liveagain", "daily_song_done"],
+            "interrupt": [
+                "story_loading_wait",
+                "reader_menu",
+                "next_button",
+                "close_button",
+                "ok_button",
+                "read_after",
+            ],
+        }
+        all_pipelines["event_reward_confirm"] = {
+            "recognition": "OCR",
+            "expected": ["获得报酬", "获得奖励"],
+            "roi": [340, 105, 600, 100],
+            "action": "Click",
+            "target": [560, 500, 160, 90],
+            "timeout": 3000,
+            "post_delay": 800,
+            # 奖励弹窗点掉后仍然优先「再次演出」(活动分数页可能在弹窗下面)。
+            "next": ["activity_liveagain", "daily_song_done"],
+        }
+        all_pipelines["handle_life_exhausted"] = {
+            "action": "Custom",
+            "custom_action": "HandleLifeExhausted",
+            "next": ["daily_song_done"],
+            "on_error": ["stop"],
+        }
 
     return all_pipelines
 
@@ -2773,7 +3367,8 @@ def _log_environment():
             "退出联动: 游戏退出自动停止=%s, 退出请求宽限=%.0fs, 游戏缺席判定=%.0fs",
             _stop_on_game_exit(), _EXIT_GRACE_S, _GAME_EXIT_GRACE_S,
         )
-        # 环境自检: 音频禁用/电源计划/帧率/内存 等会直接造成漂移或掉判定的项
+        # 环境自检: 音频禁用/帧率/内存 等会直接造成漂移或掉判定的项
+        # (2026-10-17 去掉了「电源计划」项:提示了也不能自动修,用户反馈作用不大)
         try:
             findings = envcheck.check(emu_path)
         except Exception as e:  # 自检绝不阻断主流程
@@ -2815,33 +3410,142 @@ def main():
 
 
 def _run_daily_flow(entry: str) -> None:
-    """一键清理日常(Issue #4)的分阶段执行。
+    """日常(原「一键清理日常」)的分阶段执行。GUI 现在只有这一个打歌入口。
 
     阶段1 daily       启动游戏 + 点掉开场公告/赠送弹窗(每日签到奖励也在这里领取),
                       回主界面。**必经流程,没有开关** —— 不点掉就进不了主界面。
-    阶段2 main        仅 daily.auto_clear_fire 开启时:复用常规挖矿打歌主循环清火;
-                      火量不足时 HandleLiveBoost 走清火分支,用 stop 节点
-                      (StopTask)结束本阶段 —— 不请求进程退出,以便继续阶段3。
-                      判据只能是火量:play_at_zero_boost(默认 True)的语义是
-                      "0 火也接着打",它一旦先判,本阶段就永远不会结束
-                      (2026-10-15 实测:火为 0 后连打 3 首,三抽一直没执行)。
-    阶段3 daily_pull  仅 daily.auto_free_pull 开启时:每日免费三抽 —— 招募 →
-                      演出招募,按按钮状态幂等推进(免费→确认→抽; 剩余0回/
-                      今日已完成→收尾; 尚未完成每日演出→跳过),完成后退回主界面停止。
+    阶段2 main        仅 daily.auto_clear_fire 开启时:复用常规打歌主循环清火;
+                      火量不足时按「自由演出设置 → 火罐为0时」三态处理(_zero_boost_policy)。
+                      判据只能是火量(不是生命值),见 HandleLiveBoost。
+    阶段3 daily_pull  仅 daily.auto_free_pull 开启时:每日免费三抽。
 
-    两个开关都关时,只做阶段1(启动 + 领签到/弹窗)就收尾。
+    2026-10-17 用户改需求:
+    1. 清火与三抽**同时**开启时不是"先清火再抽卡",而是先打一首、检查三抽
+       (_DAILY_PULL_EACH_SONG),确认做完之后**后续连打不再逐首回主页**。
+    2. 三抽**只在还没确认做完时才跑**:管线节点 daily_pull_done / daily_pull_locked
+       命中后由 MarkDailyPullDone 置 _daily_pull_done,之后每首直接跳过(每首白跑
+       一次要 20-40 秒);收尾再复核一次(用户要求"保险起见")。
+    3. 火罐为 0 不再是"无条件停",而是读「火罐为0时」三态:停在游戏主界面(默认) /
+       继续挖矿 / 退出游戏。选 stop 时这里会先退回主页再收尾 —— 管线里的 stop 只是
+       停在选曲确认页,与选项名承诺的"停在游戏主界面"不符。
+    4. **回主页只在两个时刻发生**(用户 2026-10-17 反馈"每首打完都回主界面太麻烦"):
+       还未确认三抽时,每首打完回一次(才能进抽卡页);三抽确认完成后改连打,
+       直到火尽,收尾复核三抽前再回一次。
     """
+    global _daily_boost_zero, _daily_pull_done, _daily_song_stop, _daily_fire_exhausted
+    _daily_boost_zero = False
+    _daily_pull_done = False
+    _daily_song_stop = True
     maatasker.post_task(entry, _get_override_pipeline()).wait().get()
-    if _DAILY_CLEAR_FIRE:
-        logging.info("自动清火:进入打歌循环,火量耗尽后自动转入下一阶段")
-        maatasker.post_task("main", _get_override_pipeline()).wait().get()
+    if _daily_boost_zero:
+        # 阶段1(daily)里 daily_boost_check 已打过「火罐不足,日常已停止」日志
+        return
+
+    def _pull(reason: str, force: bool = False) -> bool:
+        """做一次每日免费三抽。返回 False = 这一步异常,调用方应收尾。"""
+        if not _DAILY_FREE_PULL:
+            return True
+        if _daily_pull_done and not force:
+            logging.debug("每日免费三抽已确认完成,跳过检查(%s)", reason)
+            return True
+        logging.info("执行每日免费三抽(%s)", reason)
+        try:
+            maatasker.post_task("daily_pull", _get_override_pipeline()).wait().get()
+        except Exception as e:
+            logging.warning("每日免费三抽异常结束(%s)", e)
+            return False
+        return True
+
+    def _return_to_home(reason: str) -> None:
+        """从打歌结束界面点左上返回箭头一路退回主页。
+
+        连打模式的收工点在选曲确认页(HandleLiveBoost 在 comfirm_song 之后判定
+        火量并 stop),而三抽只能从主页进入,所以收尾前必须先退回去。
+        复用 live.json 的 activity_back_to_home:认左上返回箭头就点,自循环直到
+        命中 daily_song_done(主页「演出」按钮)才 stop。失败不阻断收尾。
+        """
+        # 用户 2026-10-17:「收尾回主页(连打结束)」看不懂,改成直白的动作描述。
+        logging.info("停止继续打歌")
+        try:
+            maatasker.post_task(
+                "activity_back_to_home", _get_override_pipeline()
+            ).wait().get()
+        except Exception as e:
+            logging.warning("收尾回主页失败(%s): %s", reason, e)
+
+    if _DAILY_CLEAR_FIRE and _DAILY_PULL_EACH_SONG:
+        # 阶段A:逐首打(main 每首一停,override 保证),打完就查三抽,直到确认完成。
+        # 平时一两首就够 —— 三抽要么做完(daily_pull_done)要么因"未完成每日演出"
+        # 不可抽(daily_pull_locked),两者都会置 _daily_pull_done。
+        confirmed = False
+        for round_no in range(1, _DAILY_MAX_ROUNDS + 1):
+            _daily_fire_exhausted = False
+            logging.info("自动清火:第 %d 轮打歌" % round_no)
+            try:
+                maatasker.post_task("main", _get_override_pipeline()).wait().get()
+            except Exception as e:
+                # main 异常终止(识别不到界面等):不再重试,直接收尾
+                logging.warning("打歌阶段异常结束(%s),停止循环", e)
+                break
+            if _daily_fire_exhausted:
+                # 火罐不足:本阶段收工(三抽留到收尾复核)。
+                # 选项名叫「停在游戏主界面」,而管线里的 stop 只是停在选曲确认页,
+                # 所以这里统一退回主页 —— 收尾三抽也只能从主页进。
+                # 这里不再重复打「火罐不足,日常已停止」:HandleLiveBoost 已经打过
+                # 一条带火量的(用户 2026-10-17 反馈两行一模一样,冗余)。
+                _return_to_home("火罐不足")
+                break
+            if not _pull("第 %d 首打完" % round_no):
+                break
+            if _daily_pull_done:
+                confirmed = True
+                break
+        else:
+            logging.warning(
+                "已达安全上限 %d 轮,强制结束日常流程", _DAILY_MAX_ROUNDS
+            )
+
+        # 阶段B:三抽已确认 → 后续连打,不再逐首回主页(用户 2026-10-17 要求)。
+        # _daily_song_stop=False 后 _get_override_pipeline 不再改写结算/打崩三处
+        # 的 next,main 走 live.json 原生链:结算 →「再次演出」→ 选曲 → 下一首,
+        # 直到 HandleLiveBoost 判定火量不足时 stop。
+        if confirmed and not _daily_fire_exhausted:
+            _daily_song_stop = False
+            _daily_fire_exhausted = False
+            logging.info("每日三抽已确认完成,后续打歌不再逐首回主页")
+            try:
+                maatasker.post_task("main", _get_override_pipeline()).wait().get()
+            except Exception as e:
+                logging.warning("连打阶段异常结束(%s)", e)
+            if _daily_fire_exhausted:
+                logging.info("火罐不足，日常已停止")
+            # 连打收工停在选曲确认页,三抽只能从主页进 —— 收尾前先退回去。
+            if _DAILY_FREE_PULL:
+                _return_to_home("连打结束")
+
+        # 收尾复核:三抽前面已确认做完也再验一次(用户 2026-10-17 要求"保险起见")
+        _pull("收尾复核", force=True)
+    elif _DAILY_CLEAR_FIRE:
+        # 纯清火(没勾三抽):main 自己循环打到火尽,只跑一次
+        logging.info("自动清火:进入打歌循环,火量耗尽后日常停止")
+        try:
+            maatasker.post_task("main", _get_override_pipeline()).wait().get()
+        except Exception as e:
+            logging.warning("打歌阶段异常结束(%s)", e)
+        if _daily_fire_exhausted:
+            # 与交替模式一致:火尽后退回游戏主界面(选项名承诺的落点)。
+            # 「火罐不足」的日志由 HandleLiveBoost 打,这里不重复。
+            _return_to_home("火罐不足")
     else:
         logging.info("未勾选「自动清火打歌」,跳过清火阶段")
-    if _DAILY_FREE_PULL:
-        logging.info("执行每日免费三抽(固定3次,游戏内置每日上限)")
-        maatasker.post_task("daily_pull", _get_override_pipeline()).wait().get()
-    else:
-        logging.info("未勾选「每日免费三抽」,跳过抽卡阶段")
+        _pull("清火未勾选,单独执行三抽")
+
+    if _daily_fire_exhausted and _zero_boost_policy() == "exit":
+        logging.info("火罐不足且设置为「退出游戏」")
+        try:
+            maatasker.post_task("close_app", {}).wait().get()
+        except Exception as e:
+            logging.warning("关闭游戏失败: %s", e)
 
 
 def _main_impl():
@@ -2863,7 +3567,7 @@ def _main_impl():
         "--difficulty",
         type=str,
         choices=["easy", "normal", "hard", "expert", "special"],
-        help="Specify the difficulty for main mode",
+        help="打歌难度:main 与 daily 都读(daily 由 GUI「自由演出设置」传入)",
         default="hard",
     )
     parser.add_argument(
@@ -2912,6 +3616,7 @@ def _main_impl():
     args = parser.parse_args()
 
     global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE, CHALLENGE_FINISH
+    global _DAILY_MODE
     global _DAILY_CLEAR_FIRE, _DAILY_FREE_PULL
     DEVICE_OVERRIDE = str(args.device or "").strip()
 
@@ -2927,16 +3632,25 @@ def _main_impl():
         DIFFICULTY = "special"
         entry = "special_wait"
     elif args.mode == "daily":
-        # 一键清理日常(Issue #4):分三阶段执行(见 _run_daily_flow)。
+        # 日常(现在 GUI 唯一的打歌入口):分三阶段执行(见 _run_daily_flow)。
         # 阶段1(启动 + 领签到/弹窗)是必经流程、没有开关;阶段2/3 各由一个开关控制 ——
         # 结构由用户 10-09 定,别再退回成"三个选项都得勾"。
         SPECIAL_MODE = False
+        _DAILY_MODE = True
+        # 难度/GUI「自由演出设置」→ 阶段2 的 set_difficulty(2026-10-17 合并前,
+        # 日常不传 --difficulty,难度恒为模块默认 hard,界面上选 expert 根本不生效)。
+        DIFFICULTY = args.difficulty
         daily_cfg = _runtime_config().get("daily") or {}
         _DAILY_CLEAR_FIRE = bool(daily_cfg.get("auto_clear_fire", False))
         _DAILY_FREE_PULL = bool(daily_cfg.get("auto_free_pull", False))
+        # 两个开关同开 = 交替模式:每打完一首先做三抽再继续清火
+        # (用户 2026-10-17 改的需求,详见 _run_daily_flow)。
+        global _DAILY_PULL_EACH_SONG
+        _DAILY_PULL_EACH_SONG = _DAILY_CLEAR_FIRE and _DAILY_FREE_PULL
         entry = "daily"
     else:
         SPECIAL_MODE = False
+        _DAILY_MODE = False
         DIFFICULTY = args.difficulty
         entry = "main"
     LIVEMODE = args.livemode
@@ -2950,6 +3664,10 @@ def _main_impl():
 
     # 退出看门狗:关游戏/停任务任何一条链没落实都由它兜底,保证脚本一定停。
     _start_exit_watchdog()
+    # 卡死看门狗(用户 2026-10-17):未知弹窗/界面把流程卡在原地时按返回键自愈,
+    # 两次无效就停任务。special(故事)模式连续点「下一步」是正常行为,不启用。
+    if not SPECIAL_MODE:
+        _start_stuck_watchdog()
     try:
         if args.mode == "daily":
             _run_daily_flow(entry)

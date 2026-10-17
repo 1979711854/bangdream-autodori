@@ -5,6 +5,7 @@
   "action": "Click",
   "post_delay": 800,
   "next": [
+   "tutorial_close",
    "song_announce_confirm",
    "select_live_mode",
    "live_home_button"
@@ -150,7 +151,44 @@
   "recognition": "TemplateMatch",
   "template": "live/button/pause.png",
   "next": "playsong",
+  "interrupt": [
+   "live_pause_interrupt"
+  ],
   "on_error": "save_failed_playresult"
+ },
+ "live_pause_interrupt": {
+  "recognition": "TemplateMatch",
+  "template": "live/button/pause_interrupt.png",
+  "roi": [
+   230,
+   395,
+   300,
+   120
+  ],
+  "threshold": 0.8,
+  "action": "Click",
+  "post_delay": 800,
+  "next": [
+   "live_pause_confirm"
+  ]
+ },
+ "live_pause_confirm": {
+  "recognition": "OCR",
+  "expected": [
+   "中断"
+  ],
+  "roi": [
+   640,
+   410,
+   270,
+   95
+  ],
+  "action": "Click",
+  "post_delay": 1500,
+  "next": [
+   "daily_song_done",
+   "stop"
+  ]
  },
  "playsong": {
   "action": "Custom",
@@ -161,6 +199,7 @@
    "life_exhausted_exit"
   ],
   "interrupt": [
+   "live_pause_interrupt",
    "live_failed",
    "next_button",
    "close_button",
@@ -183,6 +222,7 @@
    "time": 1500
   },
   "interrupt": [
+   "live_pause_interrupt",
    "next_button",
    "close_button",
    "ok_button",
@@ -200,6 +240,7 @@
   "pre_wait_freezes": 1000,
   "next": "save_succeed_playresult",
   "interrupt": [
+   "live_pause_interrupt",
    "live_failed"
   ]
  },
@@ -234,6 +275,80 @@
   "post_delay": 500,
   "interrupt": [
    "event_reward_confirm"
+  ]
+ },
+ "daily_song_done": {
+  "recognition": "TemplateMatch",
+  "template": "live/button/live_home.png",
+  "roi": [
+   1042,
+   543,
+   238,
+   177
+  ],
+  "threshold": 0.95,
+  "next": [
+   "song_announce_confirm",
+   "stop"
+  ]
+ },
+ "activity_liveagain": {
+  "recognition": "TemplateMatch",
+  "template": "live/button/liveagain.png",
+  "roi": [
+   660,
+   590,
+   330,
+   130
+  ],
+  "threshold": 0.8,
+  "action": "Click",
+  "post_delay": 1500,
+  "next": [
+   "activity_back_to_home"
+  ]
+ },
+ "activity_back_to_home": {
+  "recognition": "TemplateMatch",
+  "template": "daily/button/back_arrow.png",
+  "roi": [
+   0,
+   0,
+   220,
+   200
+  ],
+  "threshold": 0.8,
+  "action": "Click",
+  "post_delay": 1500,
+  "next": [
+   "activity_back_to_home",
+   "activity_select_song_back",
+   "select_live_home_back",
+   "daily_song_done"
+  ]
+ },
+ "activity_select_song_back": {
+  "recognition": "OCR",
+  "expected": [
+   "选择乐曲"
+  ],
+  "roi": [
+   90,
+   30,
+   320,
+   70
+  ],
+  "action": "Click",
+  "target": [
+   29,
+   40,
+   130,
+   90
+  ],
+  "post_delay": 1500,
+  "next": [
+   "select_live_home_back",
+   "daily_song_done"
   ]
  },
  "event_reward_confirm": {

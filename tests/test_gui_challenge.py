@@ -60,12 +60,19 @@ class GuiChallengeTests(unittest.TestCase):
         app.special_song = "song-id"
         app.device_address = ""
         app.adb_path = ""
+        # _save_gui_config 会读这两个日常开关;以前这里没补,导致
+        # test_challenge_difficulty_is_saved_separately 一直报 AttributeError
+        # (与业务改动无关的历史失败,顺手补上)
+        app.daily_auto_clear_fire = True
+        app.daily_auto_free_pull = True
         return app
 
     def test_each_button_has_separate_bot_arguments(self):
         app = self.make_app()
-        self.assertEqual(app._bot_args("main"), [
-            "--mode", "main", "--difficulty", "expert", "--livemode", "freelive"])
+        # 2026-10-17 合并入口:常规打歌统一走日常(main 按钮已删),
+        # 日常也要吃「打歌设置」里的难度。
+        self.assertEqual(app._bot_args("daily"), [
+            "--mode", "daily", "--difficulty", "expert"])
         self.assertEqual(app._bot_args("challenge"), [
             "--mode", "main", "--difficulty", "hard", "--livemode", "challengelive",
             "--challenge-finish", "home"])
@@ -75,10 +82,10 @@ class GuiChallengeTests(unittest.TestCase):
             "--mode", "special", "--special-song", "song-id"])
         app.challenge_difficulty = "easy"
         self.assertEqual(app._bot_args("challenge")[3], "easy")
-        self.assertEqual(app._bot_args("main")[3], "expert")
+        self.assertEqual(app._bot_args("daily")[3], "expert")
         for address in ("127.0.0.1:16384", "127.0.0.1:16416"):
             app.device_address = address
-            for mode in ("main", "special", "challenge"):
+            for mode in ("daily", "special", "challenge"):
                 with self.subTest(mode=mode, address=address):
                     args = app._bot_args(mode)
                     self.assertEqual(args.count("--device"), 1)
@@ -90,7 +97,7 @@ class GuiChallengeTests(unittest.TestCase):
         app.font_size = 10
         app.window_size = gui.DEFAULT_WINDOW
         app.view = "live.challenge"
-        app.boost_mode = "继续打歌"
+        app.boost_mode = "继续挖矿"
         app.life_mode = "自动退出重新选歌"
         app.auto_cal = False
         app.song_strategy = "挖矿为主"

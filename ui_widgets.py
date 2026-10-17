@@ -172,13 +172,31 @@ class SidePanel(tk.Canvas):
 
 
 class ScrolledFrame(tk.Frame):
-    """可滚轮滚动的容器，隐藏滚动条以保持 Maa 的干净观感。"""
+    """可滚轮滚动的容器，默认隐藏滚动条以保持 Maa 的干净观感。
 
-    def __init__(self, master, **kw):
+    show_scrollbar=True 时在右侧常驻一条竖向滚动条(2026-10-17:更新日志内容
+    变长,用户要求"支持上下滑动查看"—— 只靠滚轮不够直观,鼠标在卡片空白处
+    或没有滚轮时看不出这页还能往下翻)。
+    """
+
+    def __init__(self, master, show_scrollbar=False, **kw):
         th = theme()
         tk.Frame.__init__(self, master, bg=th["app_bg"], **kw)
-        self._cv = tk.Canvas(self, bg=th["app_bg"], highlightthickness=0, bd=0)
-        self._cv.pack(fill="both", expand=True)
+        self._cv = tk.Canvas(self, bg=th["app_bg"], highlightthickness=0, bd=0,
+                             # 固定滚轮/滚动条步进(像素):默认按视口比例算,
+                             # 说明页内容很长时一滚就是半屏,找不准位置。
+                             yscrollincrement=32)
+        self._cv.pack(side="left", fill="both", expand=True)
+        self._vsb = None
+        if show_scrollbar:
+            self._vsb = tk.Scrollbar(
+                self, orient="vertical", command=self._cv.yview, width=10,
+                bd=0, highlightthickness=0, relief="flat",
+                troughcolor=th["app_bg"], bg=th["border"],
+                activebackground=th["text_3"],
+            )
+            self._vsb.pack(side="right", fill="y")
+            self._cv.configure(yscrollcommand=self._vsb.set)
         self.inner = tk.Frame(self._cv, bg=th["app_bg"])
         self._win = self._cv.create_window((0, 0), window=self.inner, anchor="nw")
         self.inner.bind(
@@ -1517,6 +1535,54 @@ class DocView(tk.Frame):
         self._items.append((row, padx))
 
 
+#: 软换行时优先断在这些标点之后(中文里最自然的断句位置)。
+#: 刻意不含右括号/引号:它们后面往往紧跟名词(如「高性能」计划),在那儿断
+#: 会得到「…建议改用「高性能」/ 计划。」这种更难读的结果。
+_LOG_WRAP_PUNCT = "，。；：、！？,;:!?…"
+
+
+def _log_char_width(ch):
+    """粗略显示宽度:CJK/全角算 2,其余算 1(日志字体是等宽 Consolas)。"""
+    return 2 if ord(ch) >= 0x2E80 else 1
+
+
+def _log_wrap(message, limit=100):
+    """把超长的中文日志消息按标点软换行,续行缩进两格。
+
+    背景(用户 2026-10-17):日志 Text 用 wrap="word",而中文没有空格,实际效果
+    是按字符硬折 —— 「Windows 电源计划为「平衡」, CPU / 频率动态调节会造成…」
+    这种断法把句子从词中间劈开,很难读。这里先按显示宽度估算,超过 limit 就
+    退到最近的标点之后换行;找不到标点就交给 Text 自己折(英文句子有空格,
+    wrap="word" 本来就能断对)。
+
+    只影响界面显示,「导出日志」用的 _raw_log 仍是原始整行。
+    """
+    if not message:
+        return message
+    out = []
+    for para in message.split("\n"):
+        start = 0
+        width = 0
+        last_break = -1
+        i = 0
+        while i < len(para):
+            ch = para[i]
+            width += _log_char_width(ch)
+            if ch in _LOG_WRAP_PUNCT:
+                last_break = i + 1
+            # last_break 要够靠后才断(至少占满 40% 宽度):断点太靠前会把第一行
+            # 断成一小截,这时宁可再往后找一个标点(实在没有就交给 Text 自动折行)。
+            if width >= limit and last_break > start + limit * 2 // 5:
+                out.append(para[start:last_break])
+                start = last_break
+                width = sum(_log_char_width(c) for c in para[start:i + 1])
+                last_break = -1
+            i += 1
+        if start < len(para):
+            out.append(para[start:])
+    return "\n  ".join(out)
+
+
 class LogConsole(tk.Frame):
     """日志终端：等宽字体 + 级别分色 + 自动跟随。"""
 
@@ -1600,6 +1666,22 @@ class LogConsole(tk.Frame):
         if self._autoscroll:
             self.text.see("end")
 
+    def _wrap_limit(self):
+        """按日志区实际宽度算软换行的宽度上限(单位=半角字符数)。
+
+        估算失败/控件尚未布局时退回 88:宁可交给 Text 自动折行,也不要因为
+        winfo_width()==1 把每条消息断成好几个字一格。
+        """
+        try:
+            width = self.text.winfo_width()
+            if width < 300:
+                return 88
+            half = tkfont.Font(font=self.text.cget("font")).measure("0") or 8
+            # 减 15:时间戳(HH:MM:SS + 2 空格)与级别(rjust(5) + 2 空格)两列
+            return max(40, int((width - 20) / half) - 15)
+        except Exception:
+            return 88
+
     def line(self, stamp, level, message):
         self.text.configure(state="normal")
         if stamp:
@@ -1607,7 +1689,8 @@ class LogConsole(tk.Frame):
         self.text.insert("end", level.rjust(5) + "  ", {
             "OK": "ok", "WARN": "warn", "ERROR": "err", "CAL": "cal",
         }.get(level, "info"))
-        self.text.insert("end", message + "\n", "info")
+        self.text.insert("end", _log_wrap(message, self._wrap_limit()) + "\n",
+                         "info")
         self.text.configure(state="disabled")
         if self._autoscroll:
             self.text.see("end")

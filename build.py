@@ -32,10 +32,11 @@ if args.version is None:
     VERSION = "unknown"
 else:
     VERSION = args.version
-#: 产物名固定为 bangdream-autodori_win64.zip:README(中/英)与 Release 资产统一用它,
-#: 不再拼 version/os/arch —— 同一版本号换包(gh release upload --clobber)时不用改名字,
-#: 用户侧下载链接也稳定。
-ZIP_FILENAME = "bangdream-autodori_win64.zip"
+#: 产物名统一为 autodori_v<版本>_Windows_X64.zip(用户 2026-10-17 定的命名口径,
+#: 覆盖此前的固定名 bangdream-autodori_win64.zip)。版本号原样嵌入(含 v 前缀与
+#: -rcN 后缀),os/arch 固定写成 Windows_X64 —— 本项目的 Windows x64 构建就
+#: 一种,拼可变部分只会让链接失稳。
+ZIP_FILENAME = "autodori_%s_Windows_X64.zip" % VERSION
 
 
 # 获取当前工作目录

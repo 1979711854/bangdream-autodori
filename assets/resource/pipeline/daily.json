@@ -1,6 +1,8 @@
 {
     "daily": {
         "next": [
+            "story_loading_wait",
+            "reader_menu",
             "daily_home"
         ],
         "interrupt": [
@@ -25,12 +27,26 @@
         ],
         "threshold": 0.95,
         "next": [
+            "daily_boost_check",
+            "song_announce_confirm",
+            "stop"
+        ]
+    },
+    "daily_boost_check": {
+        "recognition": "Custom",
+        "custom_recognition": "LiveBoostEnoughRecognition",
+        "action": "Custom",
+        "custom_action": "HandleDailyBoostZero",
+        "next": [
             "song_announce_confirm",
             "stop"
         ]
     },
     "daily_pull": {
         "next": [
+            "story_loading_wait",
+            "reader_menu",
+            "tutorial_close",
             "song_announce_confirm",
             "daily_pull_home",
             "daily_pull_back"
@@ -97,6 +113,9 @@
     },
     "daily_pull_find_gacha": {
         "next": [
+            "story_loading_wait",
+            "reader_menu",
+            "tutorial_close",
             "song_announce_confirm",
             "daily_pull_on_gacha",
             "daily_pull_tab_click",
@@ -157,6 +176,9 @@
     },
     "daily_pull_btn_check": {
         "next": [
+            "story_loading_wait",
+            "reader_menu",
+            "tutorial_close",
             "song_announce_confirm",
             "daily_pull_done",
             "daily_pull_locked",
@@ -176,6 +198,11 @@
             240,
             200
         ],
+        "action": "Custom",
+        "custom_action": "MarkDailyPullDone",
+        "custom_action_param": {
+            "reason": "done"
+        },
         "next": [
             "daily_pull_exit"
         ]
@@ -191,6 +218,11 @@
             240,
             200
         ],
+        "action": "Custom",
+        "custom_action": "MarkDailyPullDone",
+        "custom_action_param": {
+            "reason": "locked"
+        },
         "next": [
             "daily_pull_exit"
         ]

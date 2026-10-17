@@ -1,6 +1,7 @@
 {
     "main": {
         "next": [
+            "tutorial_close",
             "select_song",
             "select_live_mode",
             "live_home_button"
