@@ -102,8 +102,19 @@ _daily_pull_done = False
 #:            不再逐首回主页 —— 用户 2026-10-17 反馈"每次打完都回主界面太麻烦"。
 #: 只有 _DAILY_PULL_EACH_SONG(清火+三抽同开)时才有意义。
 _daily_song_stop = True
+#: 本次进程内**实际开打**的歌曲序号(从 1 开始),只用于日志显示。
+#: 2026-10-17 用户实测反馈:原来只在每个 main 任务前打「自动清火:第 N 轮打歌」,
+#: 但①阶段1(daily)里 start_app 兜底可能已经打掉一首(游戏没停在主页时),
+#: ②三抽确认后进入连打阶段、一个 main 任务里连打好几首 —— 两处都会让编号
+#: 与实际顺序对不上。计数下沉到 play_song(每首真正开打时 +1)才是准的。
+_song_play_seq = 0
 #: 交替模式下单轮打歌的安全上限,防止 main 任务因异常反复重启却永不收工。
 _DAILY_MAX_ROUNDS = 60
+#: main 任务「没打到歌就正常结束」的最大容忍次数。弹窗类管线节点(如 2026-10-19
+#: 教程弹窗 tutorial_close)没有 next,在链中途命中会把整个 main 任务"成功"带走,
+#: 一首都没打、纯清火/交替模式都静默收工 —— 此时重试而不是放弃;超过次数说明
+#: 入口画面不可用(异常弹窗每轮都断头),停止清火流程,防止无限重试。
+_MAIN_NO_PLAY_MAX = 3
 # 默认曲目:简中客户端标题(曲库 musicTitle 下标 3)。也可写纯数字曲目 id,
 # 见 resolve_special_song()。换活动批次时改这里或 GUI 下拉。
 DEFAULT_SPECIAL_SONG = "[超高难易度 新SPECIAL] SENSENFUKOKU"
@@ -153,22 +164,45 @@ _WATCHDOG_PIXEL_DIFF = 0.8       # 采样点灰度平均差 >= 该值算"画面�
 # 脚本侧最近这么多秒内有活动(打歌心跳等)就**连图都不抓**:打歌期间保持零额外抓图,
 # 不给时序敏感的发布线程添任何 GIL 竞争(实测单次抓图 ~5ms,虽小但没必要)。
 _WATCHDOG_BUSY_QUIET_S = 10.0
+#: 看门狗连续抓图失败多少次后,用 adb 子进程确认一次设备状态(掉线短路径,
+#: 见 check() 内注释)。2s 一拍 × 10 次 ≈ 20s,远快于等满 75s 静止判据。
+_WATCHDOG_CAP_FAIL_MAX = 10
 # 抓图会被打歌线程(生命/暂停检测)和看门狗线程同时用到,串行化避免 IPC 串包
 _SCREEN_CAP_LOCK = threading.Lock()
+#: 抓图限时拿锁的超时。2026-10-20 凌晨场实测:MuMu 掉线时 IPC 调用会**挂死不
+#: 返回**(不是立刻报错),挂死者永久持锁会把另一方拖死 —— 看门狗因此陪葬,
+#: 全进程僵死零日志(01:13:31 之后无任何输出)。双方都改成限时拿锁:打歌线程
+#: 短超时(卡久了吃音符时间预算),看门狗长超时(2s 一拍,等得起)。谁挂死
+#: 持锁,另一方限时失败后继续活,看护能力不归零。
+_CAP_LOCK_TIMEOUT_S = 1.0
+_WATCHDOG_CAP_LOCK_TIMEOUT_S = 5.0
 
 
 def _watchdog_sample():
-    """给看门狗用的粗采样灰度图;抓不到(游戏没起来/IPC 忙)返回 None。"""
+    """给看门狗用的粗采样灰度图;抓不到(游戏没起来/IPC 忙/掉线挂死)返回 None。"""
     if current_player is None:
         return None
+    # 限时拿锁(见 _CAP_LOCK_TIMEOUT_S 注释):持锁方挂死在 IPC 里时,看门狗
+    # 绝不能跟着陪葬 —— 它是全进程最后的看护者。
+    if not _SCREEN_CAP_LOCK.acquire(timeout=_WATCHDOG_CAP_LOCK_TIMEOUT_S):
+        logging.warning(
+            "看门狗抓图锁 %.0fs 拿不到,持锁方疑似挂死在 IPC 上,本轮跳过",
+            _WATCHDOG_CAP_LOCK_TIMEOUT_S,
+        )
+        return None
     try:
-        with _SCREEN_CAP_LOCK:
-            arr = np.ascontiguousarray(
-                current_player.ipc_capture_display(), dtype=np.uint8
-            )
+        frame = current_player.ipc_capture_display()
+        if frame is None:
+            # 掉线时 MuMu IPC 返回 None(player.py 已显式判 None);
+            # 不能让 None 流进 np.ascontiguousarray —— 会造出 0 维数组,
+            # 在下面的 [::step, ::step] 处炸出难懂的下标错误
+            return None
+        arr = np.ascontiguousarray(frame, dtype=np.uint8)
     except Exception as e:  # noqa: BLE001 —— 看门狗自己绝不能把主流程带崩
         logging.debug("看门狗抓图失败: %s", e)
         return None
+    finally:
+        _SCREEN_CAP_LOCK.release()
     arr = arr[::_WATCHDOG_SAMPLE_STEP, ::_WATCHDOG_SAMPLE_STEP]
     if arr.ndim == 3:
         arr = arr.mean(axis=2)
@@ -207,6 +241,7 @@ class _StuckWatchdog(NotificationHandler):
         self._backs = 0
         self._last_back = 0.0
         self._observe_until = 0.0      # 按下返回键后的观察窗口截止时间
+        self._cap_fail = 0             # 连续抓图失败次数(掉线短路径计数)
 
     def ping(self) -> None:
         """脚本侧"还在推进"(打歌中的检测节拍等)时调用。"""
@@ -231,6 +266,24 @@ class _StuckWatchdog(NotificationHandler):
             # 打歌期间看门狗的额外开销 = 0。
             return False
         sample = _watchdog_sample()
+        # 掉线短路径(2026-10-20 凌晨场):MuMu 掉线时 IPC 挂死或返回 None,
+        # 抓图连续失败;此时主线程多半也僵在 IPC/minitouch 上,若只等 75s 静止
+        # 再按返回键(还要靠 adb),全程约 4 分钟且日志全无。连续抓图失败后用
+        # adb 子进程确认一次设备状态 —— subprocess 自带超时,绝不挂死;查不到
+        # 设备就登记退出 + post_stop,由退出看门狗接管硬退出,僵死也能收尾。
+        if sample is None:
+            self._cap_fail += 1
+        else:
+            self._cap_fail = 0
+        if self._cap_fail >= _WATCHDOG_CAP_FAIL_MAX:
+            state = _game_process_running()
+            if state is None:
+                logging.warning("模拟器连接断开(连续抓图失败且 adb 查不到设备),停止任务")
+                _request_exit("模拟器连接断开")
+                _force_post_stop()
+                return True
+            # 设备还在(只是抓图抽风):重置计数,交给静止判据正常走
+            self._cap_fail = 0
         with self._lock:
             changed = sample is not None and (
                 self._prev_sample is None
@@ -2015,11 +2068,25 @@ _CONFIRM_PIPELINE = {
 
 
 def _grab_screen():
-    """抓一张当前画面(ndarray)。抓图串行化,避免与看门狗线程的 IPC 抓图串包。"""
-    with _SCREEN_CAP_LOCK:
-        return np.ascontiguousarray(
-            current_player.ipc_capture_display(), dtype=np.uint8
+    """抓一张当前画面(ndarray);抓不到(掉线/锁被挂死方占用)返回 None。
+
+    抓图串行化,避免与看门狗线程的 IPC 抓图串包;但必须限时拿锁 —— 2026-10-20
+    凌晨场实测 MuMu 掉线时 IPC 调用挂死不返回,with 拿锁会无限等(见
+    _CAP_LOCK_TIMEOUT_S 注释)。调用方(生命/暂停检测)对 None 都有兜底。
+    """
+    if not _SCREEN_CAP_LOCK.acquire(timeout=_CAP_LOCK_TIMEOUT_S):
+        logging.debug(
+            "抓图锁 %.0fs 拿不到,持锁方疑似挂死在 IPC 上,本帧跳过",
+            _CAP_LOCK_TIMEOUT_S,
         )
+        return None
+    try:
+        frame = current_player.ipc_capture_display()
+        if frame is None:
+            return None
+        return np.ascontiguousarray(frame, dtype=np.uint8)
+    finally:
+        _SCREEN_CAP_LOCK.release()
 
 
 def _pause_dialog_on_screen(context, screen=None) -> bool:
@@ -2096,7 +2163,14 @@ class Play(CustomAction):
             #  「退出」就 stop,任务结束在主界面,后续三抽正好从主页起手)
             return CustomAction.RunResult(False)
         except Exception as e:
-            logging.error(f"Failed when play song: {e}", stack_info=True)
+            if isinstance(e, OSError):
+                # MuMu 掉线时 minitouch 的 socket 随 adb forward 隧道一起断开,
+                # Windows 上 sendall 报 WSAEINVAL([Errno 22] Invalid argument),
+                # 不是代码 bug(2026-10-19 实测:模拟器掉线后只剩这条报错)。栈在
+                # MAA 的 C 回调边界只剩两行,stack_info 没有增量信息,不再打。
+                logging.error("模拟器连接断开,打歌中止(%s)", e)
+            else:
+                logging.error(f"Failed when play song: {e}", stack_info=True)
             return CustomAction.RunResult(False)
 
 
@@ -2140,6 +2214,25 @@ def _has_title_prefix(title: str) -> bool:
     return bool(title) and title.lstrip().translate(_TITLE_BRACKET_TRANS).startswith("[")
 
 
+_TITLE_CLOSERS = "）)】」』]"
+_TITLE_OPENERS = "（([【「『"
+
+
+def _has_title_suffix(title: str) -> bool:
+    """标题是否带**尾部**括注(`(月島まりなver.)` / `(平行歌曲)` / `（支持3D演出模式）`)。
+
+    与 `_has_title_prefix` 同款思路:只判断"结尾是不是闭括号类字符且前面还有
+    开括号",不要求配对(OCR 读错括号很常见)。2026-10-21 实测:#24 与
+    「ときめきエクスペリエンス！(月島麻里奈ver.)」(#786/#790)是不同谱面,
+    OCR 读出带后缀的完整标题时,基础曲凭部分匹配 90 分压过变体 → 错配整首。
+    """
+    t = (title or "").rstrip()
+    if len(t) < 2 or t[-1] not in _TITLE_CLOSERS:
+        return False
+    idx = max(t.find(c, 1) for c in _TITLE_OPENERS)
+    return idx > 0
+
+
 def _normalize_title(title: str) -> str:
     """标题归一:NFKC(全角→半角、兼容字符拆解)。
 
@@ -2165,6 +2258,8 @@ def fuzzy_match_song(name, other_names=()):
        1485 音符 vs `キズナミュージック♪` 436 音符,见上方常量注释)。
     2. **NFKC 归一** —— 见 `_normalize_title`。
     3. **读数权重** = `len(读数) / 最长读数长度` —— 把"丢字多的那个读数"降权。
+       (2026-10-21 新增第 4 条:**尾部括注分池**,见下方 `query_has_suffix`
+       注释 —— 「ときめきエクスペリエンス！(月島麻里奈ver.)」实测事故。)
 
        为什么需要它:`ぎゅっDAYS♪` 在真实日志里,日文模型读成 `ぎゅっＤＡYＳト`,
        默认模型读成 `DAYS`。`DAYS` 恰好是 #120 的**完整标题**,满分 100;而正确条目
@@ -2204,6 +2299,18 @@ def fuzzy_match_song(name, other_names=()):
         return best
 
     same_class = [k for k in candidates if _has_title_prefix(k) == query_has_prefix]
+    # 后缀分池(2026-10-21):与前缀分池镜像 —— 读数带尾部括注(如
+    # 「…（月島麻里奈vék）」)时,括注信息是屏上真实存在的,带后缀的变体
+    # (#786/#790)才是正确目标;无后缀的基础曲(#24)靠"长查询被包含"的
+    # 部分匹配 90 分压过变体 → 整首按错谱面。读数**不带**后缀时不收窄
+    # (OCR 截断是双向的,基础曲读法保持原行为)。
+    query_has_suffix = _has_title_suffix(name) or (
+        bool(other_names) and _has_title_suffix(other_names[0])
+    )
+    if query_has_suffix:
+        suffixed = [k for k in same_class if _has_title_suffix(k)]
+        if suffixed and len(suffixed) != len(same_class):
+            same_class = suffixed
     if same_class and len(same_class) != len(candidates):
         hit = best_of(same_class)
         if hit is not None and hit[1] >= _POOL_SCORE_FLOOR:
@@ -2412,8 +2519,121 @@ def _reload_photogate():
         logging.debug("Failed to reload photogate: {}".format(e))
 
 
+def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
+    """歌结束后,把「服务端实际执行时刻 vs 谱面理想时间线」的滞后曲线写进日志。
+
+    背景:FULL 曲后半段越打越慢、批量出 SLOW(2026-10-21 11:43 场,[FULL]
+    FIRE BIRD slow≈104,而同 photogate=43ms 的短歌全 PERFECT)。下发链各环节
+    的可观测补偿值(Adjust offset / total_cost 尖峰)全程平稳、photogate 恒定,
+    唯独「服务端执行时间线本身的滞后累计」从未直接测过 —— minitouch jlog 为
+    每条命令上报 start/end(服务端时钟),cmd_log_list 一直在存,但没消费过。
+    判读(下一场实测):
+      - 曲内增长(lag@100% - lag@10%)≈0 而 SLOW 仍复现 → 游戏侧(模拟器
+        音频/渲染时钟相对墙钟漂移、游戏主线程停顿)实锤;
+      - 增长随曲长/批次数上升(几十 ms 级)→ 本机下发链补偿不足,按斜率修。
+    只在歌结束后由 daemon 线程跑,不碰发布时序;生命耗尽/暂停中断提前退出的
+    局不采(需要完整一首才有意义)。chart_actions 在调用点先取好引用 —— 下一
+    首歌会整体换掉 current_chart,worker 里不能再读全局。
+
+    理想时间线的重建规则必须与 actions_to_MNTcmd 的实际发射一致:
+      - 动作流 = [action, wait, action, wait, ...](wait.length = 相邻动作谱面
+        时间差,即理想间隔,补偿只改实际值不改理想值);
+      - finger=None 的 d/m/u 在发射前被丢弃(见 actions_to_MNTcmd 注释);
+      - wait 取整后 >0.01 才发射(理想流同条件);commit 不参与对齐。
+    """
+    def _worker():
+        try:
+            # 发布线程领先 2~5s,jlog 按服务端执行节奏回传 —— 必须等静默才能
+            # 拿到曲尾数据。下一首歌开始时 cmd_log_list 会被清空,所以每轮整表
+            # 快照、保留最长一份;发现列表变短(已被下一首 reset)就停。
+            best = []
+            last_growth = time.perf_counter()
+            t0 = last_growth
+            while time.perf_counter() - t0 < 20.0:
+                with cmd_log_list_lock:
+                    snap = list(cmd_log_list)
+                if len(snap) > len(best):
+                    best = snap
+                    last_growth = time.perf_counter()
+                elif len(best) and len(snap) < len(best):
+                    break
+                if time.perf_counter() - last_growth >= 1.0:
+                    break
+                time.sleep(0.2)
+            events = best
+            if len(events) < 50:
+                return
+
+            # 重建理想发射序列 [(type, ideal_ms), ...]。commit('c') 不参与
+            # 对齐:它的条数受补偿取整影响(理想流里的 'c' 实际可能没发,
+            # publish 的尾部 commit 恒定但与 action 无关),'d/m/u/w' 才携带
+            # 时间信息 —— jlog 侧的 'c' 在下面直接跳过。
+            t0_chart = chart_actions[0]["time"]
+            ideal = []
+            ideal_t = t0_chart
+            for a in chart_actions:
+                at = a["type"]
+                if at == "wait":
+                    # 发射条件与 actions_to_MNTcmd 一致(取整后 >0.01 才发)
+                    if round(a["length"]) > 0.01:
+                        ideal.append(("w", ideal_t))
+                        ideal_t += a["length"]
+                elif a.get("finger", None) is None:
+                    continue
+                else:
+                    ideal.append((at, ideal_t))
+
+            base = events[0].start_time
+            lags = []
+            miss = 0
+            j = 0
+            for ev in events:
+                et = ev.cmd.split(" ")[0]
+                if et == "c":
+                    continue
+                if j < len(ideal) and et != ideal[j][0]:
+                    # 实际流比理想流少了紧随其后的命令(wait 取整差异导致没发)
+                    # 时,向前找最多 3 个理想项重新对齐;找不到按多余事件丢弃。
+                    k = j + 1
+                    while k < len(ideal) and k - j <= 3 and ideal[k][0] != et:
+                        k += 1
+                    if k < len(ideal) and k - j <= 3:
+                        miss += k - j
+                        j = k
+                    else:
+                        miss += 1
+                        continue
+                if j >= len(ideal):
+                    miss += 1
+                    continue
+                lags.append(ev.start_time - base - (ideal[j][1] - t0_chart))
+                j += 1
+            if len(lags) < 50 or miss > 0.02 * len(events):
+                logging.warning(
+                    "服务端执行滞后[%s]: 对齐失配过高(miss=%d, events=%d, ideal=%d), 本局不采",
+                    song_label, miss, len(events), len(ideal),
+                )
+                return
+            n = len(lags)
+            v = [lags[min(n - 1, int(n * p))] for p in (0.1, 0.5, 0.9, 1.0)]
+            logging.info(
+                "服务端执行滞后[%s]: 命令 %d 条(失配 %d), lag@10%%=%.1f @50%%=%.1f "
+                "@90%%=%.1f @100%%=%.1f ms, 曲内增长=%.1fms",
+                song_label, len(events), miss, v[0], v[1], v[2], v[3], v[3] - v[0],
+            )
+        except Exception as e:
+            logging.warning("服务端执行滞后统计失败(%s): %s", song_label, e)
+
+    threading.Thread(
+        target=_worker, daemon=True, name="server-lag-dump"
+    ).start()
+
+
 def play_song(context=None):
-    logging.info("Start play")
+    # 每首真正开打时 +1:这里才是"第几首"的唯一可靠计数点(见 _song_play_seq 注释)。
+    global _song_play_seq
+    _song_play_seq += 1
+    logging.info("开始打歌 · 第 %d 首", _song_play_seq)
     _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
@@ -2528,32 +2748,42 @@ def play_song(context=None):
                 # 本拍只抓一张图,生命检测与暂停检测共用(抓图实测 ~5ms,
                 # 一秒抓两次纯属浪费,而且会吃掉下一批音符的时间预算)
                 frame = _grab_screen()
-                life_result = _life_exhausted_on_screen(context, frame)
-                life_stats["checks"] += 1
-                # 注意:_life_exhausted_on_screen 返回的状态名与统计键名不同名
-                # (函数给 "precheck_rejected",统计键是 "precheck"),早期写法是
-                # 直接 life_stats[life_result] 索引 → 亮度预检一拒绝就 KeyError,
-                # 整首歌被判失败(2026-09-16 11:47 实跑:6 首在首音触发后约 30ms
-                # 全部被这条分支终结)。改显式分支,新增状态也不会再炸。
-                if life_result == "hit":
-                    life_stats["hit"] += 1
-                elif life_result == "precheck_rejected":
-                    life_stats["precheck"] += 1
-                elif life_result == "error":
+                # 2026-10-20 凌晨场:掉线时 IPC 挂死/返回 None,_grab_screen 会
+                # 返回 None —— 不能 continue(会跳过循环尾的 sleep 与下一批
+                # 计算,重复发布当前命令),也不能把 None 传进检测函数(内部会
+                # 白重抓一次,每拍最多卡 2s)。本拍只记 error 交给看门狗的掉线
+                # 短路径收尾,循环继续走完 sleep 与下一批计算。
+                if frame is None:
                     life_stats["error"] += 1
-                if life_result == "hit":
-                    logging.info("打歌中生命值耗尽,提前结束本次演出")
-                    _log_life_stats()
-                    raise LifeExhaustedDetected()
-                # 暂停弹窗(2026-10-17 用户实况):不点「中断」这一局永远挂着。
-                # 复用同一个 1s 检测节拍,模板匹配本身很便宜;检测耗时同样从
-                # sleep 预算里扣,不影响下一批音符的时间线。
-                if _pause_dialog_on_screen(context, frame):
-                    _log_life_stats()
-                    _interrupt_paused_live(context)
-                    raise LivePauseInterrupted()
-                sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
-                last_life_check = time.perf_counter()
+                    last_life_check = time.perf_counter()
+                    sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+                else:
+                    life_result = _life_exhausted_on_screen(context, frame)
+                    life_stats["checks"] += 1
+                    # 注意:_life_exhausted_on_screen 返回的状态名与统计键名不同名
+                    # (函数给 "precheck_rejected",统计键是 "precheck"),早期写法是
+                    # 直接 life_stats[life_result] 索引 → 亮度预检一拒绝就 KeyError,
+                    # 整首歌被判失败(2026-09-16 11:47 实跑:6 首在首音触发后约 30ms
+                    # 全部被这条分支终结)。改显式分支,新增状态也不会再炸。
+                    if life_result == "hit":
+                        life_stats["hit"] += 1
+                    elif life_result == "precheck_rejected":
+                        life_stats["precheck"] += 1
+                    elif life_result == "error":
+                        life_stats["error"] += 1
+                    if life_result == "hit":
+                        logging.info("打歌中生命值耗尽,提前结束本次演出")
+                        _log_life_stats()
+                        raise LifeExhaustedDetected()
+                    # 暂停弹窗(2026-10-17 用户实况):不点「中断」这一局永远挂着。
+                    # 复用同一个 1s 检测节拍,模板匹配本身很便宜;检测耗时同样从
+                    # sleep 预算里扣,不影响下一批音符的时间线。
+                    if _pause_dialog_on_screen(context, frame):
+                        _log_life_stats()
+                        _interrupt_paused_live(context)
+                        raise LivePauseInterrupted()
+                    sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
+                    last_life_check = time.perf_counter()
             else:
                 # 本批切片太密,扣掉检测耗时会把下一批发晚,只能跳过这一轮。
                 # 偶发跳过无妨,连续跳过就意味着这段时间的弹窗不会被发现。
@@ -2585,6 +2815,7 @@ def play_song(context=None):
         else:
             break
     _log_life_stats()
+    _dump_server_lag_async(current_song_name, current_chart.actions)
     time.sleep(2)
 
 
@@ -3478,15 +3709,35 @@ def _run_daily_flow(entry: str) -> None:
         # 平时一两首就够 —— 三抽要么做完(daily_pull_done)要么因"未完成每日演出"
         # 不可抽(daily_pull_locked),两者都会置 _daily_pull_done。
         confirmed = False
+        no_play_streak = 0
         for round_no in range(1, _DAILY_MAX_ROUNDS + 1):
             _daily_fire_exhausted = False
-            logging.info("自动清火:第 %d 轮打歌" % round_no)
+            seq_before = _song_play_seq
+            # 这里不再打「第 N 轮打歌」:轮次编号改由 play_song 按实际开打顺序打
+            # (用户 2026-10-17:旧编号与真实顺序对不上,且连打阶段一个任务打多首
+            #  根本没有轮次行,不如统一成每首一行的「开始打歌 · 第 N 首」)。
             try:
                 maatasker.post_task("main", _get_override_pipeline()).wait().get()
             except Exception as e:
                 # main 异常终止(识别不到界面等):不再重试,直接收尾
                 logging.warning("打歌阶段异常结束(%s),停止循环", e)
                 break
+            if _song_play_seq == seq_before and not _daily_fire_exhausted:
+                # main 正常返回但一首都没开打:断头链 —— 弹窗类节点没有 next,
+                # 链中途命中把任务"成功"带走(见 _MAIN_NO_PLAY_MAX 注释)。
+                # 点掉弹窗后重试即可继续;超过容忍次数才停,防异常画面死循环。
+                no_play_streak += 1
+                if no_play_streak >= _MAIN_NO_PLAY_MAX:
+                    logging.warning(
+                        "打歌入口连续 %d 次提前结束,停止清火流程", no_play_streak
+                    )
+                    break
+                logging.info(
+                    "打歌入口提前结束(未进入演出,可能被弹窗打断),重试 %d/%d",
+                    no_play_streak, _MAIN_NO_PLAY_MAX,
+                )
+                continue
+            no_play_streak = 0
             if _daily_fire_exhausted:
                 # 火罐不足:本阶段收工(三抽留到收尾复核)。
                 # 选项名叫「停在游戏主界面」,而管线里的 stop 只是停在选曲确认页,
@@ -3495,7 +3746,8 @@ def _run_daily_flow(entry: str) -> None:
                 # 一条带火量的(用户 2026-10-17 反馈两行一模一样,冗余)。
                 _return_to_home("火罐不足")
                 break
-            if not _pull("第 %d 首打完" % round_no):
+            # 用实际开打的序号(不是阶段A 的 round_no):阶段1 可能已经打过一首。
+            if not _pull("第 %d 首打完" % _song_play_seq):
                 break
             if _daily_pull_done:
                 confirmed = True
@@ -3526,12 +3778,35 @@ def _run_daily_flow(entry: str) -> None:
         # 收尾复核:三抽前面已确认做完也再验一次(用户 2026-10-17 要求"保险起见")
         _pull("收尾复核", force=True)
     elif _DAILY_CLEAR_FIRE:
-        # 纯清火(没勾三抽):main 自己循环打到火尽,只跑一次
+        # 纯清火(没勾三抽):main 自己循环打到火尽。main 可能因断头弹窗(节点无
+        # next)一首都没打就"成功"返回(2026-10-19 教程弹窗实测),此时重试而不是
+        # 静默收工;超过 _MAIN_NO_PLAY_MAX 次视为入口不可用,停止清火。
         logging.info("自动清火:进入打歌循环,火量耗尽后日常停止")
-        try:
-            maatasker.post_task("main", _get_override_pipeline()).wait().get()
-        except Exception as e:
-            logging.warning("打歌阶段异常结束(%s)", e)
+        no_play_streak = 0
+        while True:
+            seq_before = _song_play_seq
+            try:
+                maatasker.post_task("main", _get_override_pipeline()).wait().get()
+            except Exception as e:
+                logging.warning("打歌阶段异常结束(%s)", e)
+                break
+            if _daily_fire_exhausted:
+                break
+            if _song_play_seq == seq_before:
+                # 一首都没打:断头弹窗把 main"成功"带走了,重试(见阶段A 同款逻辑)
+                no_play_streak += 1
+                if no_play_streak >= _MAIN_NO_PLAY_MAX:
+                    logging.warning(
+                        "打歌入口连续 %d 次提前结束,停止清火流程", no_play_streak
+                    )
+                    break
+                logging.info(
+                    "打歌入口提前结束(未进入演出,可能被弹窗打断),重试 %d/%d",
+                    no_play_streak, _MAIN_NO_PLAY_MAX,
+                )
+                continue
+            # 打到歌了:纯清火的 main 走原生连打链,一次调用就打到火尽,无需再循环
+            break
         if _daily_fire_exhausted:
             # 与交替模式一致:火尽后退回游戏主界面(选项名承诺的落点)。
             # 「火罐不足」的日志由 HandleLiveBoost 打,这里不重复。

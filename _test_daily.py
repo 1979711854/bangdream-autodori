@@ -43,13 +43,18 @@ class FakeTasker:
     boost_zero=True 时模拟「阶段1 的火罐检查发现火罐为 0」:
     daily 任务里 daily_boost_check 会把 A._daily_boost_zero 置位。
     fire_out=True 时模拟「打歌中火量不足」:main 任务里 HandleLiveBoost
-    会把 A._daily_fire_exhausted 置位。
+    在选曲确认页就 stop,没真正开打,_song_play_seq 不增长。
+    play=True(默认)时 main 返回会模拟「至少开打一首」(_song_play_seq += 1):
+    2026-10-19 起外层以序号是否增长识别断头弹窗(main 正常返回但没打歌),
+    桩必须跟真实行为一致,否则会被误判成断头而重试。
+    play=False 专门模拟断头弹窗(main 没打歌就"成功"返回)。
     """
 
-    def __init__(self, boost_zero=False, fire_out=False):
+    def __init__(self, boost_zero=False, fire_out=False, play=True):
         self.posted = []
         self.boost_zero = boost_zero
         self.fire_out = fire_out
+        self.play = play
 
     def post_task(self, node, pipeline=None):
         self.posted.append(node)
@@ -57,6 +62,8 @@ class FakeTasker:
             A._daily_boost_zero = True
         if node == "main" and self.fire_out:
             A._daily_fire_exhausted = True
+        if node == "main" and self.play and not self.fire_out:
+            A._song_play_seq += 1
 
         class _R:
             def wait(self_):
@@ -90,11 +97,35 @@ def test_flow_gating():
             A._daily_boost_zero = False
             A._daily_fire_exhausted = False
             A._daily_pull_done = False
+            A._song_play_seq = 0
             A._DAILY_CLEAR_FIRE = clear
             A._DAILY_FREE_PULL = pull
             A._DAILY_PULL_EACH_SONG = clear and pull
             A._run_daily_flow("daily")
             check("清火=%s 三抽=%s -> 跑的节点" % (clear, pull), fake.posted, want)
+
+
+def test_no_play_retry():
+    print("=== 1d. 断头弹窗:main 没打歌就返回时重试(2026-10-19 教程弹窗实测) ===")
+    # 背景:教程弹窗 tutorial_close 等弹窗节点没有 next,main 链中途命中会把
+    # 任务"成功"带走,一首都没打 —— 旧逻辑下纯清火模式静默收工。新逻辑以
+    # _song_play_seq 是否增长为判据,重试到 _MAIN_NO_PLAY_MAX 次才收工。
+    fake = FakeTasker(play=False)
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 10):
+        A._song_play_seq = 0
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = False
+        A._DAILY_PULL_EACH_SONG = False
+        A._run_daily_flow("daily")
+    # 第 1 次断头后重试 2 次,第 3 次到上限 -> 按异常收工,纯清火无三抽
+    check("断头弹窗 -> main 重试到上限后收工",
+          fake.posted, ["daily", "main", "main", "main"])
 
 
 def test_boost_zero_stops_daily():
@@ -579,6 +610,7 @@ def test_select_live_home_back():
 
 def main():
     test_flow_gating()
+    test_no_play_retry()
     test_pull_each_song_mode()
     test_boost_zero_stops_daily()
     test_select_live_home_back()

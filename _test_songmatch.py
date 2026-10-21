@@ -60,6 +60,7 @@ def load_under_test():
     wanted_consts = {
         "_TITLE_BRACKETS", "_TITLE_BRACKET_TRANS", "_POOL_SCORE_FLOOR",
         "_SONG_LEVEL_ROI", "_DIFFICULTY_ORDER",
+        "_TITLE_CLOSERS", "_TITLE_OPENERS",
     }
     segments = []
     for node in tree.body:
@@ -77,7 +78,8 @@ def load_under_test():
             s in seg for s in seeds
         ):
             segments.append(seg)
-    for fn in ("_has_title_prefix", "_normalize_title", "fuzzy_match_song",
+    for fn in ("_has_title_prefix", "_has_title_suffix", "_normalize_title",
+               "fuzzy_match_song",
                "_song_level", "_candidate_ids", "_pick_song_id"):
         node = next(
             n
@@ -105,6 +107,7 @@ NS = load_under_test()
 INDEX = NS["all_song_name_indexes"]
 match_song = NS["fuzzy_match_song"]
 has_prefix = NS["_has_title_prefix"]
+has_suffix = NS["_has_title_suffix"]
 AMBIGUOUS = NS["ambiguous_titles"]
 SONGS = NS["all_songs"]
 
@@ -178,6 +181,11 @@ CASES = [
     ("final phase", "275", "275"),
     ("キズナミュージック♪", "158", "158"),
     ("[FULL] キズナミュージック♪", "249", "249"),
+    # 2026-10-21 实测(debug/autodori-20261021-102041.log 10:24:43):
+    # 屏显「ときめきエクスペリエンス！（月島麻里奈ver.）」,ja 模型读全,
+    # 旧逻辑把无后缀基础曲(#24)的 90 分部分匹配压过变体 → 错配整首。
+    # 期望命中 #786/#790 之一(同一首歌的简中/日文条目,hard 谱面等级相同)。
+    ("ときめきエクスペリエンス！（月島麻里奈vék）", "24", "786/790"),
 ]
 
 
@@ -220,7 +228,11 @@ def test_corpus_table():
         if base != got:
             changed.append((text, base, got))
         if got != want_id:
-            check(False, "%r 期望 #%s, 实际 #%s" % (text[:30], want_id, got))
+            # "786/790" 形式 = 同一首歌的多个条目,命中其一即可
+            if "/" in str(want_id) and got in str(want_id).split("/"):
+                check(True, "%r #%s (变体组 %s 之一)" % (text[:30], got, want_id))
+            else:
+                check(False, "%r 期望 #%s, 实际 #%s" % (text[:30], want_id, got))
         elif base != got:
             check(True, "%r #%s -> #%s (修正)" % (text[:30], base, got))
     changed_set = {t for t, _, _ in changed}
@@ -268,6 +280,38 @@ def test_self_consistency():
             wrong += 1
             print("      日文键错配: %r (应 #%s, 实 #%s)" % (key[:30], sid, got))
     check(wrong == 0, "日文键抽样 %d 条全部回到自己" % len(sample))
+
+
+def test_suffix_classifier():
+    print("\n[6] 尾部括注判定(2026-10-21 ときめき 变体事故)")
+    cases = [
+        ("ときめきエクスペリエンス！（月島麻里奈vék）", True),
+        ("ときめきエクスペリエンス！ (月島まりなver.)", True),
+        ("灼熱 Bonfire!(平行歌曲)", True),
+        ("キズナミュージック♪（支持3D演出模式）", True),
+        ("ときめきエクスペリエンス！", False),          # 基础曲无后缀
+        ("[FULL] キズナミュージック♪", False),          # 前缀不是后缀
+        ("（支持3演出模式）", False),                    # 整条都是括注片段(读数)
+        ("", False),
+    ]
+    for text, want in cases:
+        check(has_suffix(text) == want, "后缀判定 %r -> %s" % (text[:28], want))
+
+
+def test_tokimeki_variant():
+    print("\n[8] ときめきエクスペリエンス! 变体错配(2026-10-21 实测原文)")
+    # ja 模型读出完整标题(含后缀,vék=ver. 误读);旧逻辑命中基础曲 #24 →
+    # 按另一张谱面打整首。期望命中变体组 #786/#790 之一。
+    hit = match_song("ときめきエクスペリエンス！（月島麻里奈vék）")
+    got = song_id(hit[0])
+    check(got in ("786", "790"), "单读数(含后缀) -> #%s (%r, %.0f 分)" % (got, hit[0][:30], hit[1]))
+    # 真实两路读数:default 模型只剩片段「！月岛麻里ver.）」
+    hit2 = match_song("ときめきエクスペリエンス！（月島麻里奈vék）", ["！月岛麻里ver.）"])
+    got2 = song_id(hit2[0])
+    check(got2 in ("786", "790"), "两路读数 -> #%s" % got2)
+    # 基础曲读法不受影响:真的抽到原版时仍命中 #24
+    hit3 = match_song("ときめきエクスペリエンス！")
+    check(song_id(hit3[0]) == "24", "无后缀读数仍命中基础曲 #%s" % song_id(hit3[0]))
 
 
 def test_two_model_readings():
@@ -365,10 +409,12 @@ def test_index_integrity():
 if __name__ == "__main__":
     print("索引规模: %d (改动前 %d)" % (len(INDEX), len(BASE_INDEX)))
     test_prefix_classifier()
+    test_suffix_classifier()
     test_reported_bug()
     test_corpus_table()
     test_self_consistency()
     test_two_model_readings()
+    test_tokimeki_variant()
     test_ambiguous_resolution()
     test_index_integrity()
     print("\n通过 %d 项, 失败 %d 项" % (len(passed), len(failed)))
