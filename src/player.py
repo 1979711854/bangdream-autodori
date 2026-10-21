@@ -23,8 +23,14 @@ class Player:
                 self.display_id = self.player.ipc_get_display_id(
                     "com.bilibili.star.bili"
                 )
+            frame = self.player.ipc_capture_display(self.display_id)
+            if frame is None:
+                # 2026-10-20 凌晨场:MuMu 掉线时 IPC 返回 None,原代码直接
+                # [:, :, :3] 下标报 'NoneType' object is not subscriptable,
+                # 从错误看不出是掉线。显式返回 None,由调用方按"抓不到"处理。
+                return None
             # RGBA -> RGB
-            return self.player.ipc_capture_display(self.display_id)[:, :, :3]
+            return frame[:, :, :3]
         else:
             # RGB
             return self.player.capture()
