@@ -2783,6 +2783,11 @@ def play_song(context=None):
                     if life_result == "hit":
                         logging.info("打歌中生命值耗尽,提前结束本次演出")
                         _log_life_stats()
+                        # 提前退出的局同样输出服务端执行滞后:生命耗尽往往就是
+                        # 锚点/时序问题,这份数据正是定位要用的(正常局才有会
+                        # 漏掉全部失败局)。jlog 由 reader 线程持续回传,daemon
+                        # 线程自行等静默,不阻塞本线程抛异常走 on_error。
+                        _dump_server_lag_async(current_song_name, current_chart.actions)
                         raise LifeExhaustedDetected()
                     # 暂停弹窗(2026-10-17 用户实况):不点「中断」这一局永远挂着。
                     # 复用同一个 1s 检测节拍,模板匹配本身很便宜;检测耗时同样从
@@ -2891,6 +2896,7 @@ def wait_first_note():
     # 会被确认逻辑当成"候选掉落"丢弃 → 首音被拖后数秒 → 整首全 MISS。已撤回,
     # 恢复"越阈值即触发"。问题A 复现靠下面的每帧 wfT 日志定位。
     _log_t = 0.0
+    _snap_start_done = False  # 起始帧截图只拍一次
 
     def _log_trigger(cross_t, change_score, kind, lanes=0):
         """记录首音触发点,并把「检测带顶部若干行」这个更灵敏的判据本来会在
@@ -2908,6 +2914,26 @@ def wait_first_note():
             "首音触发[%s]: band %.0fms change=%.2f, %d/7 轨变化, 顶部%d行 %s %s",
             kind, band_ms, change_score, lanes, edge_count, edge_desc, lead,
         )
+
+    def _snap(tag):
+        """关键瞬间抓一帧存 debug/firstnote/,人工核对首音锚点用(纯诊断:
+        daemon 线程异步抓,不参与判定、不占打歌时序)。#462 这类「触发签名
+        和真音符一模一样却整首崩」的局面,只有看截图才能分辨锚点偏早还是
+        偏晚 —— 截图里判定线上有没有音符、轨道上音符走到哪,一眼可判。"""
+        def _worker():
+            try:
+                frame = current_player.ipc_capture_display()
+                if frame is None:
+                    return
+                os.makedirs("debug/firstnote", exist_ok=True)
+                name = "debug/firstnote/%s-%s.jpg" % (
+                    time.strftime("%H%M%S"), tag)
+                # IPC 帧是 RGB,cv2 要 BGR
+                cv2.imwrite(name, frame[:, :, :3][:, :, ::-1])
+                logging.debug("首音诊断截图: %s", name)
+            except Exception as e:  # noqa: BLE001 —— 诊断截图绝不能影响打歌
+                logging.debug("首音诊断截图失败(%s): %s", tag, e)
+        threading.Thread(target=_worker, daemon=True, name="firstnote-snap").start()
 
     def _maybe_log(change_score, band_avg, note=""):
         """每帧 change_score 日志(问题A 复现用):静默期 ≤10 行/秒,变化显著或
@@ -2978,6 +3004,9 @@ def wait_first_note():
             for r in range(from_row, to_row + 1):
                 avg, _ = evaluate_row_color(screen, r)
                 rows[r - from_row] = avg
+            if not _snap_start_done:
+                _snap_start_done = True
+                _snap("start")
             band_avg = rows.mean(axis=0)
             edge_avg = rows[:edge_count].mean(axis=0)
             lane_avg = _lane_avgs(screen)
@@ -3103,6 +3132,7 @@ def wait_first_note():
                         ),
                     )
                     _log_trigger(cross_t, change_score, "interp", lanes_changed)
+                    _snap("trigger")
                     time.sleep(max(0, wait_ms) / 1000)
                     break
                 elif change_score >= CHANGE_THRESHOLD:
@@ -3117,6 +3147,7 @@ def wait_first_note():
                         "trigger(direct {:.2f})".format(change_score),
                     )
                     _log_trigger(frame_t, change_score, "direct", lanes_changed)
+                    _snap("trigger")
                     time.sleep(max(0, wait_ms) / 1000)
                     break
             prev_change = change_score
