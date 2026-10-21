@@ -279,10 +279,12 @@
   被删后 build.py 报 "no usable binaries" 且 minitouch.zip 本机下载有证书
   问题。恢复办法:从任一已发布 zip 里取 `assets/minitouch_EvATive7`
   (2026-10-21 曾从 rc2 包恢复过一次)。
-- **v1.3.3 发布状态(2026-10-21 晚)**:用户删过远端 tag+Release 后重发 ——
-  tag v1.3.3 现指向 78411b9(含首音轨道判别修复),CI 自动重发 Release。
-  b4f32c6(首音截图取证)在其后,**不在 tag 包内**;本地 dist 的 zip 是
-  最新的。下次发版时把 tag 移到最新提交即可(用户删过旧 tag 的先例)。
+- **v1.3.3 发布状态(2026-10-21 晚,二次重发)**:当晚因「栞」选歌死循环
+  修复(commit 3b305fa)再次删旧 Release+tag 重发 —— tag v1.3.3 现指向
+  3b305fa(含首音轨道判别、首音截图取证、栞形近字归一全部修复),CI 自动重发
+  Release(标题/正文/资产均已核对)。本地 dist 的 zip 与仓库根两个 exe 同步为
+  最新,`_chk_exe.py --grep _OCR_TITLE_MISREAD` 核对通过。发版文本三处均已加
+  「修复部分单字歌名曲目无法选中的问题」。
 - git 提交用 Conventional Commits 中文描述;注释写清背景原因(本仓库风格)。
 
 ## 9. 2026-10-17 的改动与当前状态
