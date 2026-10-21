@@ -306,14 +306,14 @@ class _StuckWatchdog(NotificationHandler):
             # 按完给同样长的观察窗口,否则 4s 冷却一过就会立刻连按
             self._observe_until = now + _WATCHDOG_STATIC_S
             logging.warning(
-                "卡死看门狗:%.0fs 内画面和脚本都没有任何进展,疑似卡在弹窗/未知界面,"
+                "卡死自动恢复:%.0fs 内画面和脚本都没有任何进展,疑似卡在弹窗/未知界面,"
                 "按返回键(%d/%d)",
                 _WATCHDOG_STATIC_S, self._backs, _WATCHDOG_MAX_BACKS,
             )
             _adb_shell(["input", "keyevent", "4"])
             return False
         logging.warning(
-            "卡死看门狗:按了 %d 次返回键画面仍然没有变化,停止任务",
+            "卡死自动恢复:按了 %d 次返回键画面仍然没有变化,停止任务",
             _WATCHDOG_MAX_BACKS,
         )
         _force_post_stop()
@@ -1467,7 +1467,7 @@ def _start_stuck_watchdog() -> None:
         target=_watchdog_loop, name="stuck-watchdog", daemon=True
     ).start()
     logging.info(
-        "卡死看门狗已启动(画面与脚本连续 %.0fs 都没有进展判定卡死,"
+        "卡死自动恢复已启动(画面与脚本连续 %.0fs 都没有进展判定卡死,"
         "最多按 %d 次返回键)",
         _WATCHDOG_STATIC_S, _WATCHDOG_MAX_BACKS,
     )
@@ -2832,7 +2832,9 @@ def wait_first_note():
     t_start = time.perf_counter()
     last_avg = None
     waited_frames = 0
-    info = get_runtime_info(current_player.resolution)["wait_first"]
+    _runtime = get_runtime_info(current_player.resolution)
+    info = _runtime["wait_first"]
+    _lane_info = _runtime["lane"]
     from_row, to_row = info["from"], info["to"]
     freezed = False
     row_count = to_row - from_row + 1
@@ -2861,16 +2863,40 @@ def wait_first_note():
     FIRST_NOTE_GRACE_MS = 500
     _freeze_done_t = None
 
+    # 场景切换误触发修复(2026-10-21,连打第二首首音不对的根因):
+    # 冻结完成后、真首音到来前,演出画面才「激活」(轨道亮起/READY 等)或转场,
+    # 检测带出现一次整带跳变 —— 被当成首音 → 时间线整体早 ~2-3s → 开局全 miss
+    # → 生命耗尽(实测 #462 两连崩,触发前带内静默 2.1s 后单帧 0→9.12;
+    # 谱面首音 2727ms,锚点早了约 2.7s)。区分依据:音符只占 1 条轨道宽,
+    # 场景变化会同时改动几乎所有轨道 —— 按轨道分组算变化,≥5/7 轨同时变的
+    # 越阈值一律视为场景切换,重置基线继续等真音符。
+    SCENE_MIN_LANES = 5    # 同时变化达到该轨道数 → 判为场景切换
+    LANE_CHANGE_MIN = 1.0  # 单轨变化量达到该值计入"变化轨道"
+    last_lane_avg = None   # 上一帧各轨道(检测带内)平均色,与 last_avg 同步维护
+
+    def _lane_avgs(scr):
+        """检测带各轨道的平均色,shape=(7,3)。轨道 x 范围来自 util 的 lane 配置。"""
+        x0, w = _lane_info["start_x"], _lane_info["w"]
+        return np.array(
+            [
+                scr[from_row : to_row + 1, x0 + i * w : x0 + (i + 1) * w]
+                .mean(axis=(0, 1))
+                for i in range(7)
+            ]
+        )
+
+
     # 注意:曾尝试"越阈值后持续变化 CONFIRM_MS 毫秒确认再触发"(问题A 防误触发),
     # 但真音符进入检测带只产生一帧大变化(音符进入),之后带内下移帧间变化 <3.0,
     # 会被确认逻辑当成"候选掉落"丢弃 → 首音被拖后数秒 → 整首全 MISS。已撤回,
     # 恢复"越阈值即触发"。问题A 复现靠下面的每帧 wfT 日志定位。
     _log_t = 0.0
 
-    def _log_trigger(cross_t, change_score, kind):
+    def _log_trigger(cross_t, change_score, kind, lanes=0):
         """记录首音触发点,并把「检测带顶部若干行」这个更灵敏的判据本来会在
         什么时候触发一并记下。两者之差就是现有判据的滞后量 —— 「前几个音符
-        miss」若出在首音判定上,这条日志能直接量化,不必先改触发逻辑去赌。"""
+        miss」若出在首音判定上,这条日志能直接量化,不必先改触发逻辑去赌。
+        lanes = 触发帧里发生变化的轨道数(1-2 轨 = 音符形态,可作诊断)。"""
         band_ms = (cross_t - t_start) * 1000.0
         if edge_cross_t is None:
             edge_desc, lead = "未越阈值", ""
@@ -2879,8 +2905,8 @@ def wait_first_note():
             edge_desc = "%.0fms" % edge_ms
             lead = "(灵敏判据早 %.0fms)" % (band_ms - edge_ms)
         logging.info(
-            "首音触发[%s]: band %.0fms change=%.2f, 顶部%d行 %s %s",
-            kind, band_ms, change_score, edge_count, edge_desc, lead,
+            "首音触发[%s]: band %.0fms change=%.2f, %d/7 轨变化, 顶部%d行 %s %s",
+            kind, band_ms, change_score, lanes, edge_count, edge_desc, lead,
         )
 
     def _maybe_log(change_score, band_avg, note=""):
@@ -2943,6 +2969,7 @@ def wait_first_note():
                 )
                 last_avg = band_avg = None
                 last_edge_avg = None
+                last_lane_avg = None
                 prev_change = None
                 prev_frame_t = None
                 _maybe_log(0.0, (0.0, 0.0, 0.0), "force-timeout")
@@ -2953,6 +2980,13 @@ def wait_first_note():
                 rows[r - from_row] = avg
             band_avg = rows.mean(axis=0)
             edge_avg = rows[:edge_count].mean(axis=0)
+            lane_avg = _lane_avgs(screen)
+            lane_diff = (
+                np.abs(lane_avg - last_lane_avg).sum(axis=1)
+                if last_lane_avg is not None
+                else np.zeros(7)
+            )
+            lanes_changed = int((lane_diff >= LANE_CHANGE_MIN).sum())
             edge_change = (
                 float(np.sum(np.abs(edge_avg - last_edge_avg)))
                 if last_edge_avg is not None
@@ -2993,6 +3027,7 @@ def wait_first_note():
                         )
                 last_avg = band_avg
                 last_edge_avg = edge_avg
+                last_lane_avg = lane_avg
                 _maybe_log(change_score, band_avg)
                 continue
 
@@ -3030,6 +3065,28 @@ def wait_first_note():
                     )
             elif last_avg is not None and prev_change is not None:
                 if prev_change < CHANGE_THRESHOLD <= change_score:
+                    if lanes_changed >= SCENE_MIN_LANES:
+                        # 场景切换/演出画面激活:几乎所有轨道同帧变化,不是音符。
+                        # 重置基线继续等 —— 真首音会在之后以「少数轨道变化」的
+                        # 形态越阈值(见 SCENE_MIN_LANES 注释)。
+                        _maybe_log(
+                            change_score,
+                            band_avg,
+                            "ignored(scene %d/7 lanes)" % lanes_changed,
+                        )
+                        logging.debug(
+                            "首音检测: %.0fms 忽略场景切换(%d/7 轨变化, change=%.2f),"
+                            "继续等真音符",
+                            (frame_t - t_start) * 1000.0,
+                            lanes_changed,
+                            change_score,
+                        )
+                        last_avg = band_avg
+                        last_edge_avg = edge_avg
+                        last_lane_avg = lane_avg
+                        prev_change = change_score
+                        prev_frame_t = frame_t
+                        continue
                     # change crossed the threshold between the last two frames
                     frac = (CHANGE_THRESHOLD - prev_change) / max(
                         change_score - prev_change, 1e-9
@@ -3045,7 +3102,7 @@ def wait_first_note():
                             prev_change, change_score
                         ),
                     )
-                    _log_trigger(cross_t, change_score, "interp")
+                    _log_trigger(cross_t, change_score, "interp", lanes_changed)
                     time.sleep(max(0, wait_ms) / 1000)
                     break
                 elif change_score >= CHANGE_THRESHOLD:
@@ -3059,13 +3116,14 @@ def wait_first_note():
                         band_avg,
                         "trigger(direct {:.2f})".format(change_score),
                     )
-                    _log_trigger(frame_t, change_score, "direct")
+                    _log_trigger(frame_t, change_score, "direct", lanes_changed)
                     time.sleep(max(0, wait_ms) / 1000)
                     break
             prev_change = change_score
             prev_frame_t = frame_t
             last_avg = band_avg
             last_edge_avg = edge_avg
+            last_lane_avg = lane_avg
             _maybe_log(change_score, band_avg)
         except Exception as e:
             logging.error(f"Failed to get screen: {e}")
