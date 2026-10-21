@@ -2249,6 +2249,15 @@ def _normalize_title(title: str) -> str:
     return unicodedata.normalize("NFKC", title or "")
 
 
+# OCR 形近字归一(只作用于 OCR 读数,曲库标题不经过这里)。
+# 2026-10-21 实测(autodori-20261021-204718.log):单字标题「栞」(#513)被 ja 模型
+# 读成「乗」(两个字下半都是木,字形相近),默认模型读出空串 → 匹配 0 分,
+# SongRecognition 永远不命中 → 选歌死循环(点难度 → 认不出歌名 → 重新选歌)。
+# 归一前已核对全曲库没有任何标题含「乗」,此替换不会误伤真标题;
+# 以后再遇到新的形近字误读,往这张表里加即可。
+_OCR_TITLE_MISREAD = str.maketrans({"乗": "栞"})
+
+
 def fuzzy_match_song(name, other_names=()):
     """OCR 读数(可传多个模型的读数) → 曲库条目,返回 `(标题, 分数)`;无候选返回 None。
 
@@ -2273,7 +2282,14 @@ def fuzzy_match_song(name, other_names=()):
     用真实日志做过对照(`debug/_exp_eval_match.py`,以选歌界面「乐曲等级」数字为
     ground truth):现状 46/48,加 1+2 仍 46/48,加上第 3 条 → **48/48**,无回归。
     """
-    readings = [r for r in (_normalize_title(t) for t in (name,) + tuple(other_names)) if r]
+    readings = [
+        r
+        for r in (
+            _normalize_title(t).translate(_OCR_TITLE_MISREAD)
+            for t in (name,) + tuple(other_names)
+        )
+        if r
+    ]
     if not readings:
         return None
     candidates = list(all_song_name_indexes.keys())

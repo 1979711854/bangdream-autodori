@@ -61,6 +61,7 @@ def load_under_test():
         "_TITLE_BRACKETS", "_TITLE_BRACKET_TRANS", "_POOL_SCORE_FLOOR",
         "_SONG_LEVEL_ROI", "_DIFFICULTY_ORDER",
         "_TITLE_CLOSERS", "_TITLE_OPENERS",
+        "_OCR_TITLE_MISREAD",
     }
     segments = []
     for node in tree.body:
@@ -186,6 +187,10 @@ CASES = [
     # 旧逻辑把无后缀基础曲(#24)的 90 分部分匹配压过变体 → 错配整首。
     # 期望命中 #786/#790 之一(同一首歌的简中/日文条目,hard 谱面等级相同)。
     ("ときめきエクスペリエンス！（月島麻里奈vék）", "24", "786/790"),
+    # 2026-10-21 实测(debug/autodori-20261021-204718.log):单字标题「栞」(#513)
+    # 被 ja 模型读成形近字「乗」,默认模型读出空串 → 匹配 0 分 → 选歌死循环。
+    # 旧逻辑下同样认不出( baseline 对「乗」只能蒙一个低分条目)。
+    ("乗", "", "513"),
 ]
 
 
@@ -314,6 +319,19 @@ def test_tokimeki_variant():
     check(song_id(hit3[0]) == "24", "无后缀读数仍命中基础曲 #%s" % song_id(hit3[0]))
 
 
+def test_shiori_misread():
+    print("\n[9] 单字标题「栞」形近字误读(2026-10-21 实测原文)")
+    # 真实两路读数:ja 模型读「乗」,默认模型读空串
+    hit = match_song("乗", [""])
+    check(song_id(hit[0]) == "513", "「乗 + 空串」-> #%s (%r, %.0f 分)" % (song_id(hit[0]), hit[0], hit[1]))
+    # 单读数也要命中
+    hit = match_song("乗")
+    check(song_id(hit[0]) == "513", "单读数「乗」-> #%s" % song_id(hit[0]))
+    # OCR 读对时当然也命中,确认归一没有反向破坏
+    hit = match_song("栞")
+    check(song_id(hit[0]) == "513", "读对「栞」-> #%s" % song_id(hit[0]))
+
+
 def test_two_model_readings():
     print("\n[7] 两个模型读数合并(本次报告的 ぎゅっDAYS♪ 截断)")
     # 真实日志 2026-09-16 12:56:13:日文模型读出全角残字,默认模型只读出片段,
@@ -415,6 +433,7 @@ if __name__ == "__main__":
     test_self_consistency()
     test_two_model_readings()
     test_tokimeki_variant()
+    test_shiori_misread()
     test_ambiguous_resolution()
     test_index_integrity()
     print("\n通过 %d 项, 失败 %d 项" % (len(passed), len(failed)))
