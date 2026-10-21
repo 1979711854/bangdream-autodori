@@ -90,13 +90,23 @@ class Chart:
             note_index += 1
             return note_index
 
+        # 先收集全部 BPM 再换算(2026-10-21,issue 回帖第 2 点确认的真 bug):
+        # 原来只有一遍遍历,BPM 条目「遇到才收进 _bpms」,而 Long/Slide 是单
+        # 条目、处理它时其全部 connections 一次性换算 —— 长条跨过一个尚未
+        # 遍历到的 BPM 变化时,后续 connection 按旧 BPM 换算,时间全错。
+        # 缓存 1112 张谱面实测 29 张受影响(2.6%),最大偏差 2168ms
+        # (#477/#421/#255 都在 1s 上下,见 _diag_bpm.py);#180/#443/#555/#568
+        # 等歌历史小额 miss 也可由此解释。拆成两遍:先收集,再统一换算,
+        # index/checkpoint 编号顺序与原单遍一致,不受影响。
+        for note in self._chart_data:
+            if note.get("type") == "BPM":
+                self._bpms.append((note["bpm"], note["beat"]))
+
         for _, note in enumerate(self._chart_data):
             note_type = note["type"]
 
             if note_type == "BPM":
-                bpm = note["bpm"]
-                beat = note["beat"]
-                self._bpms.append((bpm, beat))
+                continue
             elif note_type in ["Single", "Directional"]:
                 note["time"] = self._beat_to_time(note["beat"])
                 note["checkpoint_index"] = get_checkpoint_index()
@@ -263,6 +273,20 @@ class Chart:
                     }
                 )
             for i, (cur_slice_start, cur_slice_size) in enumerate(slices):
+                # 幻影切片过滤(2026-10-21,固定漏 miss 悬案根因,帧语义重放
+                # 实测 7/11 首漏点数精确吻合、3 首 ALL PERFECT 负对照为 0,
+                # 见 _diag_final3.py):split_number 对非 slice_size 整除的
+                # 时长(多为浮点噪声,如 duration=120.000000000004)会切出一
+                # 个 ~1e-12 的尾片,其时刻 = from+duration+0.00001,恰好落在
+                # 收尾 connection 的时刻上;而 move 的 +0.00001 偏移又保证它
+                # 排在「同刻同手指开始的下一个 note 的 down」之后。两者间隙
+                # 仅 10μs,不会插 wait → 同一个 minitouch commit → evdev 一帧
+                # 内同 contact 只保留最终位置,触点在同一帧内从新 note 的
+                # lane 直接跳到幻影位置 → 新音符的 tap/绿条头从未在自己的
+                # lane 上出现过 →「压根没点」型 miss(fast/slow=0、great=0,
+                # 数量逐场固定)。尾片位置与前一片目标相同(=终点),跳过无损。
+                if cur_slice_size < 0.5:
+                    continue
                 result.append(
                     {
                         "finger": finger,
