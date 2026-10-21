@@ -2568,6 +2568,11 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
             # 对齐:它的条数受补偿取整影响(理想流里的 'c' 实际可能没发,
             # publish 的尾部 commit 恒定但与 action 无关),'d/m/u/w' 才携带
             # 时间信息 —— jlog 侧的 'c' 在下面直接跳过。
+            # 注意两套命名:动作类型是 down/move/up(见 notes_to_actions),
+            # minitouch 指令/jlog 是 d/m/u —— 必须映射,否则逐条对不上
+            # (2026-10-21 实机每首歌都报「对齐失配过高」即此因,离线重放
+            # _diag_replay.py 已证实两流条数与顺序完全一致,纯命名错位)。
+            _ACT_TO_CMD = {"down": "d", "move": "m", "up": "u"}
             t0_chart = chart_actions[0]["time"]
             ideal = []
             ideal_t = t0_chart
@@ -2581,7 +2586,7 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                 elif a.get("finger", None) is None:
                     continue
                 else:
-                    ideal.append((at, ideal_t))
+                    ideal.append((_ACT_TO_CMD[at], ideal_t))
 
             base = events[0].start_time
             lags = []
@@ -2609,9 +2614,13 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                 lags.append(ev.start_time - base - (ideal[j][1] - t0_chart))
                 j += 1
             if len(lags) < 50 or miss > 0.02 * len(events):
+                # 对齐失败只说明这份诊断数据采不到(本工具的重建与真实命令流
+                # 对不上),与打歌本身无关 —— 打歌在那之前已经结束。文案写明,
+                # 免得用户看到 WARNING 以为打歌出了问题。
                 logging.warning(
-                    "服务端执行滞后[%s]: 对齐失配过高(miss=%d, events=%d, ideal=%d), 本局不采",
-                    song_label, miss, len(events), len(ideal),
+                    "服务端执行滞后[%s]: 诊断数据本局不采"
+                    "(命令流对齐失败: events=%d, ideal=%d, 失配=%d;不影响打歌)",
+                    song_label, len(events), len(ideal), miss,
                 )
                 return
             n = len(lags)
