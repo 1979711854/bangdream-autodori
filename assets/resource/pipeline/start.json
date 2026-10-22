@@ -3,6 +3,7 @@
         "action": "StartApp",
         "package": "com.bilibili.star.bili",
         "next": [
+            "daily_pull_cut_anim",
             "story_loading_wait",
             "reader_menu",
             "tutorial_close",

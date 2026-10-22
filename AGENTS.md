@@ -190,6 +190,14 @@
   压过变体 → 整首按错谱面(10:20 场 #24 无结算即此因)。已加 `_has_title_suffix`
   + 匹配器「尾部括注分池」(与前缀分池镜像);`_test_songmatch.py` 76 项全过、
   历史语料零回归。来源:issue #7 回帖第 4 点。已随 v1.3.3 正式发布。
+- **每日三抽卡 TOUCH TO CUT(issue #10,2026-10-22 已修)**:第三抽点完「招募」后
+  上一抽结果页尚未切走,`daily_pull_anim_wait` 提前命中旧页「招募结果」→ 误点
+  「再次招募」→ 抽卡动画(TOUCH TO CUT)播放,但 `daily_pull_again` 只等确认框、
+  20s 超时退出 → main/start_app 也不认识 TOUCH TO CUT → 卡近 2 分钟到手动点击。
+  修复:again 加 `interrupt: [daily_pull_cut_anim]` + next 补 `daily_pull_anim_wait`;
+  main/start_app 的 next 首位挂 `daily_pull_cut_anim` 兜底。**未改误识别时序本身**
+  —— 旧页误判后点「再次招募」与正常流程等价,动画被点掉后会回到正确的结果页,
+  所以是良性的;单次日志定位,未稳定复现(报告者原话)。
 - **单字标题「栞」选不到(2026-10-21 已修,源码)**:#513「栞」在选难度页被
   ja 模型 OCR 读成形近字「乗」(下半都是木)、默认模型读出空串 → 匹配 0 分,
   SongRecognition 永不命中 → 随机选歌死循环(点难度→认不出→重选,约 3s/轮,

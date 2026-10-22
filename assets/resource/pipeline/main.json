@@ -1,6 +1,7 @@
 {
     "main": {
         "next": [
+            "daily_pull_cut_anim",
             "tutorial_close",
             "select_song",
             "select_live_mode",
