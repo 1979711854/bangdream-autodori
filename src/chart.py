@@ -1,6 +1,7 @@
 import json
 import logging
 import time
+from collections import deque
 from pathlib import Path
 
 from minitouchpy import CommandBuilder
@@ -50,6 +51,28 @@ class Chart:
         self.actions_to_cmd_index = 0
         self._a2c_offset = 0
         self._a2c_rounded_loss = 0.0
+        # 已发射 wait 命令的「理想时长」队列(滞后反馈的测量基准,2026-10-23 第四版)。
+        # ⚠ 四版演变,都写在这里防止后人重蹈(测量端口径的完整踩坑史):
+        #   第一版(基准=命令串解析的实际值):字符串解析丢小数,账本虚高
+        #     ~900ms → 推早 100ms/曲,翻车回退。
+        #   第二版(基准=理想时长,逐条增量记账):账本=补偿后残差,自限但
+        #     注入只补增量,残差存量挂账 —— FULL 曲前 20% 欠 ~50ms 永远
+        #     压不掉(曲线平台即挂账);短曲欠账小是假达标。
+        #   第三版(基准=实际生效时长,逐条增量记账):想追存量,但「逐条
+        #     增量」口径把**批间空闲**也记成漂移 —— 反馈生效后服务端提前
+        #     干完、空闲变大、账本虚涨,无自限正反馈:实测账本 +1358ms
+        #     (dump -75ms),推早 1.3s 批量 FAST,当场翻车。教训:逐条增量
+        #     口径下「命令间一切时间差都算漂移」,与补偿天然耦合,不能用于
+        #     反馈测量。
+        #   第四版(本版,基准=理想时长 + **绝对对齐**记账):在线维护理想
+        #     时间线指针(ideal += 上一条 wait 的理想时长),lag = start −
+        #     ideal。与 _dump_server_lag_async 的重建口径完全一致:批间
+        #     空闲正确表现为提前(lag 下降,自限);注入端改为「补足到池」
+        #     (lag − _a2c_offset),排水消费池水时残差同步下降、下批补足
+        #     为 0 —— 既自限又追回存量(第二版+第三版各自缺陷的合并解)。
+        # mnt_callback 收到对应 jlog 'w' 事件时按序弹出(服务端按序执行,
+        # 顺序天然一致;队列在 callback_data_lock 内读写)。
+        self.wait_ideal_ms = deque()
 
     def _beat_to_time(self, beat: float) -> float:
         if not self._bpms:
@@ -555,6 +578,11 @@ class Chart:
                 if rounded_waitfor > 0.01:
                     append(builder.commit())
                     append(builder.wait(rounded_waitfor))
+                    # 理想时长入队(反馈补偿基准,第四版绝对对齐口径):
+                    # mnt_callback 收到这条 'w' 的 jlog 回执时弹出,用原始
+                    # action["length"](未补偿/未取整),与 _dump_server_lag_async
+                    # 的理想流重建口径一致 —— 在线 lag 与 dump 可直接对照。
+                    self.wait_ideal_ms.append(action["length"])
 
         self.actions_to_cmd_index += size
 

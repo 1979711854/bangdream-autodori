@@ -19,6 +19,7 @@ Auto-play script for BanG Dream! (Chinese server) + GUI launcher
 - [x] **Multiple song-selection strategies**: **mining-oriented**, **random**
 - [x] **"SPECIAL extra-high difficulty event" support**: walk to the "Select Band" screen in game manually, the script takes over the start, plays that one fixed chart and stops — no loop (see the dedicated section below)
 - [x] **Challenge Live CP clearing**: started separately from the GUI, it picks 8x / 4x / 2x / 1x based on your balance each song and stops when less than 200 CP is left
+- [x] **FULL-length songs supported**: the play timing self-compensates from measured server-side lag, so long FULL versions judge as accurately as regular songs
 - [x] **GUI launcher**: difficulty / song-selection strategy / boost strategy / photogate / life-exhausted strategy
 - [x] **Automatic photogate calibration**: after each song the timing is nudged from the FAST/SLOW distribution and converges within a few songs — no manual tuning needed on a different PC
 - [x] **Auto select song, auto play, and re-play after the result screen**: handles PT reward popups, character dialogue, failed lives, event stories and the rest of the result flow
@@ -36,6 +37,14 @@ Auto-play script for BanG Dream! (Chinese server) + GUI launcher
 **SPECIAL extra-high difficulty event:**
 
 ![](screenshots/special_record.jpg)
+
+## 🎵 FULL-length songs supported
+
+The play timing self-compensates from measured server-side lag, so the second
+half of long FULL versions no longer drifts late or piles up SLOW judgements —
+FULL versions now combo as accurately as regular songs.
+
+![](screenshots/full.jpg)
 
 ## 🖥 GUI (Maa/SukiUI style)
 

@@ -409,6 +409,47 @@ cmd_log_list: list[MNTEvATive7LogEventData] = []
 cmd_log_list_lock = threading.Lock()
 current_version = None
 
+# 服务端滞后反馈补偿(2026-10-23,issue #8 修复方向 A):
+# _adjust_offset 是按「命令开销估计」的开环补偿,实测拉不平 ~15-80ms/曲的
+# 累计漂移(FULL FIRE BIRD 音符尾段 80ms → slow=315)。这里直接闭环:
+#   - 测量端(mnt_callback):**绝对对齐**口径 —— 在线维护理想时间线指针,
+#     lag = start - ideal(与 dump 同口径)。基准=理想时长(chart.wait_ideal_ms)。
+#     ⚠ 四版口径踩坑(详见 chart.py __init__ 注释):①字符串解析值→账本虚高
+#     ~900ms 翻车;②理想时长+逐条增量→自限但存量挂账;③实际生效时长+逐条
+#     增量→批间空闲被记成漂移,无自限正反馈,账本 +1358ms 推早 1.3s 翻车。
+#     结论:逐条增量口径与补偿天然耦合,反馈测量只能用绝对对齐。
+#   - 执行端(play_song):「补足到池」—— 每批把池水位补到 lag(lag −
+#     _a2c_offset),由 chart.py 既有机制按每条 wait ±1ms(OFFSET_LIMIT)
+#     排水。排水生效→残差降→下批补足归 0,自限;存量由排水逐批追回。
+# 反馈只补「实测残差」:_adjust_offset 已生效的部分不会重复计入(它生效后
+# 滞后不再增长,增量自然为 0),两个控制器是协作而非叠加。
+#
+# ⚠ 2026-10-23 用户决定回退(总开关置 False):三场实测曲内漂移已被压住
+# (音符增长 -12/-4.5/+9.6ms,仿真口径达标),但用户体感「打歌更不好」——
+# 三场 fast=9/6/68 且 slow 全 0,是**整场整体偏早**,属 photogate 全局校准轴
+# (反馈只修曲内相对漂移,不修全局偏移,两者正交不冲突但叠加影响体感)。
+# 保留全部测量/诊断代码(只读、不碰时序),注入点由本开关控制。
+# 2026-10-23 上午 A/B 对照实验(用户确认):重启反馈 —— 10:29 回退版基准场
+# 非 FULL 曲也爆 SLOW(Off we go. 音符增长 +103ms → slow=337,Tempest/人マニア
+# +84ms),photogate 校准同场 36→6 剧烈波动(全局轴),与曲内漂移轴正交。
+# 反馈版 11:41/12:23 两场:短中曲 12 首 slow 全 0(达标),但 FULL 曲
+# (CiRCLE THANKS MUSiC♪)仍 +55ms/slow=274 —— 定位出第二版「存量挂账」
+# 缺陷(见上②)。第三版(基准=实际生效时长)当场翻车:批间空闲被逐条
+# 增量口径记成漂移,账本 +1358ms(dump -75ms),推早 1.3s 批量 FAST。
+# 第四版(本版):测量端绝对对齐(dump 同口径)+ 注入端补足到池,
+# 理论上同时解决「挂账」与「正反馈」;实机验收:lagdump「音符曲内增长」
+# 压回 ±10ms(FULL 曲也含),在线 lag 与 dump 曲线应一致(同口径)。
+_LAG_FEEDBACK_ENABLED = True
+# lag:绝对对齐口径的当前残差(= dump 同口径);ideal:理想时间线指针;
+# last_start/last_sched:滚动状态。第四版注入端为补足式,不再需要 applied。
+_lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0}
+
+
+def reset_lag_feedback():
+    """每首歌开始时清零(与 cmd_log_list.clear() 同点调用)。"""
+    global _lag_fb
+    _lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0}
+
 
 def reset_callback_data():
     global callback_data
@@ -2556,6 +2597,14 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
         时间差,即理想间隔,补偿只改实际值不改理想值);
       - finger=None 的 d/m/u 在发射前被丢弃(见 actions_to_MNTcmd 注释);
       - wait 取整后 >0.01 才发射(理想流同条件);commit 不参与对齐。
+
+    2026-10-22 扩展:原「曲内增长」统计的是全部带时命令(d/m/u/w),把音符处滞后
+    与无音区 wait 超时混在一起(VIOLET LINE 增长 66.4ms 却 fast=284 的反例说明
+    增长大头可能落在无音区)。现拆成两组输出,并把逐条 (cmd, ideal_ms, lag_ms)
+    曲线落盘 debug/lagdump/*.json,供离线脚本 _diag_lagan.py 逐曲对照
+    fast/slow/miss 判读归属(下发链补偿不足 vs 游戏侧时钟漂移)。
+    注意 lag@N% 是「位置百分位」(歌进行到 N% 时的滞后),不是分布分位数 ——
+    曲内增长 = 曲尾滞后 - 曲首滞后,即累计漂移量。
     """
     def _worker():
         try:
@@ -2605,7 +2654,7 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                     ideal.append((_ACT_TO_CMD[at], ideal_t))
 
             base = events[0].start_time
-            lags = []
+            pairs = []  # (指令字母, 理想时刻ms(相对t0_chart), 滞后ms) —— 曲线落盘用
             miss = 0
             j = 0
             for ev in events:
@@ -2627,8 +2676,10 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                 if j >= len(ideal):
                     miss += 1
                     continue
-                lags.append(ev.start_time - base - (ideal[j][1] - t0_chart))
+                lag = ev.start_time - base - (ideal[j][1] - t0_chart)
+                pairs.append((et, ideal[j][1] - t0_chart, lag))
                 j += 1
+            lags = [p[2] for p in pairs]
             if len(lags) < 50 or miss > 0.02 * len(events):
                 # 对齐失败只说明这份诊断数据采不到(本工具的重建与真实命令流
                 # 对不上),与打歌本身无关 —— 打歌在那之前已经结束。文案写明,
@@ -2646,6 +2697,63 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                 "@90%%=%.1f @100%%=%.1f ms, 曲内增长=%.1fms",
                 song_label, len(events), miss, v[0], v[1], v[2], v[3], v[3] - v[0],
             )
+
+            def _pos_pct(seq, p):
+                return seq[min(len(seq) - 1, int(len(seq) * p))]
+
+            # 音符组(d/m/u,判定点命令):SLOW/FAST 归属要看这里的曲内增长,
+            # 不是上面全命令混计的增长 —— 无音区 wait 超时不影响音符判定。
+            note_lags = [p[2] for p in pairs if p[0] != "w"]
+            wait_lags = [p[2] for p in pairs if p[0] == "w"]
+            note_growth = wait_growth = 0.0
+            if len(note_lags) >= 50:
+                a, b = _pos_pct(note_lags, 0.1), _pos_pct(note_lags, 1.0)
+                note_growth = b - a
+                logging.info(
+                    "服务端执行滞后[%s]: 音符命令 %d 条, lag@10%%=%.1f @50%%=%.1f "
+                    "@90%%=%.1f @100%%=%.1f ms, 音符曲内增长=%.1fms",
+                    song_label, len(note_lags), a,
+                    _pos_pct(note_lags, 0.5), _pos_pct(note_lags, 0.9), b, note_growth,
+                )
+            if len(wait_lags) >= 50:
+                a, b = _pos_pct(wait_lags, 0.1), _pos_pct(wait_lags, 1.0)
+                wait_growth = b - a
+                logging.info(
+                    "服务端执行滞后[%s]: 无音区 wait %d 条, gap曲内增长=%.1fms"
+                    "(@10%%=%.1f @100%%=%.1f)",
+                    song_label, len(wait_lags), wait_growth, a, b,
+                )
+
+            # 逐条曲线落盘,供 _diag_lagan.py 离线对照结算读数。文件会积累,
+            # 定期清理(同 debug/firstnote 惯例)。写失败只告警,不影响任何流程。
+            try:
+                os.makedirs("debug/lagdump", exist_ok=True)
+                safe = re.sub(r'[\\/:*?"<>|]', "_", song_label).strip() or "song"
+                path = "debug/lagdump/%s-%s.json" % (
+                    time.strftime("%Y%m%d-%H%M%S"), safe[:60],
+                )
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "meta": {
+                                "song": song_label,
+                                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "events": len(pairs),
+                                "note_cmds": len(note_lags),
+                                "wait_cmds": len(wait_lags),
+                                "miss": miss,
+                                "note_growth_ms": round(note_growth, 2),
+                                "gap_growth_ms": round(wait_growth, 2),
+                            },
+                            # [cmd, ideal_ms, lag_ms];ideal 相对谱面首动作,
+                            # lag = 实际执行 - 理想(>0 即偏晚)
+                            "events": [[c, round(i, 2), round(g, 2)] for c, i, g in pairs],
+                        },
+                        f, separators=(",", ":"),
+                    )
+                logging.info("服务端执行滞后[%s]: 曲线已落盘 %s", song_label, path)
+            except Exception as e:  # noqa: BLE001 — 诊断落盘绝不影响打歌
+                logging.warning("服务端执行滞后[%s]: 曲线落盘失败(%s)", song_label, e)
         except Exception as e:
             logging.warning("服务端执行滞后统计失败(%s): %s", song_label, e)
 
@@ -2662,6 +2770,7 @@ def play_song(context=None):
     _reload_photogate()
     cmd_log_list.clear()
     reset_callback_data()
+    reset_lag_feedback()
     wait_first = get_runtime_info(current_player.resolution)["wait_first"]
     logging.info(
         "打歌: %s (#%s-%s), 动作%s, photogate=%sms, 检测带y=%s-%s",
@@ -2837,6 +2946,24 @@ def play_song(context=None):
             batch_no += 1
             batch_first_time = upcoming[0]["time"]
             with callback_data_lock:
+                # 反馈补偿执行端(2026-10-23 第四版):「补足到池」——把池水位
+                # (chart._a2c_offset,含开环补偿待排水额)补到与当前实测残差
+                # (lag,绝对对齐口径)一致。排水消费池水时服务端残差同步下降,
+                # 下批补足量归 0 → 既自限又追回存量(第二版自限但挂账、第三版
+                # 追账但正反馈,各取一半)。机理与四版踩坑史见模块头注释与
+                # chart.py __init__ 注释。
+                # 测量滞后(发布领先 2~3s)使补足相位落后 1~2 批,误差方向
+                # 偏少注(安全侧),量级 ≤2×每批新漂移(~2ms),可接受。
+                if _LAG_FEEDBACK_ENABLED:
+                    _fb_delta = _lag_fb["lag"] - current_chart._a2c_offset
+                    if abs(_fb_delta) > 0.01:
+                        current_chart._a2c_offset += _fb_delta
+                        logging.debug(
+                            "滞后反馈: 残差%.1fms 池%.1f→%.1f(批#%d)",
+                            _lag_fb["lag"],
+                            current_chart._a2c_offset - _fb_delta,
+                            current_chart._a2c_offset, batch_no,
+                        )
                 _adjust_offset()
                 reset_callback_data()
             current_chart.actions_to_MNTcmd(
@@ -3299,6 +3426,37 @@ def mnt_callback(event: MNTEvent, data: MNTEventData):
         # (例如 `int(cmd.split(" ")[-1])` 遇到非预期指令格式)都会跳过 release,
         # 锁就永远不释放 —— 打歌主循环在 _adjust_offset() 处永久等待,整首卡死。
         with callback_data_lock:
+            # 服务端滞后在线估计(测量端,2026-10-23 第四版):**绝对对齐**口径
+            # —— 在线维护理想时间线指针 ideal(每条带时命令理想额度=d/m/u
+            # 占 0、wait 占理想时长,从 chart.wait_ideal_ms 队列弹出),
+            # lag = start - ideal,与 _dump_server_lag_async 的重建口径一致。
+            # ⚠ 前三版教训(完整踩坑史见 chart.py __init__ 注释):
+            #   第一版基准=字符串解析值,账本虚高 ~900ms;
+            #   第二版基准=理想时长但逐条增量记账,自限但存量挂账;
+            #   第三版基准=实际生效时长逐条增量,批间空闲被记成漂移,
+            #     无自限正反馈,账本 +1358ms 推早 1.3s 批量 FAST。
+            #   共同点:后两版都是「逐条增量」口径 —— 它把命令间一切时间差
+            #   都算漂移,批间空闲与补偿天然耦合,反馈测量只能用绝对对齐。
+            if cmd_type != "c":
+                if _lag_fb["ideal"] is None:
+                    # 首条带时命令:理想线从它对齐(与 dump 的曲内增长差值
+                    # 口径等价,起点绝对值不影响增长判读)。
+                    _lag_fb["ideal"] = data.start_time
+                    _lag_fb["lag"] = 0.0
+                else:
+                    _lag_fb["ideal"] += _lag_fb["last_sched"]
+                    _lag_fb["lag"] = data.start_time - _lag_fb["ideal"]
+                _lag_fb["last_start"] = data.start_time
+                if cmd_type == "w":
+                    chart = current_chart
+                    if chart is not None and chart.wait_ideal_ms:
+                        _lag_fb["last_sched"] = chart.wait_ideal_ms.popleft()
+                    else:
+                        # 队列空(异常/丢事件):退回命令串里的实际值,至少
+                        # 不让估计发疯;整型解析误差 ≤0.5ms/条,一次性小误差。
+                        _lag_fb["last_sched"] = float(cmd.split(" ")[-1])
+                else:
+                    _lag_fb["last_sched"] = 0.0
             if (last_cmd_endtime := callback_data.get("last_cmd_endtime")) != -1:
                 callback_data["interval"]["total"] += 1
                 callback_data["interval"]["total_offset"] += (
