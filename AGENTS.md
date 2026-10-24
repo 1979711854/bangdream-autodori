@@ -364,6 +364,28 @@
   FULL FIRE BIRD +0.8/全 PERFECT(origin 曲,历史 slow=315)。五场连续
   达标(FULL×5+普通×14),跨时段稳定,issue #8 曲内漂移轴结案;
   photogate 轴在反馈版下亦稳定(39 恒定、fast/slow 全 0)。待发版。
+  **v1.3.4 已发版(2026-10-24 凌晨)**:commit 1a02458 + tag v1.3.4 push,
+  CI 自动构建发 Release(标题「BanG Dream · 邦邦自动挖矿助手 v1.3.4」,
+  正文取 RELEASE_NOTES.md)。发版文本四处:RELEASE_NOTES.md / CHANGELOG.md
+  (含四版口径踩坑经验,现象/原因/修复三段式)/ gui.py CHANGELOG(v1.3.4
+  块,已删 v1.3.3「已知问题」行)/ README 中英双语(功能条目 +
+  「🎵 支持 FULL 曲」小节,配图 screenshots/full.jpg,由用户桌面 full.png
+  转 JPEG 216KB)。1:05 重新打包(改了 gui.py),exe 已同步仓库根。
+  issue #8 回复话术已交给用户自行发布。本地 dist zip 为最终产物。
+  **issue #11 高开销机器反馈不收敛 → v1.3.5-rc1(2026-10-25)**:MuMu 用户
+  (nighteron)复测 v1.3.4 仍 fast→perfect→slow,This game 音符曲内增长
+  67.9ms(45→110ms 不收敛)、slow=16。取证:其机器 wait 单条开销实测
+  均值 0.97ms(0.67~1.24),贴着 chart.py OFFSET_LIMIT=1 排水上限,排水
+  容量(3225ms/歌)≈ 积累(~3249ms)零余量 → 反馈环空转。我们自己机器
+  0.07ms 有 14 倍余量所以实机验收没暴露。修复:OFFSET_LIMIT 改自适应
+  max(1, wait_offset+0.5)(低开销机器 max 兜底=1 行为不变);离线验证
+  用合成裸曲线(用户的 lagdump 是带补偿曲线,直接重放是双重补偿假象;
+  合成 LIMIT=1.0 尾段 108.9 与实机 105.3 吻合,模型可信)——注意 lagsim
+  尾段有 ~3000ms 测量延迟地板(~90ms),判读只看斜率不看绝对值。
+  _test_chart.py 21/21。附带发现:用户 10-23 附件实为 v1.3.3-rc 前构建
+  (旧文案「对齐失配过高」+ miss=全部带时命令的命名错位特征签名),
+  maa.log Working 目录 autodori_v1.3.3_Windows_X64。v1.3.5-rc1 已打包
+  (gui.py APP_VERSION 1.3.5 + 三处发版文本),exe/metadata 已同步。
   **第四版实测达标(2026-10-23 13:40 场,三首 FULL 曲)**:キズナミュージック
   音符增 +2.2/尾段 0.5、FIRE BIRD +17.6/尾段 0.6(gap -13.5,部分漂移被
   无音区吸收)、CiRCLE THANKS MUSiC -26.0/尾段 -7.7 —— 三首 slow 全 0、

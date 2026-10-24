@@ -554,7 +554,14 @@ class Chart:
                 self._a2c_offset += wait_offset
                 wait_for = action["length"]
 
-                OFFSET_LIMIT = 1
+                # 排水上限自适应(2026-10-25,issue #11):原固定 1ms 在高开销
+                # 环境下排水容量 ≈ 开销积累(用户机器 wait 开销实测均值 0.97ms,
+                # 贴着 1ms 上限,零余量),反馈补偿追不平,曲内滞后 45→110ms
+                # 收敛不了。上限改为「实测开销 + 0.5ms 余量」,低开销机器
+                # (实测 ~0.07ms)不受影响 —— max(1, …) 保底,行为与旧版完全一致。
+                # 上限再大有过冲出 FAST 的风险,反馈环每批重置残差可自限,
+                # 但余量 0.5ms 够把单批 ~44 条 wait 的波动拉平,先不放大。
+                OFFSET_LIMIT = max(1, wait_offset + 0.5)
                 offset_adjust = min(
                     wait_for,
                     min(OFFSET_LIMIT, max(-OFFSET_LIMIT, self._a2c_offset)),
