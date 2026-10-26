@@ -1,4 +1,6 @@
+import json
 import logging
+from pathlib import Path
 import requests
 from diskcache import Cache
 from urllib3.util.retry import Retry
@@ -69,6 +71,14 @@ class BestdoriAPI:
     @staticmethod
     def get_chart(song_id: str, difficulty: str):
         cacheid = f"{song_id}-{difficulty}"
+        if cacheid == "655-hard":
+            # Bestdori 缺少第 49 拍最右轨单键；旧缓存也有同样缺口，
+            # 因此先加载已补齐的本地谱面，再考虑缓存和网络。
+            path = Path("assets/chart_overrides/655-hard.json")
+            with path.open(encoding="utf-8") as chart_file:
+                chart = json.load(chart_file)
+            BestdoriAPI._logger.info("Local chart override for %s: %s", cacheid, path)
+            return chart
         url = BestdoriAPI.base + f"/charts/{song_id}/{difficulty}.json"
         return BestdoriAPI._fetch_and_cache(url, cacheid)
 
