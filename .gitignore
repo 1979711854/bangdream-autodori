@@ -677,3 +677,15 @@ _exp_resolve689.py
 # package_skill.py 不带输出目录参数时会把 zip 打到当前工作目录,
 # 在仓库里跑一次就会多出 autodori.zip;技能包本身应留在 ~/.codebuddy/skills/。
 autodori.zip
+
+# ---- 本机一次性开发产物(2026-10-28 清理) ----
+# 刻意**不**写 `_*.py`:项目惯例是把 `_test_*.py` 回归脚本入库,一刀切会让
+# 以后新写的测试静默进不了库(本次 `_test_firstnote.py`/`_test_gate_cal.py`
+# 就是正经回归脚本)。这里只挡开发期截图与一次性排查目录 —— 清理前根目录
+# 积了 19 张诊断 png(13MB)、_testrun(158MB)、_issue11 等,git status 一片红。
+_*.png
+_*.jpg
+_issue*/
+_bms_dl/
+_tmp_rel/
+bangdream-autodori/
