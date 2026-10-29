@@ -52,6 +52,15 @@ import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
 from challenge import ChallengeCPRecognition, SelectChallengeCP, challenge_overrides, click
+from story import (
+    DEFAULT_MAX_STORIES,
+    StoryAvatarClick,
+    StoryInsufficient,
+    StoryRewardOk,
+    story_insufficient,
+    story_overrides,
+    story_read_count,
+)
 import envcheck
 from util import *
 
@@ -81,6 +90,15 @@ _DAILY_FREE_PULL = False
 #: 2026-10-17 GUI 重构:顶栏「开始自由演出」已删除,日常是唯一的 GUI 打歌入口,
 #: main 模式只留给命令行调试与挑战演出。
 _DAILY_MODE = False
+#: 本次进程跑的是不是「阅读角色故事」模式(--mode story,2026-10-25 新增)。
+#: 用户在游戏里筛好「小故事未读」并停在「乐队-培养」页,bot 从列表左上角
+#: 依次读;流程与模板见 src/story.py 与 pipeline/story.json。
+_STORY_MODE = False
+#: 读哪一种故事:member=小故事,memoir=回忆小故事(两种按钮并排,模板不同)
+_STORY_TYPE = "member"
+#: 本轮阅读上限(--mode story 启动时从 config.yml 的 story.max_stories 读,
+#: 默认 50;GUI 不暴露此配置)
+_STORY_LIMIT = DEFAULT_MAX_STORIES
 #: 清火与三抽**同时**开启时的交替模式(用户 2026-10-17 定的新流程):
 #: 每成功打完一首歌,检查一次每日免费三抽,三抽完再回去继续打歌,
 #: 直到火量不足收工。只有两个开关同时打开才生效。
@@ -135,6 +153,9 @@ if _timing_cfg.get("photogate_latency_ms") is not None:
 maaresource = Resource()
 maaresource.register_custom_recognition("ChallengeCPRecognition", ChallengeCPRecognition())
 maaresource.register_custom_action("SelectChallengeCP", SelectChallengeCP())
+maaresource.register_custom_action("StoryAvatarClick", StoryAvatarClick())
+maaresource.register_custom_action("StoryRewardOk", StoryRewardOk())
+maaresource.register_custom_action("StoryInsufficient", StoryInsufficient())
 
 
 # ---------------------------------------------------------------------------
@@ -146,10 +167,14 @@ maaresource.register_custom_action("SelectChallengeCP", SelectChallengeCP())
 #   同一节点在 60s 滑动窗口内命中 >= 8 次  => 判定卡死
 # 正常流程不会触发:打歌单节点要阻塞一两分钟,三抽每步只命中一两次。
 #
-# 兜底按强度递进,绝不无限乱点:
-#   1) 按一次安卓返回键(绝大多数弹窗/子页面都响应),等冷却;
-#   2) 仍在打转就再按一次;
-#   3) 还卡 => post_stop 停任务 + warning 写明卡在哪个节点,交给外层统一收尾。
+# 兜底按强度递进,绝不无限乱点(2026-10-26 #400 事故后重排):
+#   1) 置 _STUCK_EVENT 通知等待循环自行退出 —— 卡点在 Play 等长循环里时,
+#      post_stop 停不掉运行中的 CustomAction、返回键也够不着,唯一能从循环
+#      里出去的就是循环自己(协作式解救);
+#   2) 循环没响应 => 点已知弹窗按钮(「演出失败」的「退出」,纯按钮弹窗
+#      不响应返回键,2026-10-26 实测按 4 次零反应);
+#   3) 仍无变化 => 按一次安卓返回键(绝大多数弹窗/子页面都响应),等冷却;
+#   4) 还卡 => post_stop 停任务 + warning,交给外层统一收尾。
 #
 # 白名单:故事/公告的"下一步"连点、三抽滚动、随机兜底点击本身就设计成可重复
 # 命中,不能算卡死。special(故事)模式不启动本看门狗。
@@ -158,7 +183,8 @@ maaresource.register_custom_action("SelectChallengeCP", SelectChallengeCP())
 _WATCHDOG_STATIC_S = 75.0        # 画面与脚本都没有任何进展持续多久判卡死
 _WATCHDOG_BACK_COOLDOWN_S = 4.0  # 两次返回键的最小间隔
 _WATCHDOG_SCAN_INTERVAL_S = 2.0  # 后台扫描周期
-_WATCHDOG_MAX_BACKS = 2          # 返回键最多按几次,之后停任务(方案 1A)
+#: 解救总轮数 = 事件通知 + 点已知弹窗按钮/返回键 + 返回键。到顶 post_stop。
+_WATCHDOG_RESCUE_ROUNDS = 3
 _WATCHDOG_SAMPLE_STEP = 8        # 采样图每隔多少像素取一个点
 _WATCHDOG_PIXEL_DIFF = 0.8       # 采样点灰度平均差 >= 该值算"画面有变化"
 # 脚本侧最近这么多秒内有活动(打歌心跳等)就**连图都不抓**:打歌期间保持零额外抓图,
@@ -176,6 +202,13 @@ _SCREEN_CAP_LOCK = threading.Lock()
 #: 持锁,另一方限时失败后继续活,看护能力不归零。
 _CAP_LOCK_TIMEOUT_S = 1.0
 _WATCHDOG_CAP_LOCK_TIMEOUT_S = 5.0
+
+#: 卡死协作式解救事件(2026-10-26):看门狗判卡死后置位,等待类循环
+#: (首音等待等)每帧检查,看到就 raise 走 on_error 链正规收尾。为什么必须
+#: 协作:post_stop 停不掉**正在运行**的 CustomAction —— #400 那次按了 4 次
+#: 返回键、post_stop 也发了,Play 里的 while True 照转不误。Event.clear()
+#: 在 play_song 开头(每首新歌),防止上一轮的残留事件误杀下一首。
+_STUCK_EVENT = threading.Event()
 
 
 def _watchdog_sample():
@@ -215,8 +248,76 @@ def _sample_diff(a, b) -> float:
     return float(np.abs(a - b).mean())
 
 
+#: 卡死解救允许点的高危弹窗按钮。**只放「演出失败」的「退出」**:模板
+#: 复用 common/button/exit(管线 exit_button 节点同款,粉/白两版)。「继续
+#: (复活)」要花星石、「重新开始」会让卡死的 Play 更乱,都不进白名单。
+_STUCK_MODAL_TEMPLATES = (
+    "common/button/exit/pink.png",
+    "common/button/exit/white.png",
+)
+_stuck_modal_tpl_cache: dict = {}
+
+
+def _load_stuck_modal_templates() -> dict:
+    """懒加载退出按钮模板(cv2.imread 是 BGR)。读不到就返回空,不参与解救。"""
+    if _stuck_modal_tpl_cache:
+        return _stuck_modal_tpl_cache
+    for name in _STUCK_MODAL_TEMPLATES:
+        path = os.path.join("assets", "resource", "image", *name.split("/"))
+        tpl = cv2.imread(path, cv2.IMREAD_COLOR)
+        if tpl is not None:
+            _stuck_modal_tpl_cache[name] = tpl
+    return _stuck_modal_tpl_cache
+
+
+def _click_stuck_modal_button() -> bool:
+    """看门狗第 2 轮解救:整幅画面找「演出失败」弹窗的「退出」按钮并点掉。
+
+    返回键对这种纯按钮弹窗无效(2026-10-26 实测按 4 次零反应),必须点按钮。
+    匹配不到返回 False,调用方落到返回键。用 cv2 模板匹配而不是复用管线
+    节点:看门狗线程同步 post 管线动作容易死锁(见 HandleLiveBoost 注释),
+    而且任务线程被 Play 占着时节点根本轮不到执行。
+    时序安全:只在画面静止 75s 后才会被调用 —— 打歌中音符一直在动,到不了
+    这里,不存在与 minitouch 发布线程抢点的问题;首音等待阶段也还没开始
+    发布命令。点击走 _click_at_box(MAA post_click,失败退 adb tap)。
+    """
+    tpls = _load_stuck_modal_templates()
+    if not tpls:
+        return False
+    if not _SCREEN_CAP_LOCK.acquire(timeout=_WATCHDOG_CAP_LOCK_TIMEOUT_S):
+        return False
+    try:
+        frame = current_player.ipc_capture_display()
+    finally:
+        _SCREEN_CAP_LOCK.release()
+    if frame is None:
+        return False
+    # IPC 帧是 RGB,模板是 BGR,先转一致再匹配(见 _snap 注释)
+    frame = np.ascontiguousarray(frame[:, :, :3][:, :, ::-1], dtype=np.uint8)
+    for name, tpl in tpls.items():
+        res = cv2.matchTemplate(frame, tpl, cv2.TM_CCOEFF_NORMED)
+        _, maxv, _, maxloc = cv2.minMaxLoc(res)
+        if maxv >= 0.8:
+            h, w = tpl.shape[:2]
+            box = [maxloc[0], maxloc[1], w, h]
+            logging.warning(
+                "卡死解救:识别到「退出」按钮(%s score=%.3f box=%s),点击",
+                name, maxv, box,
+            )
+            return _click_at_box(box)
+    return False
+
+
 class _StuckWatchdog(NotificationHandler):
-    """卡死看门狗:「画面长期静止 + 脚本侧无进展」=> 按返回键,两次无效则停任务。
+    """卡死看门狗:「画面长期静止 + 脚本侧无进展」=> 分轮解救,无效则停任务。
+
+    2026-10-26 解救链重排(#400 事故:卡在 Play 长循环里,按 4 次返回键 +
+    post_stop 全部无效):
+      第 1 轮 置 _STUCK_EVENT 通知等待循环自行退出(协作式解救);
+      第 2 轮 点「演出失败→退出」等已知弹窗按钮(纯按钮弹窗不响应返回键);
+      第 3 轮 按安卓返回键(多数弹窗/子页面响应;打歌中会误弹暂停,所以
+              排在最后 —— 而打歌中画面不会静止,本来也到不了这轮);
+      仍无效  post_stop 停任务,交给外层统一收尾。
 
     2026-10-17 重写 —— 老实现的两个判据在本 MAA 版本上全部失效:
       MAA 4.4.0 只把**任务级**通知(Tasker.Task.*)送到 Python,**节点级**
@@ -301,20 +402,49 @@ class _StuckWatchdog(NotificationHandler):
         if now - self._last_back < _WATCHDOG_BACK_COOLDOWN_S:
             return False                  # 冷却中,别连按
         self._last_back = now
-        if backs < _WATCHDOG_MAX_BACKS:
-            self._backs = backs + 1
-            # 按完给同样长的观察窗口,否则 4s 冷却一过就会立刻连按
-            self._observe_until = now + _WATCHDOG_STATIC_S
+        self._backs = backs + 1
+        # 每轮解救后给同样长的观察窗口,否则 4s 冷却一过就会立刻连按
+        self._observe_until = now + _WATCHDOG_STATIC_S
+        if backs == 0:
+            # 第 1 轮:协作式解救 —— 只置事件,不点不按。Play 等长循环每帧
+            # 检查该事件,看到就 raise 走 on_error 链,由管线正规收尾(点
+            # 「退出」带二次确认链,比看门狗盲点安全);若卡点不在长循环里
+            # (管线空转),事件无人消费,75s 后落到第 2 轮。
+            _STUCK_EVENT.set()
             logging.warning(
-                "卡死自动恢复:%.0fs 内画面和脚本都没有任何进展,疑似卡在弹窗/未知界面,"
-                "按返回键(%d/%d)",
-                _WATCHDOG_STATIC_S, self._backs, _WATCHDOG_MAX_BACKS,
+                "卡死自动恢复:%.0fs 内画面和脚本都没有任何进展,"
+                "已通知等待循环自行退出(1/%d)",
+                _WATCHDOG_STATIC_S, _WATCHDOG_RESCUE_ROUNDS,
             )
-            _adb_shell(["input", "keyevent", "4"])
+            return False
+        if backs == 1:
+            # 第 2 轮:循环没能自行退出(卡点在管线/线程真死)。返回键对
+            # 「演出失败」这类纯按钮弹窗无效,先试点已知弹窗按钮。
+            logging.warning(
+                "卡死自动恢复:等待循环未响应,尝试点击已知弹窗按钮(2/%d)",
+                _WATCHDOG_RESCUE_ROUNDS,
+            )
+            if _click_stuck_modal_button():
+                return False
+        if backs < _WATCHDOG_RESCUE_ROUNDS:
+            # 第 2 轮(没认出弹窗)/第 3 轮:返回键兜底。送达与否必须可见:
+            # 2026-10-26 按 4 次返回键画面零反应,当时 adb 失败只写 DEBUG
+            # 甚至不写,事后无法区分「键没送到」和「画面不响应」。
+            r = _adb_shell(["input", "keyevent", "4"])
+            if r is None:
+                logging.warning(
+                    "卡死自动恢复:返回键可能未送达(adb 调用失败,设备掉线?)"
+                )
+            else:
+                logging.warning(
+                    "卡死自动恢复:%.0fs 内画面和脚本都没有任何进展,"
+                    "按返回键(%d/%d)",
+                    _WATCHDOG_STATIC_S, self._backs, _WATCHDOG_RESCUE_ROUNDS,
+                )
             return False
         logging.warning(
-            "卡死自动恢复:按了 %d 次返回键画面仍然没有变化,停止任务",
-            _WATCHDOG_MAX_BACKS,
+            "卡死自动恢复:%d 轮解救(通知循环/点弹窗按钮/返回键)均无效,停止任务",
+            _WATCHDOG_RESCUE_ROUNDS,
         )
         _force_post_stop()
         return True
@@ -442,13 +572,129 @@ current_version = None
 _LAG_FEEDBACK_ENABLED = True
 # lag:绝对对齐口径的当前残差(= dump 同口径);ideal:理想时间线指针;
 # last_start/last_sched:滚动状态。第四版注入端为补足式,不再需要 applied。
-_lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0}
+# 2026-10-28 加两道保护后多三个字段:
+#   off          本曲已停注入(回执积压判死,lag 不可信)
+#   backlog_since 积压首次超限的时刻(用来算持续时长)
+#   backlog_peak  本曲回执积压峰值(歌尾打一行 INFO,用来校准上面的阈值)
+#   overshoot_n  本曲被「单批补足超限」丢弃的批次数(取证用)
+_lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0,
+           "off": False, "backlog_since": None, "backlog_peak": 0,
+           "overshoot_n": 0,
+           # 2026-10-28 加:测量端退化的两个直接计数(只读,不碰时序)。
+           # 背景:同一天两场,一场线上 lag 全程 ±5ms 而 dump 曲内增长 -98ms
+           # (ゼッタイ宣言,越打越快),另一场线上 lag 涨到 243ms 却在丢弃 75 批
+           # (テレキャスタービーボーイ,实测 fast=54 而非 SLOW)——两个方向都飘,
+           # 共同指向「在线理想时间线指针不可信」。要判是哪种退化,就得数:
+           #   wait_recv  成功从 wait_ideal_ms 配对弹出的 'w' 回执条数
+           #   fallback_n 队列空、退回命令串实际值的条数(该值已含补偿,比理想短,
+           #              拿它当理想额度 = 把漂移吃成 0,lag 直接失真)
+           "wait_recv": 0, "fallback_n": 0}
+
+# ---- 滞后反馈的两道保护(2026-10-28) ----
+# 实机崩局取证(2026-10-28 00:13~00:19 三首,gate 同为 60):
+#   #320 失配 11/15717 → miss 4;#763 失配 2719/16964 → miss 12;
+#   #263 失配 322/5150 → 服务端 lag 从 12ms 涨到 117ms → 生命耗尽。
+# 机理:jlog 的 'w' 回执丢了 → wait_ideal_ms 只进不出(弹出发生在回执里)
+# → ideal 指针少推进 → lag 被算**大** → 「补足到池」把这个虚高值注回去
+# → wait 被缩短 → 时间线被推早 → 批量 FAST/miss,正反馈一路到崩。
+# 同一晚 00:27 那首失配只有 14 条时全 PERFECT:失配是间歇性爆发、不是长曲
+# 固有属性,所以只能做事后保护,不能靠「这首没崩」推断下首没事。
+# 保护①(挡住 0:19 那种崩):回执积压持续超限 = 回执在丢,lag 已不可信,
+#   **本曲立刻停注入**,并清空池水 —— 不清的话虚高池水还会继续按
+#   OFFSET_LIMIT 排水,时间线继续往早推。停注入后回退开环 _adjust_offset,
+#   最差是偏晚(SLOW),不会批量 miss。
+# 保护②(挡虚高注入):正常每批新漂移 ~2ms,单批要补 30ms 以上只可能是
+#   测量异常。注早了要命(FAST/miss),不注最多偏晚,所以丢弃并记数。
+_LAG_FB_MAX_BACKLOG = 400           # wait 回执积压上限(正常只领先 1~2 批)
+_LAG_FB_BACKLOG_HOLD_S = 2.0        # 持续超限多久判定「回执真的在丢」
+_LAG_FB_MAX_BATCH_INJECT_MS = 30.0  # 单批补足上限,超过当测量异常丢弃
 
 
 def reset_lag_feedback():
     """每首歌开始时清零(与 cmd_log_list.clear() 同点调用)。"""
     global _lag_fb
-    _lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0}
+    _lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0,
+               "off": False, "backlog_since": None, "backlog_peak": 0,
+               "overshoot_n": 0, "wait_recv": 0, "fallback_n": 0}
+
+
+def _lag_fb_snapshot() -> dict:
+    """取本曲反馈状态的快照,给 dump 线程做「在线 lag vs dump lag」对照。
+
+    2026-10-28 加:_dump_server_lag_async 是 daemon 线程,要等 jlog 静默(≤20s)
+    才出数;下一首开始时 reset_lag_feedback 会把 _lag_fb 清零,所以必须在本曲
+    收尾**当场**快照,不能在线程里读全局。只读,不碰时序。
+    """
+    return {
+        "lag": _lag_fb["lag"],
+        "wait_recv": _lag_fb["wait_recv"],
+        "fallback_n": _lag_fb["fallback_n"],
+        "peak": _lag_fb["backlog_peak"],
+        "overshoot_n": _lag_fb["overshoot_n"],
+        "off": _lag_fb["off"],
+    }
+
+
+def lag_feedback_batch_delta(chart, batch_no: int, now=None) -> float:
+    """算出本批「补足到池」的池增量;返回 0 表示本批不注入(含两道保护)。
+
+    调用点:play_song 每批发布前、持 callback_data_lock 时 —— 与 _lag_fb /
+    wait_ideal_ms 的其他读写同锁,这里读队列长度是安全的。
+    chart 传当前 Chart(需要 `wait_ideal_ms` 与 `_a2c_offset`),None 视为无表。
+    now 只给离线测试注入时钟用。
+    """
+    if chart is None or not _LAG_FEEDBACK_ENABLED or _lag_fb["off"]:
+        return 0.0
+    if now is None:
+        now = time.perf_counter()
+
+    # 保护①:wait 回执积压(队列长度 = 已发 wait 数 − 已收 jlog 回执数)
+    backlog = len(getattr(chart, "wait_ideal_ms", ()) or ())
+    if backlog > _lag_fb["backlog_peak"]:
+        _lag_fb["backlog_peak"] = backlog
+    if backlog <= _LAG_FB_MAX_BACKLOG:
+        _lag_fb["backlog_since"] = None
+    else:
+        since = _lag_fb["backlog_since"]
+        if since is None:
+            _lag_fb["backlog_since"] = now
+            logging.warning(
+                "滞后反馈: wait 回执积压 %d 条(>%d),lag=%.1fms 可能虚高;"
+                "持续 %.1fs 未回落就本曲停注入",
+                backlog, _LAG_FB_MAX_BACKLOG, _lag_fb["lag"],
+                _LAG_FB_BACKLOG_HOLD_S,
+            )
+        elif now - since >= _LAG_FB_BACKLOG_HOLD_S:
+            _lag_fb["off"] = True
+            stale = getattr(chart, "_a2c_offset", 0.0)
+            chart._a2c_offset = 0.0
+            logging.warning(
+                "滞后反馈: 本曲停止注入 —— wait 回执积压 %d 条(>%d)持续 %.1fs,"
+                "lag=%.1fms 已不可信;清空池水 %.1fms,退回开环补偿(批#%d)",
+                backlog, _LAG_FB_MAX_BACKLOG, now - since, _lag_fb["lag"],
+                stale, batch_no,
+            )
+            return 0.0
+
+    delta = _lag_fb["lag"] - getattr(chart, "_a2c_offset", 0.0)
+    if delta > _LAG_FB_MAX_BATCH_INJECT_MS:
+        # 保护②:虚高注入。只拦「往早推」这一侧(正增量把 wait 缩短);
+        # 负增量是池水多于残差,应用它等于往晚放,不影响安全性。
+        _lag_fb["overshoot_n"] += 1
+        if _lag_fb["overshoot_n"] == 1:
+            logging.warning(
+                "滞后反馈: 单批补足 %.1fms 超过 %.0fms 上限,本批丢弃(lag=%.1fms "
+                "池=%.1fms 批#%d);后续同类丢弃只记 debug",
+                delta, _LAG_FB_MAX_BATCH_INJECT_MS, _lag_fb["lag"],
+                getattr(chart, "_a2c_offset", 0.0), batch_no,
+            )
+        else:
+            logging.debug(
+                "滞后反馈: 单批补足 %.1fms 超限丢弃(第 %d 次,批#%d)",
+                delta, _lag_fb["overshoot_n"], batch_no,
+            )
+        return 0.0
+    return delta if abs(delta) > 0.01 else 0.0
 
 
 def reset_callback_data():
@@ -1508,9 +1754,9 @@ def _start_stuck_watchdog() -> None:
         target=_watchdog_loop, name="stuck-watchdog", daemon=True
     ).start()
     logging.info(
-        "卡死自动恢复已启动(画面与脚本连续 %.0fs 都没有进展判定卡死,"
-        "最多按 %d 次返回键)",
-        _WATCHDOG_STATIC_S, _WATCHDOG_MAX_BACKS,
+        "卡死自动恢复:待命中(仅当画面与脚本连续 %.0fs 都没有进展才会介入,"
+        "介入顺序:通知循环自行退出 → 点「演出失败→退出」→ 按返回键)",
+        _WATCHDOG_STATIC_S,
     )
 
 
@@ -1650,19 +1896,86 @@ class MarkDailyPullDone(CustomAction):
         return CustomAction.RunResult(True)
 
 
+# 崩局退出兜底(2026-10-29):
+# 12:35 场 #606 V.I.P MONSTER 崩局现场(debug/autodori-20261029-121834.log):
+# life_exhausted_exit 的 OCR 明明命中了「退出」(0.9996) 并点掉弹窗,但 next 上的
+# life_exhausted_confirm 还是 expected「退出」,而它的 roi [630,395,280,90] 在
+# 那个弹窗上覆盖的是「重新开始」「继续」两个按钮 —— 连续 5 次 OCR 只读到
+# 「斤开始 / 继」,5 秒后 Task timeout → on_error:stop → 整局清火停止,
+# 后面 3 次 main 全部「未进入演出」(游戏停在得分页)。
+# 现在管线不再要求二次确认(退出链直连 handle_life_exhausted),这里补 Python
+# 侧的收尾确认:每轮抓一张图,①还在「演出失败」弹窗就再点一次「退出」;
+# ②掉到得分页就点白色「确定」;③两样都认不到 = 已经离开演出,直接放行。
+_LIFE_EXIT_PIPELINE = {
+    "life_exit_btn": {
+        "recognition": "OCR",
+        "only_rec": True,
+        "expected": ["退出"],
+        "roi": [300, 420, 160, 70],
+    },
+    "life_result_ok": {
+        "recognition": "TemplateMatch",
+        "template": ["common/button/confirm/white.png"],
+        "roi": [300, 380, 680, 320],
+        "threshold": 0.8,
+    },
+}
+
+
+def _force_leave_live(context, max_round=3) -> bool:
+    """崩局后确保真的离开演出界面。认不到弹窗时放行(返回 False 只代表没确认到)。
+
+    只做「退出弹窗 / 得分页」两种已知画面的收尾,不猜其他 UI —— 认不出来就交给
+    后续 main 节点与看门狗,绝不在这里死等。
+    """
+    for rnd in range(1, max_round + 1):
+        screen = _grab_screen()
+        if screen is None:
+            logging.warning("崩局退出兜底:抓图失败,第 %d 轮跳过", rnd)
+            return False
+        try:
+            reco = context.run_recognition(
+                "life_exit_btn", screen, _LIFE_EXIT_PIPELINE
+            )
+            if reco is not None and reco.best_result:
+                logging.info("崩局退出兜底:第 %d 轮仍在「演出失败」弹窗,再点一次「退出」", rnd)
+                _click_at_box(reco.best_result.box)
+                time.sleep(1.0)
+                continue
+            reco = context.run_recognition(
+                "life_result_ok", screen, _LIFE_EXIT_PIPELINE
+            )
+            if reco is not None and reco.best_result:
+                logging.info("崩局退出兜底:第 %d 轮停在得分页,点「确定」", rnd)
+                _click_at_box(reco.best_result.box)
+                time.sleep(1.0)
+                continue
+        except Exception as e:  # noqa: BLE001 —— 兜底失败不能连带崩掉收尾
+            logging.warning("崩局退出兜底第 %d 轮识别失败: %s", rnd, e)
+            return False
+        logging.info("崩局退出兜底:第 %d 轮已不在演出界面,放行", rnd)
+        return True
+    logging.warning(
+        "崩局退出兜底:%d 轮后仍停在演出界面,交给后续节点/看门狗", max_round
+    )
+    return False
+
+
 @maaresource.custom_action("HandleLifeExhausted")
 class HandleLifeExhausted(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         # 这里**不是**清火阶段的收工点:生命值耗尽只说明这一首打崩了,只要还有火
         # 就该接着打下一首。「清火完成」的判据是**火量不足**,由 HandleLiveBoost
         # 在选曲确认页判定 —— 2026-10-15 之前错挂在这里,正常打完永远等不到收工。
+        # 先确认真的离开了演出(管线那一步只保证点过「退出」,不保证生效)。
+        _force_leave_live(context)
         # GUI 配置 data/config.yml 的 on_life_exhausted:
         #   auto = 回到主页后自动继续打歌; wait = 停在主页等用户手动操作
         mode = str(_runtime_config().get("on_life_exhausted", "auto") or "auto")
         if mode == "wait":
-            # 同样不依赖 on_error 冒泡(handle_life_exhausted 的父节点
-            # life_exhausted_confirm 现在恰好也配了 on_error("stop"),但那是巧合;
-            # 一旦上游 next/on_error 被改动就会退化成沿 next("main")继续打歌)。
+            # 不依赖 on_error 冒泡保证停在主页(上游 next 是 "main",一旦
+            # life_exhausted_exit 的 next/on_error 被改动,这里会退化成沿
+            # next("main")继续打歌),所以显式跑一次 stop。
             logging.info("生命值耗尽,已退出到主页,等待手动操作")
             # 登记退出请求:stop 走的是 need_to_stop 软检查,万一没落实,
             # 看门狗会在 8s 后强制 post_stop 并走统一收尾。
@@ -2130,6 +2443,121 @@ def _grab_screen():
         _SCREEN_CAP_LOCK.release()
 
 
+# ---- 崩局诊断(2026-10-28) ----
+# 背景:18:30 场 #189-special / #413-special 两首都在中途「演出失败」,而下发链
+# 完全干净(曲内滞后 -6.1 / +0.6ms、dump 失配 0)、生命条检测一直没报(31/32 次
+# 亮度预检跳过)—— 事后只剩「演出失败」那一条 OCR 文本,分辨不出是时间线整体
+# 偏早/偏晚(分数一直不涨)还是某一段崩(分数涨过再断)。补三样只读取证,全部
+# 复用打歌循环已经抓到的帧,不额外抢 IPC(外部连采会抢通道,见 _save_frame_async):
+#   ①首音触发后约 1s 存一张「首音后」画面 —— 看第一批音符有没有被判;
+#   ②崩局瞬间存帧 + OCR 左上角分数;
+#   ③崩局一行日志 + 同目录 txt(首音触发参数/批次/指令索引/在线滞后)。
+_FIRST_NOTE_DIAG = {}
+
+# 左上角分数区(1280x720):截图实测数字在 x≈65..195 / y≈65..90;避开上方
+# C/B/A/S/SS 评级条(y 30~55)与右上角暂停键。
+_CRASH_SCORE_ROI = [50, 55, 240, 48]
+_CRASH_SCORE_PIPELINE = {
+    "crash_score": {
+        "recognition": "OCR",
+        "roi": _CRASH_SCORE_ROI,
+        "only_rec": True,
+    },
+}
+
+
+def _save_frame_async(tag, frame, subdir="debug/firstnote"):
+    """把**已经抓到**的帧异步落盘(纯诊断:不抓新图、不参与判定、不占时序)。
+
+    不在这里抓图:2026-10-27 实测外部/旁路线程连采 IPC 会和 bot 抢通道
+    (滞后统计失配从 5/22020 涨到 3763/11472)。帧由打歌线程自己给。
+    """
+    if frame is None:
+        return
+    img = frame.copy()
+
+    def _worker():
+        try:
+            os.makedirs(subdir, exist_ok=True)
+            name = "%s/%s-%s.jpg" % (subdir, time.strftime("%H%M%S"), tag)
+            # IPC 帧是 RGB,cv2 要 BGR;4 通道时只留前三个
+            cv2.imwrite(name, img[:, :, :3][:, :, ::-1])
+            logging.debug("诊断截图: %s", name)
+        except Exception as e:  # noqa: BLE001 —— 诊断绝不能影响打歌
+            logging.debug("诊断截图失败(%s): %s", tag, e)
+
+    threading.Thread(target=_worker, daemon=True, name="diag-snap").start()
+
+
+def _maybe_snap_firstnote_post(frame):
+    """首音触发后约 1s,复用打歌循环已抓的帧存一张「首音后」画面。
+
+    取第一道 ≥800ms 的生命检测节拍(那时第一批音符已经过判定线)。崩局时和
+    trigger 截图对照:锚点偏早 → 判定线上没音符、分数不涨;偏晚 → 音符已压在
+    判定线下方。纯诊断,不额外抓图,不参与判定。
+    """
+    diag = _FIRST_NOTE_DIAG
+    t0 = diag.get("t")
+    if t0 is None or diag.get("post_saved"):
+        return
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if elapsed_ms < 800.0:
+        return
+    diag["post_saved"] = True
+    _save_frame_async("firstnote+%dms" % int(elapsed_ms), frame)
+
+
+def _dump_crash_diag(context, frame, song_label, batch_no, chart):
+    """崩局(打歌中生命耗尽)取证:落帧 + 读分数 + 汇总日志 + txt。
+
+    分数是事后区分两类崩局的唯一信号:时间线整体错(锚点偏早/偏晚)→ 分数
+    几乎不涨;某一段崩(手势/游戏卡顿)→ 分数涨过一大截才断。
+    全部只读 —— OCR 发生在已经判定失败之后,不再影响任何时序。
+    """
+    label = "%s-%s" % (time.strftime("%H%M%S"), song_label)
+    _save_frame_async("crash", frame, "debug/crash")
+    score = ""
+    try:
+        reco = context.run_recognition(
+            "crash_score", frame, _CRASH_SCORE_PIPELINE
+        )
+        score = (reco.best_result.text if reco and reco.best_result else "") or ""
+    except Exception as e:  # noqa: BLE001
+        logging.debug("崩局分数 OCR 失败: %s", e)
+    diag = dict(_FIRST_NOTE_DIAG)
+    t0 = diag.get("t")
+    played_s = (time.perf_counter() - t0) if t0 else -1.0
+    sent = getattr(chart, "actions_to_cmd_index", -1)
+    total = len(getattr(chart, "actions", []))
+    lag = _lag_fb.get("lag", 0.0)
+    summary = (
+        "已打 %.1fs(自首音触发) · 发布批次 %d · 指令索引 %s/%s"
+        " · 在线 lag %.1fms · 画面分数 '%s'"
+    ) % (played_s, batch_no, sent, total, lag, score)
+    logging.info("崩局诊断: %s", summary)
+    try:
+        os.makedirs("debug/crash", exist_ok=True)
+        with open("debug/crash/%s.txt" % label, "w", encoding="utf-8") as f:
+            f.write("# 崩局诊断 %s 曲目 %s photogate=%sms\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), song_label,
+                PHOTOGATE_LATENCY,
+            ))
+            f.write("# " + summary + "\n")
+            if diag.get("t") is not None:
+                f.write((
+                    "# 首音触发[%s]: band %.0fms change=%.2f %d/7 轨变化"
+                    " 底噪=%.2f 触发帧 y=%.1f\n"
+                ) % (
+                    diag.get("kind", "?"), diag.get("band_ms", 0.0),
+                    diag.get("change", 0.0), diag.get("lanes", 0),
+                    diag.get("noise", 0.0), diag.get("y", -1.0),
+                ))
+            else:
+                f.write("# 首音触发: 本局无记录(未经过 wait_first_note)\n")
+    except Exception as e:  # noqa: BLE001 —— 诊断落盘失败不影响收尾
+        logging.debug("崩局诊断落盘失败: %s", e)
+
+
 def _pause_dialog_on_screen(context, screen=None) -> bool:
     """打歌中当前画面是否是「暂停」弹窗。异常一律当没弹,绝不带崩打歌。
 
@@ -2561,8 +2989,11 @@ def _prepare_special_song(cli_value: str) -> None:
 
 def _reload_photogate():
     """每首歌开始前重读 data/config.yml 的 photogate_latency_ms,
-    让 GUI 自动校准在单次运行里也能连续生效(不用重启 bot)。"""
-    global PHOTOGATE_LATENCY
+    让 GUI 自动校准在单次运行里也能连续生效(不用重启 bot)。
+
+    同时读 timing.measure_anchor(L2 锚点在线实测的总开关),口径与 photogate 一致:
+    改完下一首就生效,不必重启。"""
+    global PHOTOGATE_LATENCY, PHOTOGATE_MEASURE_ENABLED
     try:
         cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if isinstance(cfg, dict):
@@ -2572,11 +3003,19 @@ def _reload_photogate():
                 logging.debug(
                     "PHOTOGATE_LATENCY reloaded to {}ms".format(PHOTOGATE_LATENCY)
                 )
+            if isinstance(timing, dict) and timing.get("measure_anchor") is not None:
+                PHOTOGATE_MEASURE_ENABLED = bool(timing["measure_anchor"])
+                logging.debug(
+                    "PHOTOGATE_MEASURE_ENABLED reloaded to %s",
+                    PHOTOGATE_MEASURE_ENABLED,
+                )
     except Exception as e:
         logging.debug("Failed to reload photogate: {}".format(e))
 
 
-def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
+def _dump_server_lag_async(
+    song_label: str, chart_actions: list, fb_snap: dict = None
+) -> None:
     """歌结束后,把「服务端实际执行时刻 vs 谱面理想时间线」的滞后曲线写进日志。
 
     背景:FULL 曲后半段越打越慢、批量出 SLOW(2026-10-21 11:43 场,[FULL]
@@ -2681,13 +3120,17 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                 j += 1
             lags = [p[2] for p in pairs]
             if len(lags) < 50 or miss > 0.02 * len(events):
-                # 对齐失败只说明这份诊断数据采不到(本工具的重建与真实命令流
+                # 对齐失败只说明这份诊断数据算不出来(命令流重建与真实命令流
                 # 对不上),与打歌本身无关 —— 打歌在那之前已经结束。文案写明,
-                # 免得用户看到 WARNING 以为打歌出了问题。
+                # 免得用户看到 WARNING 以为打歌出了问题。措辞口语化、压长度,
+                # 让 GUI 控制台一行放得下(2026-10-26 用户反馈分行难读)。
+                # 2026-10-28 用户反馈「命令流与谱面对不上」拗口:改成
+                # 「N/M 条指令与谱面错位」,先说数量再说动作,并且把
+                # 「仅诊断」讲明 —— 这条 WARNING 只影响滞后统计。
                 logging.warning(
-                    "服务端执行滞后[%s]: 诊断数据本局不采"
-                    "(命令流对齐失败: events=%d, ideal=%d, 失配=%d;不影响打歌)",
-                    song_label, len(events), len(ideal), miss,
+                    "服务端执行滞后[%s]: 有 %d/%d 条指令与谱面错位,"
+                    "本局跳过统计(仅诊断,不影响打歌)",
+                    song_label, miss, len(events),
                 )
                 return
             n = len(lags)
@@ -2697,6 +3140,19 @@ def _dump_server_lag_async(song_label: str, chart_actions: list) -> None:
                 "@90%%=%.1f @100%%=%.1f ms, 曲内增长=%.1fms",
                 song_label, len(events), miss, v[0], v[1], v[2], v[3], v[3] - v[0],
             )
+            # 2026-10-28 诊断:在线反馈 lag 与 dump(绝对口径)对照。
+            # 两者理论同口径,实测会分叉(±5ms vs -98ms / 243ms 虚高),分叉量
+            # 就是测量端退化的程度;queue 空兜底条数用来判是不是那条路造成的。
+            if fb_snap:
+                logging.info(
+                    "滞后反馈对照[%s]: 在线 lag 终值 %.1fms, dump lag@100%%=%.1fms,"
+                    " 差值 %.1fms; wait 回执 %d 条, 队列空兜底 %d 条%s",
+                    song_label, fb_snap.get("lag", 0.0), v[3],
+                    fb_snap.get("lag", 0.0) - v[3],
+                    fb_snap.get("wait_recv", 0),
+                    fb_snap.get("fallback_n", 0),
+                    ", 本曲已停注入" if fb_snap.get("off") else "",
+                )
 
             def _pos_pct(seq, p):
                 return seq[min(len(seq) - 1, int(len(seq) * p))]
@@ -2771,6 +3227,11 @@ def play_song(context=None):
     cmd_log_list.clear()
     reset_callback_data()
     reset_lag_feedback()
+    # 每首新歌清掉看门狗的卡死事件:上一首歌里事件置位后本循环已 raise,
+    # 这里不清的话,残留事件会在下一首的首音等待里立刻误触发放弃。
+    _STUCK_EVENT.clear()
+    # 崩局诊断(2026-10-28):首音触发参数按曲重置,别让上一首的值串到下一首。
+    _FIRST_NOTE_DIAG.clear()
     wait_first = get_runtime_info(current_player.resolution)["wait_first"]
     logging.info(
         "打歌: %s (#%s-%s), 动作%s, photogate=%sms, 检测带y=%s-%s",
@@ -2892,6 +3353,9 @@ def play_song(context=None):
                     last_life_check = time.perf_counter()
                     sleep_s = max(0.0, sleep_s - (time.perf_counter() - check_t0))
                 else:
+                    # 崩局诊断(2026-10-28):首音后约 1s 复用这张已抓的帧存图,
+                    # 不额外抓图 —— 崩局时对照 trigger 截图判断锚点偏早/偏晚。
+                    _maybe_snap_firstnote_post(frame)
                     life_result = _life_exhausted_on_screen(context, frame)
                     life_stats["checks"] += 1
                     # 注意:_life_exhausted_on_screen 返回的状态名与统计键名不同名
@@ -2908,11 +3372,21 @@ def play_song(context=None):
                     if life_result == "hit":
                         logging.info("打歌中生命值耗尽,提前结束本次演出")
                         _log_life_stats()
+                        # 崩局取证(2026-10-28):用上面这张已经抓到的帧存画面 +
+                        # 读分数,再汇总首音参数与指令进度。只读,不影响收尾。
+                        _dump_crash_diag(
+                            context, frame,
+                            "%s-%s" % (current_song_id, DIFFICULTY),
+                            batch_no, current_chart,
+                        )
                         # 提前退出的局同样输出服务端执行滞后:生命耗尽往往就是
                         # 锚点/时序问题,这份数据正是定位要用的(正常局才有会
                         # 漏掉全部失败局)。jlog 由 reader 线程持续回传,daemon
                         # 线程自行等静默,不阻塞本线程抛异常走 on_error。
-                        _dump_server_lag_async(current_song_name, current_chart.actions)
+                        _dump_server_lag_async(
+                            current_song_name, current_chart.actions,
+                            _lag_fb_snapshot(),
+                        )
                         raise LifeExhaustedDetected()
                     # 暂停弹窗(2026-10-17 用户实况):不点「中断」这一局永远挂着。
                     # 复用同一个 1s 检测节拍,模板匹配本身很便宜;检测耗时同样从
@@ -2955,13 +3429,17 @@ def play_song(context=None):
                 # 测量滞后(发布领先 2~3s)使补足相位落后 1~2 批,误差方向
                 # 偏少注(安全侧),量级 ≤2×每批新漂移(~2ms),可接受。
                 if _LAG_FEEDBACK_ENABLED:
-                    _fb_delta = _lag_fb["lag"] - current_chart._a2c_offset
+                    # 两道保护(回执积压停注入 / 单批补足超限丢弃)在函数里判,
+                    # 返回 0 就是本批不注入;背景见 lag_feedback_batch_delta 上方。
+                    _fb_pool_before = current_chart._a2c_offset
+                    _fb_delta = lag_feedback_batch_delta(
+                        current_chart, batch_no
+                    )
                     if abs(_fb_delta) > 0.01:
                         current_chart._a2c_offset += _fb_delta
                         logging.debug(
                             "滞后反馈: 残差%.1fms 池%.1f→%.1f(批#%d)",
-                            _lag_fb["lag"],
-                            current_chart._a2c_offset - _fb_delta,
+                            _lag_fb["lag"], _fb_pool_before,
                             current_chart._a2c_offset, batch_no,
                         )
                 _adjust_offset()
@@ -2971,9 +3449,102 @@ def play_song(context=None):
             )
         else:
             break
+    # 反馈补偿的曲末汇总(2026-10-28):回执积压峰值是「jlog 到底丢没丢」的
+    # 直接证据 —— 正常只领先 1~2 批(≤200 条),峰值贴着上限或者被保护①
+    # 停过注入,就是这一局下发链出问题的实锤。阈值(400)要靠这些数校准。
+    if _LAG_FEEDBACK_ENABLED:
+        # 2026-10-28 加后两个数:wait 配对成功条数 / 队列空兜底条数。
+        # 兜底条数>0 就说明本曲 lag 有一部分是「拿实际值当理想值」算出来的,
+        # dump 与在线分叉时先看这个数。
+        logging.info(
+            "滞后反馈汇总: 回执积压峰值 %d 条(上限 %d), 单批超限丢弃 %d 批;"
+            " wait 回执 %d 条, 队列空兜底 %d 条%s",
+            _lag_fb["backlog_peak"], _LAG_FB_MAX_BACKLOG,
+            _lag_fb["overshoot_n"], _lag_fb["wait_recv"],
+            _lag_fb["fallback_n"],
+            ", 本曲已停注入" if _lag_fb["off"] else "",
+        )
     _log_life_stats()
-    _dump_server_lag_async(current_song_name, current_chart.actions)
+    _dump_server_lag_async(
+        current_song_name, current_chart.actions, _lag_fb_snapshot()
+    )
     time.sleep(2)
+
+
+# ---- 首音候选可信度门(2026-10-27,用户反馈「刚开打歌对不上导致 miss」)----
+# 背景:23:24 场第 1 首 #3-special ぽっぴん’しゃっふる,冻结期底噪长期 3.7~4.4,
+# 首音候选以 change=3.42(仅高于阈值 1.4)越阈值就被锚定 → 实际晚了数百毫秒
+# (触发帧截图 debug/firstnote/232424-trigger.jpg 上已显示 MISS、最近的音符
+# 还在检测带上方),整曲错位,开打 7 秒生命耗尽。而失败局没有结算 FAST/SLOW,
+# GUI 的 photogate 自动校准既拿不到信号、也不会调(量级也差两个数量级)。
+# 正常曲目对照(同场第 2 首 ONENESS 全 PERFECT):触发 change=9.68,
+# band 与顶部 7 行越阈值的时差 -4ms(实测正常范围 -8~+1ms)。
+# 所以把「这不是音符、是背景光效在缓慢变化」做成两道可量化的判据:
+#   ① 触发值必须显著高于冻结期底噪,否则只是噪声抖了一下;
+#   ② band 与顶部灵敏判据必须是同一物体(越阈值时刻相近),否则是两段无关变化。
+# 命中任一条就**不锚定**,重置基线继续等真首音。三条放行条件防止过度拦截:
+# 不同候选累计拒绝 MAX_TRIGGER_REJECTS 次、累计拒绝超过 REJECT_GIVEUP_S 秒、
+# 或顶部判据这次没记录到越阈值(没有可对照证据,安全侧放行)。
+TRIGGER_NOISE_RATIO = 1.5       # 触发值 ≥ 底噪 × 1.5 才可信
+TRIGGER_EDGE_WINDOW_MS = 150.0  # band 与顶部判据越阈值的最大允许时差
+MAX_TRIGGER_REJECTS = 3         # 不同候选累计拒绝上限
+REJECT_GIVEUP_S = 8.0           # 累计拒绝时长上限(秒),到点放宽
+
+
+def _first_note_trigger_check(
+    change_score,
+    noise_floor,
+    band_t,
+    edge_last_t,
+    rejects,
+    rejected_s,
+    threshold=3.0,
+):
+    """首音候选是否可信 → (ok, reason);reason 为空串表示通过。
+
+    纯函数,离线回归见 _test_firstnote.py。判据与放行条件见上方常量注释。
+    noise_floor=0 表示没有可信底噪(冻结强制超时的曲目),此时不启用判据①。
+    """
+    if rejects >= MAX_TRIGGER_REJECTS or rejected_s >= REJECT_GIVEUP_S:
+        return True, ""
+    if noise_floor > 0:
+        floor = max(threshold, noise_floor * TRIGGER_NOISE_RATIO)
+        if change_score < floor:
+            return False, "低于底噪(change=%.2f < %.2f, 底噪=%.2f)" % (
+                change_score, floor, noise_floor)
+    if edge_last_t is not None:
+        lead_ms = (band_t - edge_last_t) * 1000.0
+        if lead_ms > TRIGGER_EDGE_WINDOW_MS:
+            return False, "顶部判据早 %.0fms(不是同一个物体)" % lead_ms
+        if lead_ms < -TRIGGER_EDGE_WINDOW_MS:
+            return False, "顶部判据晚 %.0fms(不是同一个物体)" % (-lead_ms)
+    return True, ""
+
+
+# ---- L2:首音锚点在线实测(2026-10-27,先取证后启用)----
+# 现状:锚点 = 「检测带越阈值时刻 + PHOTOGATE_LATENCY」。检测带到判定线那 55px
+# 的传播时间被写死成一个数,但实测证据(2026-10-27 晚)否定了这个前提:
+#   · 同一晚 photogate 被自动校准推过 40/41/47/50/55/59/60/67/70/72/85/86ms;
+#   · 同一首 #179 檄!帝国華撃団 在 gate=50/59/67 下 fast=170/151/90、miss=29/22/4,
+#     而同 gate=50 的 #12 走り始めたばかり 全 0 —— 一个常量没法同时适配两首曲;
+#   · 首曲冷启动、失败局(无结算 FAST/SLOW)自动校准都够不着。
+# 实测法:锚定后跟 1~2 帧,用「带内相对静默背景的亮部重心」位移算下落速度,
+# 外推到判定线 y=590;测不出速度、或结果与常量估计差太多就回退常量。
+# **默认关闭**:先靠 _dump_firstnote_trace 落盘的曲线核对口径(本轮),数据支持后
+# 再把 PHOTOGATE_MEASURE_ENABLED 打开或写进 data/config.yml 的 timing.measure_anchor。
+PHOTOGATE_MEASURE_ENABLED = False
+MEASURE_MAX_FRAMES = 2        # 触发后最多额外抓几帧(1 帧 ≈ 6~10ms)
+MEASURE_V_MIN = 0.15          # px/ms,低于当静止/未动
+MEASURE_V_MAX = 4.0           # px/ms,高于当误检
+MEASURE_MAX_DIFF_MS = 45.0    # 与常量估计的最大允许差异,超出视为实测不可信
+
+
+def _weighted_centroid(weights):
+    """按行权重算重心(返回行偏移);权重全 0 返回 -1。纯函数,便于离线回归。"""
+    total = float(weights.sum())
+    if total <= 1e-6:
+        return -1.0
+    return float((weights * np.arange(len(weights))).sum() / total)
 
 
 def wait_first_note():
@@ -3022,6 +3593,21 @@ def wait_first_note():
     LANE_CHANGE_MIN = 1.0  # 单轨变化量达到该值计入"变化轨道"
     last_lane_avg = None   # 上一帧各轨道(检测带内)平均色,与 last_avg 同步维护
 
+    # 首音候选可信度门的状态(判据见 _first_note_trigger_check 上方注释)。
+    noise_samples = deque(maxlen=200)  # 冻结期各帧 change,用于估静默底噪
+    noise_floor = 0.0                  # 冻结完成时的底噪;0 = 不启用判据①
+    edge_last_t = None                 # 最近一次「顶部 7 行越阈值」的时刻
+    prev_edge_change = None            # 上一帧顶部判据的帧间变化(判「越阈值那一帧」)
+    last_rows = None                   # 上一帧逐行颜色,算「带内差分重心」取证用
+    trigger_rejects = 0                # 不同候选被拒次数(间隔 >300ms 才算新候选)
+    last_reject_t = None
+    reject_since = None                # 首次拒绝时刻,算累计拒绝时长
+
+    # L2 取证/实测状态(见 PHOTOGATE_MEASURE_ENABLED 上方注释)。
+    band_baseline = None               # 冻结完成时的逐行颜色 = 静默背景
+    cent_history = deque(maxlen=12)    # 触发前若干帧的 (t_ms, 带内音符绝对 y)
+    judge_y = _lane_info["h"]          # 判定线 y(命中区中心),590 @720p
+
     def _lane_avgs(scr):
         """检测带各轨道的平均色,shape=(7,3)。轨道 x 范围来自 util 的 lane 配置。"""
         x0, w = _lane_info["start_x"], _lane_info["w"]
@@ -3041,11 +3627,140 @@ def wait_first_note():
     _log_t = 0.0
     _snap_start_done = False  # 起始帧截图只拍一次
 
+    def _band_centroid():
+        """触发帧「带内逐行差分」的亮部重心(0=检测带顶, row_count-1=带底)。
+
+        纯取证,不参与判定:真音符是一小段亮块,差分重心应落在带内、随帧下移;
+        背景光效/立绘动画的差分是整带弥散的。先在日志里攒几场数据,再决定要不要
+        拿它做「锚点在线实测」(L2)—— 直接改锚点算法前必须先离线验证重心能否
+        稳定提取(见 _diag_firstnote.py)。
+        """
+        if last_rows is None:
+            return -1.0
+        dy = np.abs(rows - last_rows).sum(axis=1)
+        total = float(dy.sum())
+        if total <= 1e-6:
+            return -1.0
+        return float((dy * np.arange(row_count)).sum() / total)
+
+    def _rows_of(img):
+        """检测带逐行 RGB 均值,shape=(row_count,3)。主循环与实测抓帧共用。"""
+        arr = np.empty((row_count, 3), dtype=np.float64)
+        for r in range(from_row, to_row + 1):
+            avg, _ = evaluate_row_color(img, r)
+            arr[r - from_row] = avg
+        return arr
+
+    def _band_y_from_rows(rows_):
+        """当前帧带内音符的绝对 y;无有效差异返回 -1。
+
+        用「相对静默基线」而不是帧间差分:差分在音符移动时会出现「新位置亮 +
+        旧位置恢复」两块,重心落在中间、速度被系统性低估;基线法直接给音符当前
+        所在行。背景有轻微动画时靠 -1.0 的门限把底噪压掉。
+        """
+        if band_baseline is None:
+            return -1.0
+        w = np.abs(rows_ - band_baseline).sum(axis=1)
+        c = _weighted_centroid(np.clip(w - 1.0, 0, None))
+        return -1.0 if c < 0 else from_row + c
+
+    def _measure_anchor(y0, t0):
+        """触发后实测下落速度,预测到判定线还需多久 → (wait_ms, 说明)。
+
+        测不出返回 (None, 原因)。只多抓 1~2 帧(每帧 6~10ms),时间从原本要睡的
+        photogate 里扣,不额外推后时间线。
+        """
+        y_prev, t_prev = y0, t0
+        seen = 0
+        for _ in range(MEASURE_MAX_FRAMES):
+            img = current_player.ipc_capture_display()
+            t = time.perf_counter()
+            if img is None:
+                break
+            y = _band_y_from_rows(_rows_of(img))
+            if y < 0:
+                continue
+            dt_ms = (t - t_prev) * 1000.0
+            if dt_ms <= 0.5:
+                continue
+            v = (y - y_prev) / dt_ms
+            seen += 1
+            if MEASURE_V_MIN <= v <= MEASURE_V_MAX:
+                return (judge_y - y) / v, "y=%.1f v=%.2fpx/ms" % (y, v)
+            y_prev, t_prev = y, t
+        return None, "速度不可信(样本%d)" % seen
+
+    def _dump_trace(cross_t, change_score, kind, y0):
+        """把触发前后若干帧的「带内音符 y」落盘,供 L2 启用前核对口径。
+
+        纯日志:daemon 线程异步写,不参与判定、不占打歌时序。原来靠外部脚本
+        连采 IPC 取证,会和 bot 抢通道(2026-10-27 实测把滞后统计的失配从
+        5/22020 拉到 3763/11472),改成 bot 自己落盘。
+        """
+        # 主线程先拷一份快照:deque 在落盘线程里迭代时若被 while 循环继续 append,
+        # 会抛 "deque mutated during iteration",文件就空了。
+        history = list(cent_history)
+
+        def _worker():
+            try:
+                os.makedirs("debug/firstnote", exist_ok=True)
+                path = "debug/firstnote/%s-%s-%s-anchor.txt" % (
+                    time.strftime("%H%M%S"), current_song_id, DIFFICULTY)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(
+                        "# %s (#%s-%s) photogate=%dms 检测带 y=%d-%d 判定线 y=%d\n"
+                        % (current_song_name, current_song_id, DIFFICULTY,
+                           PHOTOGATE_LATENCY, from_row, to_row, judge_y)
+                    )
+                    f.write(
+                        "# 触发[%s] band %.0fms change=%.2f 底噪=%.2f 拒绝%d次 触发帧 y=%s\n"
+                        % (kind, (cross_t - t_start) * 1000.0, change_score,
+                           noise_floor, trigger_rejects,
+                           "-" if y0 is None or y0 < 0 else "%.1f" % y0)
+                    )
+                    f.write("# t_ms\ty\n")
+                    for t_ms, y in history:
+                        f.write("%.0f\t%.1f\n" % (t_ms, y))
+                logging.info("首音曲线已落盘 %s", path)
+            except Exception as e:  # noqa: BLE001 —— 落盘失败绝不影响打歌
+                logging.debug("首音曲线落盘失败(%s)", e)
+
+        threading.Thread(
+            target=_worker, daemon=True, name="firstnote-trace"
+        ).start()
+
+    def _resolve_anchor_wait(cross_t, wait_ms, y0, change_score, kind):
+        """落盘曲线,并按需实测锚点;返回最终应睡毫秒。
+
+        未启用实测(默认)时原样返回常量结果,行为与改动前完全一致。
+        """
+        _dump_trace(cross_t, change_score, kind, y0)
+        # y0 < 0 = 触发帧带内没有可辨识的音符位置(音符可能已在带下方/背景遮挡),
+        # 没有起点就没法测速,直接用常量。
+        if not PHOTOGATE_MEASURE_ENABLED or y0 is None or y0 < 0:
+            return wait_ms
+        remain_ms = wait_ms - (time.perf_counter() - cross_t) * 1000.0
+        m_wait, desc = _measure_anchor(y0, time.perf_counter())
+        if m_wait is None:
+            logging.info("首音锚点实测[%s]: 跳过(%s),用常量 %.0fms",
+                         kind, desc, max(0.0, remain_ms))
+            return max(0.0, remain_ms)
+        if abs(m_wait - remain_ms) > MEASURE_MAX_DIFF_MS:
+            logging.info(
+                "首音锚点实测[%s]: %s → %.0fms,与常量 %.0fms 差 %.0fms 超限,回退常量",
+                kind, desc, m_wait, remain_ms, abs(m_wait - remain_ms),
+            )
+            return max(0.0, remain_ms)
+        logging.info("首音锚点实测[%s]: %s → %.0fms(常量 %.0fms,差 %.0fms)",
+                     kind, desc, m_wait, remain_ms, m_wait - remain_ms)
+        return max(0.0, m_wait)
+
     def _log_trigger(cross_t, change_score, kind, lanes=0):
         """记录首音触发点,并把「检测带顶部若干行」这个更灵敏的判据本来会在
         什么时候触发一并记下。两者之差就是现有判据的滞后量 —— 「前几个音符
         miss」若出在首音判定上,这条日志能直接量化,不必先改触发逻辑去赌。
-        lanes = 触发帧里发生变化的轨道数(1-2 轨 = 音符形态,可作诊断)。"""
+        lanes = 触发帧里发生变化的轨道数(1-2 轨 = 音符形态,可作诊断)。
+        底噪/带内重心是 2026-10-27 加的可信度门取证字段(见 _first_note_trigger_check)。"""
         band_ms = (cross_t - t_start) * 1000.0
         if edge_cross_t is None:
             edge_desc, lead = "未越阈值", ""
@@ -3054,9 +3769,70 @@ def wait_first_note():
             edge_desc = "%.0fms" % edge_ms
             lead = "(灵敏判据早 %.0fms)" % (band_ms - edge_ms)
         logging.info(
-            "首音触发[%s]: band %.0fms change=%.2f, %d/7 轨变化, 顶部%d行 %s %s",
+            "首音触发[%s]: band %.0fms change=%.2f, %d/7 轨变化, 顶部%d行 %s %s, "
+            "底噪=%.2f 带内重心=%.1f/%.0f 拒绝%d次",
             kind, band_ms, change_score, lanes, edge_count, edge_desc, lead,
+            noise_floor, _band_centroid(), row_count - 1, trigger_rejects,
         )
+        # 2026-10-28 崩局诊断:把触发参数留给 _dump_crash_diag —— 崩局时
+        # 「首音是怎么锚的」和「画面分数」放在一起才能判断锚点偏早还是偏晚。
+        _FIRST_NOTE_DIAG.update({
+            "kind": kind, "band_ms": band_ms, "lanes": lanes,
+            "change": change_score, "noise": noise_floor,
+            "y": -1.0 if note_y is None else float(note_y),
+            "gate": PHOTOGATE_LATENCY, "t": cross_t, "post_saved": False,
+        })
+
+    def _reject_trigger(reason, change_score, frame_t, kind):
+        """拒绝本次首音候选:计数(同一段持续变化只算一次)并记取证日志。
+
+        调用方负责重置基线后 continue;这里只管计数与日志。间隔 >300ms 才算
+        新候选,否则持续噪声会在几百毫秒内把拒绝配额烧光。
+        """
+        nonlocal trigger_rejects, last_reject_t, reject_since
+        if last_reject_t is None or (frame_t - last_reject_t) > 0.3:
+            trigger_rejects += 1
+        last_reject_t = frame_t
+        if reject_since is None:
+            reject_since = frame_t
+        edge_desc = (
+            "未记录" if edge_last_t is None
+            else "%.0fms" % ((edge_last_t - t_start) * 1000.0)
+        )
+        logging.warning(
+            "首音候选被拒[%s · %s]: band %.0fms change=%.2f 底噪=%.2f "
+            "顶部判据 %s 带内重心=%.1f/%.0f,第 %d 次拒绝(累计 %.1fs),重置基线继续等",
+            kind, reason, (frame_t - t_start) * 1000.0, change_score,
+            noise_floor, edge_desc, _band_centroid(), row_count - 1,
+            trigger_rejects, frame_t - reject_since,
+        )
+
+    def _gate_reject(change_score, frame_t, kind):
+        """执行可信度门;不通过就拒绝并把基线重置到本帧,返回 True(调用方 continue)。
+
+        与场景切换分支同一套重置方式(基线推进到本帧、prev_change 记本帧变化),
+        否则下一帧会因为 prev_change 仍为旧值而重复触发同一个候选。
+        """
+        nonlocal last_avg, last_edge_avg, last_lane_avg, last_rows
+        nonlocal prev_change, prev_frame_t
+        ok, reason = _first_note_trigger_check(
+            change_score,
+            noise_floor,
+            frame_t,
+            edge_last_t,
+            trigger_rejects,
+            (frame_t - reject_since) if reject_since else 0.0,
+        )
+        if ok:
+            return False
+        _reject_trigger(reason, change_score, frame_t, kind)
+        last_avg = band_avg
+        last_edge_avg = edge_avg
+        last_lane_avg = lane_avg
+        last_rows = rows
+        prev_change = change_score
+        prev_frame_t = frame_t
+        return True
 
     def _snap(tag):
         """关键瞬间抓一帧存 debug/firstnote/,人工核对首音锚点用(纯诊断:
@@ -3110,6 +3886,17 @@ def wait_first_note():
     # 取 12s 既容得下前奏偏长的曲子,又不会等到歌都快结束了还在等。
     FREEZE_TIMEOUT_S = 12.0
 
+    # 首音阶段总超时(2026-10-26 #400 CATASTROPHE BANQUET 事故):冻结封顶后
+    # 本循环再无任何退出条件 —— 那首 MV 大立绘曲的全轨背景变化让每个首音候选
+    # 都被 SCENE_MIN_LANES(>=5/7 轨)判成"场景切换"吞掉,一个音没打、生命耗尽
+    # 弹「演出失败」,而 Play 卡在本循环里永不返回,MAA 任务线程被占死,看门狗
+    # 按返回键(弹窗不响应 BACK)和 post_stop(停不掉运行中的 CustomAction)都
+    # 救不了,整局僵死 8 分钟直到手动重启。取 240s:实测生命耗尽弹窗在开局后
+    # 约 2.5~3 分钟出现,超时放弃时弹窗必已在屏上,playsong.on_error 的
+    # life_exhausted_exit(OCR 点「退出」)能直接接管回主页继续下一首;正常曲
+    # 进 live 到首音触发只要 4~8s,余量 30 倍。
+    FIRST_NOTE_TIMEOUT_S = 240.0
+
     # 抓屏失败计数(对应下方 except)。
     # 原来这里只有一行 `logging.error` —— 抓屏**持续**失败时(模拟器 IPC 断连、
     # 游戏崩了、分辨率被改、MuMu 被切后台)整个 while 就成了无退避的死循环:
@@ -3120,6 +3907,28 @@ def wait_first_note():
     capture_failures = 0
 
     while True:
+        # 看门狗协作式解救(见 _STUCK_EVENT 注释):等待循环每帧看一眼,
+        # 看门狗判卡死就立刻放弃走 on_error,不用干等下面的 240s 总超时。
+        # is_set() 是纯布尔读(几十 ns),且只在等待阶段执行 —— 打歌发布的
+        # 热路径(逐批下发音符命令)一行不碰,对时序零影响。
+        # 必须放在 try **外**:循环体整体包在 try 里,底部 except 会把一切
+        # 异常当"抓屏失败"计数,raise 在里面只会被吞掉转圈。
+        # 抛 RuntimeError → Play 的通用 except 捕获 → RunResult(False) →
+        # playsong.on_error(save_failed_playresult → life_exhausted_exit)收尾。
+        if _STUCK_EVENT.is_set():
+            logging.warning("看门狗判定卡死,放弃本局等待首音,走 on_error 收尾")
+            raise RuntimeError("看门狗判定卡死,放弃本局")
+        if freezed and (
+            time.perf_counter() - t_start
+        ) >= FIRST_NOTE_TIMEOUT_S:
+            logging.warning(
+                "首音 %.0fs 仍未触发,放弃本局走 on_error(疑似 MV/场景变化"
+                "把首音判据全吞了,见 SCENE_MIN_LANES 注释)",
+                FIRST_NOTE_TIMEOUT_S,
+            )
+            raise RuntimeError(
+                "等待首音 %ds 未触发,放弃本局" % FIRST_NOTE_TIMEOUT_S
+            )
         try:
             screen = current_player.ipc_capture_display()
             capture_failures = 0
@@ -3139,14 +3948,17 @@ def wait_first_note():
                 last_avg = band_avg = None
                 last_edge_avg = None
                 last_lane_avg = None
+                last_rows = None
                 prev_change = None
                 prev_frame_t = None
+                # 强制超时说明检测带一直在动,此时算出来的「底噪」是运动水平,
+                # 拿它当判据①会把真首音也拦掉 —— 干脆不启用(只留判据②)。
+                noise_floor = 0.0
+                # 没有静默基线,L2 的「带内音符位置」算不出来,一并不启用。
+                band_baseline = None
                 _maybe_log(0.0, (0.0, 0.0, 0.0), "force-timeout")
                 continue
-            rows = np.empty((row_count, 3), dtype=np.float64)
-            for r in range(from_row, to_row + 1):
-                avg, _ = evaluate_row_color(screen, r)
-                rows[r - from_row] = avg
+            rows = _rows_of(screen)
             if not _snap_start_done:
                 _snap_start_done = True
                 _snap("start")
@@ -3172,6 +3984,11 @@ def wait_first_note():
                     else 0.0
                 )
                 if last_avg is not None:
+                    # 底噪采样:冻结期每帧的 change。冻结完成时最后 200 帧必然
+                    # 都 ≤ 阈值(deque 只留这么长),取中位数就是这台机器/这个
+                    # 画面在这首歌开始时的静默水平 —— 触发值要显著高于它才算
+                    # 真音符(判据①,见 _first_note_trigger_check)。
+                    noise_samples.append(change_score)
                     if change_score <= CHANGE_THRESHOLD:
                         if waited_frames == 0:
                             _freeze_t0 = frame_t
@@ -3183,12 +4000,19 @@ def wait_first_note():
                         freezed = True
                         _freeze_done_t = frame_t
                         _log_t = 0.0  # 进入触发期,重置节流以便逐帧记录
+                        noise_floor = (
+                            float(np.median(noise_samples)) if noise_samples else 0.0
+                        )
+                        # 静默背景存一份:L2 用「当前帧相对它」定位音符所在行,
+                        # 比帧间差分准(差分在移动时重心落在新旧位置中间)。
+                        band_baseline = rows.copy()
                         fps = (
                             200.0 / max((frame_t - _freeze_t0) * 1000.0, 1e-6) * 1000.0
                         )
                         logging.info(
                             "冻结完成: 等待首音总耗时 %.0fms(静默判定被重置 %d 次), "
-                            "最后 200 帧耗 %.0fms(约 %.0f fps), 检测带 y=%d-%d(顶部 %d 行作灵敏判据)",
+                            "最后 200 帧耗 %.0fms(约 %.0f fps), 检测带 y=%d-%d(顶部 %d 行作灵敏判据), "
+                            "底噪=%.2f",
                             (frame_t - t_start) * 1000.0,
                             freeze_resets,
                             (frame_t - _freeze_t0) * 1000.0,
@@ -3196,10 +4020,12 @@ def wait_first_note():
                             from_row,
                             to_row,
                             edge_count,
+                            noise_floor,
                         )
                 last_avg = band_avg
                 last_edge_avg = edge_avg
                 last_lane_avg = lane_avg
+                last_rows = rows
                 _maybe_log(change_score, band_avg)
                 continue
 
@@ -3212,6 +4038,11 @@ def wait_first_note():
                 if last_avg is not None
                 else 0.0
             )
+            # 带内音符位置(相对静默背景):触发前攒一小段历史,触发时落盘供
+            # L2 核对口径;只在 freezed 阶段算,冻结期不做无用功。
+            note_y = _band_y_from_rows(rows)
+            if note_y >= 0:
+                cent_history.append(((frame_t - t_start) * 1000.0, note_y))
             # 灵敏判据的越阈值时刻:宽限期内的也照记 —— 真首音若正好落在宽限
             # 窗口里会被整段忽略,这条能看出它当时到底有没有越阈值。
             if (
@@ -3220,6 +4051,17 @@ def wait_first_note():
                 and edge_change >= CHANGE_THRESHOLD
             ):
                 edge_cross_t = frame_t
+            # 门控用的「最近一次越阈值」:只认「从阈值下穿到阈值上」那一帧。
+            # 不能用「当前是否高于阈值」——持续高于阈值的背景噪声每帧都算命中,
+            # 时差恒为 0,判据②就失效了。也不与 edge_cross_t 合并:后者是首次
+            # 记录,专门用于诊断「顶部判据本来会何时触发」,语义不同。
+            if (
+                last_edge_avg is not None
+                and prev_edge_change is not None
+                and prev_edge_change < CHANGE_THRESHOLD <= edge_change
+            ):
+                edge_last_t = frame_t
+            prev_edge_change = edge_change
             now_t = time.perf_counter()
             if (
                 _freeze_done_t is not None
@@ -3256,8 +4098,11 @@ def wait_first_note():
                         last_avg = band_avg
                         last_edge_avg = edge_avg
                         last_lane_avg = lane_avg
+                        last_rows = rows
                         prev_change = change_score
                         prev_frame_t = frame_t
+                        continue
+                    if _gate_reject(change_score, frame_t, "interp"):
                         continue
                     # change crossed the threshold between the last two frames
                     frac = (CHANGE_THRESHOLD - prev_change) / max(
@@ -3276,11 +4121,16 @@ def wait_first_note():
                     )
                     _log_trigger(cross_t, change_score, "interp", lanes_changed)
                     _snap("trigger")
+                    wait_ms = _resolve_anchor_wait(
+                        cross_t, wait_ms, note_y, change_score, "interp"
+                    )
                     time.sleep(max(0, wait_ms) / 1000)
                     break
                 elif change_score >= CHANGE_THRESHOLD:
                     # Already above threshold on both frames: the entry happened
                     # at or before this frame; compensate the elapsed time.
+                    if _gate_reject(change_score, frame_t, "direct"):
+                        continue
                     wait_ms = PHOTOGATE_LATENCY - (
                         time.perf_counter() - frame_t
                     ) * 1000.0
@@ -3291,6 +4141,9 @@ def wait_first_note():
                     )
                     _log_trigger(frame_t, change_score, "direct", lanes_changed)
                     _snap("trigger")
+                    wait_ms = _resolve_anchor_wait(
+                        frame_t, wait_ms, note_y, change_score, "direct"
+                    )
                     time.sleep(max(0, wait_ms) / 1000)
                     break
             prev_change = change_score
@@ -3298,6 +4151,7 @@ def wait_first_note():
             last_avg = band_avg
             last_edge_avg = edge_avg
             last_lane_avg = lane_avg
+            last_rows = rows
             _maybe_log(change_score, band_avg)
         except Exception as e:
             logging.error(f"Failed to get screen: {e}")
@@ -3451,9 +4305,15 @@ def mnt_callback(event: MNTEvent, data: MNTEventData):
                     chart = current_chart
                     if chart is not None and chart.wait_ideal_ms:
                         _lag_fb["last_sched"] = chart.wait_ideal_ms.popleft()
+                        _lag_fb["wait_recv"] += 1
                     else:
                         # 队列空(异常/丢事件):退回命令串里的实际值,至少
                         # 不让估计发疯;整型解析误差 ≤0.5ms/条,一次性小误差。
+                        # ⚠ 2026-10-28:这条兜底是「测量端退化」的入口 —— 实际值
+                        # 已含补偿(比理想短),拿它当理想额度会让 ideal 指针少推进,
+                        # lag 被吃成 0(零下拉)甚至虚高(テレキャスタービーボーイ
+                        # 涨到 243ms)。只计数不改行为,等实机数据定改法。
+                        _lag_fb["fallback_n"] += 1
                         _lag_fb["last_sched"] = float(cmd.split(" ")[-1])
                 else:
                     _lag_fb["last_sched"] = 0.0
@@ -3656,6 +4516,17 @@ def _get_override_pipeline():
         }
         return all_pipelines
 
+    if _STORY_MODE:
+        # 阅读角色故事(2026-10-25 新增):story.json 是闭环链,不需要
+        # set_difficulty / select_live_mode 等打歌节点,照 SPECIAL_MODE 的
+        # 惯例在这里早退,只按故事类型换按钮模板并传入读数上限。
+        # 上限读 data/config.yml 的 story.max_stories(默认 50,GUI 不暴露):
+        # 收工判据(点完头像等不到成员详情)若因界面变化失效,没有上限
+        # 就会无限重读第一个角色。上限已在 _main_impl 读好(_STORY_LIMIT)。
+        for name, override in story_overrides(_STORY_TYPE, _STORY_LIMIT).items():
+            all_pipelines.setdefault(name, {}).update(override)
+        return all_pipelines
+
     if _DAILY_MODE:
         # 日常模式:「选择演出」界面(live 首页)点返回箭头回主页后,接回 daily_home
         # 走完整阶段1(火罐检查 + 点公告 + 停),而不是 start_app 重试掉进打歌循环
@@ -3738,6 +4609,11 @@ def _get_override_pipeline():
             # LOADING/0MB/3MB 下载条)→ 所有识别全不命中 → 永久卡住。
             # 用户定的口径:只点「再次演出」,「确定」彻底不点。
             # activity_liveagain = 点再次演出 → 左上返回 → 主页 → 停(daily_song_done)。
+            # ⚠ 2026-10-28 教训:这里**不要**挂 rankup_confirm。活动结算会经过
+            # 「等级 EXP」结果页(整屏白底),rankup_confirm.png(232x58 白底黑字)
+            # 在角色卡牌下方白底实测误命中 0.9928,抢在 next_button 前面点了空白处,
+            # 画面不走 → 20s Task timeout,整场连打被终止。活动页的推进交给
+            # interrupt 里的 next_button(OCR「下一步」)。
             "next": ["event_reward_confirm", "activity_liveagain", "daily_song_done"],
             "interrupt": [
                 "story_loading_wait",
@@ -3757,6 +4633,7 @@ def _get_override_pipeline():
             "timeout": 3000,
             "post_delay": 800,
             # 奖励弹窗点掉后仍然优先「再次演出」(活动分数页可能在弹窗下面)。
+            # ⚠ 2026-10-28:这里同样不要挂 rankup_confirm(白底误命中,见上一条)。
             "next": ["activity_liveagain", "daily_song_done"],
         }
         all_pipelines["handle_life_exhausted"] = {
@@ -3864,6 +4741,12 @@ def _log_environment():
             gate, life, boost, DIFFICULTY,
             "超高难度SPECIAL活动(固定单曲, 打完即停)" if SPECIAL_MODE else LIVEMODE,
         )
+        # 2026-10-28:锚点实测开关加到环境诊断里 —— 排查「为什么一首全 P、
+        # 另一首整曲偏早」时必须先知道这一轮到底有没有实测锚点。
+        logging.info(
+            "首音锚点实测=%s(时机校准页可切换, 下一首生效)",
+            "开" if PHOTOGATE_MEASURE_ENABLED else "关",
+        )
         if SPECIAL_MODE:
             logging.info("活动曲目: %s (#%s)", current_song_name or "?", current_song_id or "?")
         logging.info(
@@ -3912,6 +4795,24 @@ def main():
         _shutdown(1, "未捕获异常: %s" % (e,))
 
 
+def _task_failed(job, what: str) -> bool:
+    """MAA 任务是否失败(界面识别超时/链断),失败时打一条警告。
+
+    2026-10-28 rank up 弹窗事故的根因之一:maa 的 `Job.get()` 只取结果,
+    任务失败**不抛异常**(见 .venv/Lib/site-packages/maa/job.py:54),
+    所以 `post_task(...).wait().get()` 外面的 try/except 永远抓不到
+    Tasker.Task.Failed —— 连打阶段因为「获得报酬」弹窗的按钮认不出而
+    3.5s 超时失败,Python 却当成"连打正常结束",继续打「停止继续打歌」
+    并在弹窗画面上硬跑三抽。这里统一改看 `job.failed`。
+
+    桩对象/旧版本没有 failed 属性时按成功处理,行为与改动前一致。
+    """
+    if getattr(job, "failed", False):
+        logging.warning("%s任务失败(界面识别超时),按异常收尾", what)
+        return True
+    return False
+
+
 def _run_daily_flow(entry: str) -> None:
     """日常(原「一键清理日常」)的分阶段执行。GUI 现在只有这一个打歌入口。
 
@@ -3939,25 +4840,66 @@ def _run_daily_flow(entry: str) -> None:
     _daily_boost_zero = False
     _daily_pull_done = False
     _daily_song_stop = True
-    maatasker.post_task(entry, _get_override_pipeline()).wait().get()
+    job = maatasker.post_task(entry, _get_override_pipeline()).wait()
+    job.get()
+    # 2026-10-28:阶段1(启动游戏/领签到/点公告)失败以前完全无提示,后面会连锁
+    # 失败却只看到打歌阶段报错。这里只告警不中断 —— 有些弹窗会被后续阶段的
+    # 兜底节点点掉,保持原行为。
+    _task_failed(job, "日常启动阶段")
     if _daily_boost_zero:
         # 阶段1(daily)里 daily_boost_check 已打过「火罐不足,日常已停止」日志
         return
 
-    def _pull(reason: str, force: bool = False) -> bool:
-        """做一次每日免费三抽。返回 False = 这一步异常,调用方应收尾。"""
+    def _pull(reason: str, force: bool = False) -> str:
+        """做一次每日免费三抽,返回三态字符串:
+
+        "ok"   = 做完了(或本来就抽完/不需要抽);
+        "skip" = 前置校验认不到主页「演出」按钮,本轮**不抽**,打歌照常继续;
+        "fail" = 三抽链自身失败(界面识别超时/链断),调用方应收尾。
+
+        2026-10-28 修:以前只返回 bool,precheck 一失败就当异常处理,阶段A
+        直接 break(autodori-20261028-180117.log:打了一首、三抽被跳过、火还剩
+        12、整场收工)。"不在主页"只意味着这一轮不能抽卡,不等于清火要停。
+        另外 precheck 原先 next 直连 daily_pull,校验成功就会把整套三抽跑一遍,
+        Python 又 post 一次 → 每轮跑两遍(18:05 场两行「今日次数已抽完」)。
+        """
         if not _DAILY_FREE_PULL:
-            return True
+            return "ok"
         if _daily_pull_done and not force:
             logging.debug("每日免费三抽已确认完成,跳过检查(%s)", reason)
-            return True
+            return "ok"
         logging.info("执行每日免费三抽(%s)", reason)
+        # 2026-10-28 rank up 弹窗事故:进抽卡流程前先确认人在游戏主界面。
+        # daily_pull 是无 recognition 的跳板节点(必定命中),任何画面进来都能
+        # "开始三抽";弹窗挡着时它会把弹窗里的白色「确定」当成
+        # song_announce_confirm 点掉,然后断头 → 任务报"成功",三抽其实没做。
+        # precheck 认不到主页「演出」按钮就 5s 超时,这里跳过并告警。
+        # ⚠ 它的 next 只能是 stop(只当阀门);链进 daily_pull 就等于校验=开抽。
         try:
-            maatasker.post_task("daily_pull", _get_override_pipeline()).wait().get()
+            failed = _task_failed(
+                maatasker.post_task(
+                    "daily_pull_precheck", _get_override_pipeline()
+                ).wait(),
+                "三抽前置校验",
+            )
+        except Exception as e:
+            logging.warning("三抽前置校验异常(%s)", e)
+            failed = True
+        if failed:
+            logging.warning(
+                "当前不在游戏主界面,跳过本次每日免费三抽(%s)", reason
+            )
+            return "skip"
+        try:
+            if _task_failed(
+                maatasker.post_task("daily_pull", _get_override_pipeline()).wait(),
+                "每日免费三抽",
+            ):
+                return "fail"
         except Exception as e:
             logging.warning("每日免费三抽异常结束(%s)", e)
-            return False
-        return True
+            return "fail"
+        return "ok"
 
     def _return_to_home(reason: str) -> None:
         """从打歌结束界面点左上返回箭头一路退回主页。
@@ -3970,9 +4912,15 @@ def _run_daily_flow(entry: str) -> None:
         # 用户 2026-10-17:「收尾回主页(连打结束)」看不懂,改成直白的动作描述。
         logging.info("停止继续打歌")
         try:
-            maatasker.post_task(
-                "activity_back_to_home", _get_override_pipeline()
-            ).wait().get()
+            # 2026-10-28:弹窗挡着时这里会认不到返回箭头,空转 20s 后任务失败;
+            # 失败要打出来(以前被 .get() 吞掉,后面三抽在弹窗画面上盲跑)。
+            if _task_failed(
+                maatasker.post_task(
+                    "activity_back_to_home", _get_override_pipeline()
+                ).wait(),
+                "收尾回主页",
+            ):
+                logging.warning("收尾回主页失败(%s)", reason)
         except Exception as e:
             logging.warning("收尾回主页失败(%s): %s", reason, e)
 
@@ -3982,17 +4930,39 @@ def _run_daily_flow(entry: str) -> None:
         # 不可抽(daily_pull_locked),两者都会置 _daily_pull_done。
         confirmed = False
         no_play_streak = 0
+        # 2026-10-28 用户反馈「打完第一首没去三抽」:阶段1(daily)的 start_app 兜底
+        # 在「游戏没停在主页」时会把那一首直接打掉(日志:11:13:24 开始打歌 → 11:16:34
+        # 结算,紧跟 11:16:52 才 post 第一个 main)。那首走的是 daily 任务,不经过
+        # 下面循环里的 _pull,于是三抽被跳过、直接进连打。
+        # 这里补一次:进循环前按已打首数查三抽,确认完成就直接进连打阶段。
+        if _song_play_seq > 0:
+            res = _pull("第 %d 首打完(启动阶段)" % _song_play_seq)
+            if res == "fail":
+                logging.warning("启动阶段那首打完后的三抽异常,继续清火")
+            elif res == "skip":
+                # 不在主页只影响这一轮抽卡,清火照常继续(见 _pull docstring)。
+                logging.warning("启动阶段那首打完后的三抽被跳过,继续清火")
+            elif _daily_pull_done:
+                confirmed = True
         for round_no in range(1, _DAILY_MAX_ROUNDS + 1):
+            if confirmed:
+                break
             _daily_fire_exhausted = False
             seq_before = _song_play_seq
             # 这里不再打「第 N 轮打歌」:轮次编号改由 play_song 按实际开打顺序打
             # (用户 2026-10-17:旧编号与真实顺序对不上,且连打阶段一个任务打多首
             #  根本没有轮次行,不如统一成每首一行的「开始打歌 · 第 N 首」)。
             try:
-                maatasker.post_task("main", _get_override_pipeline()).wait().get()
+                job = maatasker.post_task("main", _get_override_pipeline()).wait()
+                job.get()
             except Exception as e:
                 # main 异常终止(识别不到界面等):不再重试,直接收尾
                 logging.warning("打歌阶段异常结束(%s),停止循环", e)
+                break
+            if _task_failed(job, "打歌阶段"):
+                # 2026-10-28 rank up 弹窗事故:结算弹窗的按钮认不出,MAA 3.5s
+                # 超时判任务失败,而 Job.get() 不抛异常 —— 以前当成"正常打完"。
+                # 这时画面停在弹窗上,继续查三抽只会点错东西,直接收尾。
                 break
             if _song_play_seq == seq_before and not _daily_fire_exhausted:
                 # main 正常返回但一首都没开打:断头链 —— 弹窗类节点没有 next,
@@ -4019,8 +4989,13 @@ def _run_daily_flow(entry: str) -> None:
                 _return_to_home("火罐不足")
                 break
             # 用实际开打的序号(不是阶段A 的 round_no):阶段1 可能已经打过一首。
-            if not _pull("第 %d 首打完" % _song_play_seq):
+            res = _pull("第 %d 首打完" % _song_play_seq)
+            if res == "fail":
+                # 三抽链自身失败(界面识别超时/链断):画面可能停在半路,收尾。
                 break
+            if res == "skip":
+                # 只是没在主页、这一轮抽不了:继续打下一首,别把整场清火带走。
+                continue
             if _daily_pull_done:
                 confirmed = True
                 break
@@ -4038,9 +5013,14 @@ def _run_daily_flow(entry: str) -> None:
             _daily_fire_exhausted = False
             logging.info("每日三抽已确认完成,后续打歌不再逐首回主页")
             try:
-                maatasker.post_task("main", _get_override_pipeline()).wait().get()
+                job = maatasker.post_task("main", _get_override_pipeline()).wait()
+                job.get()
             except Exception as e:
                 logging.warning("连打阶段异常结束(%s)", e)
+            else:
+                # 2026-10-28:连打阶段的失败同样是结算弹窗点不掉导致的超时,
+                # 以前被 .get() 吞掉,后面照样回主页、照样跑三抽。
+                _task_failed(job, "连打阶段")
             if _daily_fire_exhausted:
                 logging.info("火罐不足，日常已停止")
             # 连打收工停在选曲确认页,三抽只能从主页进 —— 收尾前先退回去。
@@ -4048,7 +5028,8 @@ def _run_daily_flow(entry: str) -> None:
                 _return_to_home("连打结束")
 
         # 收尾复核:三抽前面已确认做完也再验一次(用户 2026-10-17 要求"保险起见")
-        _pull("收尾复核", force=True)
+        if _pull("收尾复核", force=True) == "fail":
+            logging.warning("收尾复核的三抽异常结束")
     elif _DAILY_CLEAR_FIRE:
         # 纯清火(没勾三抽):main 自己循环打到火尽。main 可能因断头弹窗(节点无
         # next)一首都没打就"成功"返回(2026-10-19 教程弹窗实测),此时重试而不是
@@ -4058,9 +5039,12 @@ def _run_daily_flow(entry: str) -> None:
         while True:
             seq_before = _song_play_seq
             try:
-                maatasker.post_task("main", _get_override_pipeline()).wait().get()
+                job = maatasker.post_task("main", _get_override_pipeline()).wait()
+                job.get()
             except Exception as e:
                 logging.warning("打歌阶段异常结束(%s)", e)
+                break
+            if _task_failed(job, "打歌阶段"):
                 break
             if _daily_fire_exhausted:
                 break
@@ -4085,7 +5069,8 @@ def _run_daily_flow(entry: str) -> None:
             _return_to_home("火罐不足")
     else:
         logging.info("未勾选「自动清火打歌」,跳过清火阶段")
-        _pull("清火未勾选,单独执行三抽")
+        if _pull("清火未勾选,单独执行三抽") == "fail":
+            logging.warning("单独执行三抽时异常结束")
 
     if _daily_fire_exhausted and _zero_boost_policy() == "exit":
         logging.info("火罐不足且设置为「退出游戏」")
@@ -4102,13 +5087,24 @@ def _main_impl():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["main", "special", "daily"],
+        choices=["main", "special", "daily", "story"],
         help=(
             "Specify the mode to run. 'main' = 常规挖矿;"
             "'special' = 超高难度 SPECIAL 活动(固定单曲,玩家手动进入后接管);"
-            "'daily' = 日常(启动游戏+领签到/弹窗;清火打歌与每日三抽各有开关)"
+            "'daily' = 日常(启动游戏+领签到/弹窗;清火打歌与每日三抽各有开关);"
+            "'story' = 阅读角色故事(用户筛选未读并停在乐队-培养页后接管)"
         ),
         default="main",
+    )
+    parser.add_argument(
+        "--story-type",
+        type=str,
+        choices=["member", "memoir"],
+        help=(
+            "story 模式读哪一种故事:member=小故事,memoir=回忆小故事"
+            "(游戏里一次只能筛选一种未读,故拆成两个参数)"
+        ),
+        default="member",
     )
     parser.add_argument(
         "--difficulty",
@@ -4195,6 +5191,22 @@ def _main_impl():
         global _DAILY_PULL_EACH_SONG
         _DAILY_PULL_EACH_SONG = _DAILY_CLEAR_FIRE and _DAILY_FREE_PULL
         entry = "daily"
+    elif args.mode == "story":
+        # 阅读角色故事(2026-10-25 新增):用户已在游戏里筛好未读并停在
+        # 「乐队-培养」列表页,bot 直接接管 —— 不启动游戏、不做签到,
+        # 入口节点 story 先认列表页,不在列表页就超时结束,不瞎点。
+        SPECIAL_MODE = False
+        _DAILY_MODE = False
+        global _STORY_MODE, _STORY_TYPE, _STORY_LIMIT
+        _STORY_MODE = True
+        _STORY_TYPE = args.story_type
+        story_cfg = _runtime_config().get("story") or {}
+        _STORY_LIMIT = int(story_cfg.get("max_stories", DEFAULT_MAX_STORIES))
+        # 开跑日志(用户定的口径):首轮点击前打一条
+        logging.info("阅读角色故事:开始(%s,本轮上限 %d 篇)",
+                     "小故事" if _STORY_TYPE == "member" else "回忆小故事",
+                     _STORY_LIMIT)
+        entry = "story"
     else:
         SPECIAL_MODE = False
         _DAILY_MODE = False
@@ -4220,6 +5232,20 @@ def _main_impl():
             _run_daily_flow(entry)
         else:
             maatasker.post_task(entry, _get_override_pipeline()).wait().get()
+            if _STORY_MODE:
+                # 收尾汇总(用户定的口径,按结束方式区分):材料不足 / 达到上限
+                # (还有未读) / 没到上限就结束(列表读空) / 没读到第一个。
+                if story_insufficient():
+                    logging.info("解锁小故事的道具不足,已暂停;"
+                                 "补充「中小碎片」后再次点击继续。")
+                elif story_read_count() >= _STORY_LIMIT:
+                    logging.info("本轮已阅读 %d 篇,暂停;若还有未读,再次点击继续。",
+                                 story_read_count())
+                elif story_read_count() == 0:
+                    logging.info("未开始阅读:未检测到「乐队-培养」列表页,"
+                                 "请检查游戏画面后重试。")
+                else:
+                    logging.info("可读小故事已全部读完,共 %d 篇。", story_read_count())
     except KeyboardInterrupt:
         logging.info("收到中断信号,准备退出")
     except Exception as e:

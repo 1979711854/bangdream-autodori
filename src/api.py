@@ -1,6 +1,8 @@
+import json
 import logging
 import requests
 from diskcache import Cache
+from pathlib import Path
 from urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
 
@@ -69,6 +71,21 @@ class BestdoriAPI:
     @staticmethod
     def get_chart(song_id: str, difficulty: str):
         cacheid = f"{song_id}-{difficulty}"
+        # 本地谱面覆盖(数据侧兜底):Bestdori 是社区转录数据,个别音符与游戏内
+        # 谱面不一致,盲修要命,所以只对已取证的具体谱面做数据侧修正(2026-10-26):
+        #   ① 缺音:#655-hard 游戏 487 个判定点、Bestdori 只有 486 —— 缺 beat 49
+        #      第 7 轨的普通单键(BMS 里对象写的是 01=bgm,游戏照样判;上游 PR #13)。
+        #   ② flick 错标:#35/#681、#147/#674、#144-hard、#710-expert 的「fever
+        #      滑条尾」被标成 flick,而游戏 BMS 里是 fever_note_slide_end_a /
+        #      fever_slide_end_a(没有 flick 变体)→ 按 flick 上划离轨,尾判固定 miss。
+        #      (对照:能打中的谱面里这类尾巴是 slide_end_flick_a/b 对象。)
+        # override 文件 = 完整谱面(Bestdori 原格式 JSON 列表),放
+        # assets/chart_overrides/<曲id>-<难度>.json,不动打歌手势。
+        # ⚠️ 必须排在磁盘缓存之前:缓存里就是那份错数据,不能盖过修复。
+        override = Path("assets/chart_overrides") / f"{song_id}-{difficulty}.json"
+        if override.is_file():
+            BestdoriAPI._logger.info(f"Local chart override for {cacheid}")
+            return json.loads(override.read_text(encoding="utf-8"))
         url = BestdoriAPI.base + f"/charts/{song_id}/{difficulty}.json"
         return BestdoriAPI._fetch_and_cache(url, cacheid)
 

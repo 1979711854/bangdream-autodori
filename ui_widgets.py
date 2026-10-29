@@ -650,6 +650,11 @@ class Stepper(tk.Frame):
         delta = self.big_step if big else self.step
         self.set(cur + direction * delta)
         self._commit()
+        # set() 已经把 _last 更新成新值,紧接着的 _commit() 便认为「没变化」,
+        # 不会回调 on_change —— 实测后果是点 ± 只看数字变,实际值没变
+        # (photogate 的配置和 bot 都还是旧值)。这里显式补一次回调。
+        if self.on_change and self._last != cur:
+            self.on_change(self._last)
 
     def commit(self):
         """对外暴露的提交入口。

@@ -42,9 +42,43 @@
             "stop"
         ]
     },
+    "daily_pull_precheck": {
+        "recognition": "TemplateMatch",
+        "template": "live/button/live_home.png",
+        "roi": [
+            1042,
+            543,
+            238,
+            177
+        ],
+        "threshold": 0.95,
+        "timeout": 5000,
+        "next": [
+            "stop"
+        ]
+    },
+    "daily_pull_loading": {
+        "recognition": "OCR",
+        "expected": [
+            "LOADING",
+            ".*MB/.*"
+        ],
+        "roi": [
+            0,
+            540,
+            1280,
+            180
+        ],
+        "timeout": 3000,
+        "post_delay": 1000,
+        "next": [
+            "daily_pull_loading",
+            "daily_pull_find_gacha"
+        ]
+    },
     "daily_pull": {
         "next": [
-            "story_loading_wait",
+            "daily_pull_loading",
             "reader_menu",
             "tutorial_close",
             "song_announce_confirm",
@@ -113,7 +147,7 @@
     },
     "daily_pull_find_gacha": {
         "next": [
-            "story_loading_wait",
+            "daily_pull_loading",
             "reader_menu",
             "tutorial_close",
             "song_announce_confirm",
@@ -176,7 +210,7 @@
     },
     "daily_pull_btn_check": {
         "next": [
-            "story_loading_wait",
+            "daily_pull_loading",
             "reader_menu",
             "tutorial_close",
             "song_announce_confirm",

@@ -48,13 +48,16 @@ class FakeTasker:
     2026-10-19 起外层以序号是否增长识别断头弹窗(main 正常返回但没打歌),
     桩必须跟真实行为一致,否则会被误判成断头而重试。
     play=False 专门模拟断头弹窗(main 没打歌就"成功"返回)。
+    fail_nodes 里的入口返回 failed=True,模拟 MAA 任务失败(2026-10-28 rank up
+    弹窗事故:Job.get() 不抛异常,只能靠 job.failed 判断)。
     """
 
-    def __init__(self, boost_zero=False, fire_out=False, play=True):
+    def __init__(self, boost_zero=False, fire_out=False, play=True, fail_nodes=()):
         self.posted = []
         self.boost_zero = boost_zero
         self.fire_out = fire_out
         self.play = play
+        self.fail_nodes = set(fail_nodes)
 
     def post_task(self, node, pipeline=None):
         self.posted.append(node)
@@ -64,14 +67,18 @@ class FakeTasker:
             A._daily_fire_exhausted = True
         if node == "main" and self.play and not self.fire_out:
             A._song_play_seq += 1
+        failed = node in self.fail_nodes
 
         class _R:
+            failed = False
+
             def wait(self_):
                 return self_
 
             def get(self_):
                 return None
 
+        _R.failed = failed
         return _R()
 
 
@@ -83,15 +90,18 @@ def test_flow_gating():
          patch.object(A, "_get_override_pipeline", lambda: {}), \
          patch.object(A, "_DAILY_MAX_ROUNDS", 2), \
          patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        # 2026-10-28 起三抽前多跑一次 daily_pull_precheck(认主页「演出」按钮),
+        # 认不到就跳过并告警 —— 防止弹窗挡屏时把别的「确定」当公告确认点掉。
+        pull_pre = ["daily_pull_precheck", "daily_pull"]
         for clear, pull, want in (
             (False, False, ["daily"]),                     # 都不勾 -> 只做必经流程
             (True, False, ["daily", "main"]),              # 只清火(main 自己循环到火尽)
-            (False, True, ["daily", "daily_pull"]),        # 只三抽
+            (False, True, ["daily"] + pull_pre),           # 只三抽
             # 都做(2026-10-17 新流程):每打完一首先查三抽再回去打,火不尽就一直
             # 交替下去;FakeTasker 不会置「火量不足」,所以跑满安全上限 2 轮
             # (阶段1 的 daily 只跑一次,之后是 main/daily_pull 交替),
             # 最后再跑一次收尾复核(force=True,用户要求"保险起见")。
-            (True, True, ["daily"] + ["main", "daily_pull"] * 2 + ["daily_pull"]),
+            (True, True, ["daily"] + (["main"] + pull_pre) * 2 + pull_pre),
         ):
             fake.posted.clear()
             A._daily_boost_zero = False
@@ -151,10 +161,13 @@ def test_boost_zero_stops_daily():
         A._DAILY_FREE_PULL = True
         A._DAILY_PULL_EACH_SONG = True
         A._daily_pull_done = False
+        A._song_play_seq = 0          # 本用例的前提:阶段1 没打过歌
         A._run_daily_flow("daily")
     # 2026-10-17:火尽后先回主界面(选项名「停在游戏主界面」),再收尾复核三抽
     check("打歌中火罐0 -> 打一首即停,回主页后只在收尾复核三抽",
-          fake.posted, ["daily", "main", "activity_back_to_home", "daily_pull"])
+          fake.posted,
+          ["daily", "main", "activity_back_to_home",
+           "daily_pull_precheck", "daily_pull"])
 
     # 只清火不开三抽:火尽后自然结束(无三抽可跳)
     fake = FakeTasker(fire_out=True)
@@ -199,6 +212,153 @@ def test_boost_zero_stops_daily():
           bc["custom_action"], "HandleDailyBoostZero")
 
 
+def test_rankup_popup():
+    print("=== 1e. 结算弹窗按钮兜底 + 任务失败感知(2026-10-28 rank up) ===")
+    # 事故现场(debug/autodori-20261028-100925.log):连打最后一首结算后弹
+    # 「获得报酬」,OCR 命中 0.9978,但 event_reward_ok 只认 ok/white.png(181x37),
+    # 3 次都是 0.4579 → 3.5s 超时把整个 main 判失败;maa 的 Job.get() 不抛异常,
+    # Python 当"连打正常结束",继续打「停止继续打歌」(空转 20s)并硬跑三抽
+    # —— daily_pull 是必定命中的跳板,把弹窗里的「确定」当公告确认点掉就断链。
+    live = json.loads(
+        Path("assets/resource/pipeline/live.json").read_text(encoding="utf-8"))
+    ok = live["event_reward_ok"]
+    check("event_reward_ok 认白色「确定」",
+          "common/button/confirm/white.png" in ok["template"], True)
+    check("event_reward_ok 限定按钮区(不再整屏找)", "roi" in ok, True)
+    check("奖励弹窗点完能推进活动「下一步」页",
+          "next_button" in ok["next"], True)
+    # ⚠ 2026-10-28 当天第二次事故(autodori-20261028-105318.log):把 rankup_confirm
+    # 挂进结算链是错的 —— 活动「等级 EXP」结果页整屏白底,rankup_confirm.png
+    # 实测误命中 0.9928,抢在 next_button 前点了空白处,20s 超时整场终止。
+    check("结算链不挂 rankup_confirm(白底误命中)",
+          "rankup_confirm" in live["save_succeed_playresult"]["next"], False)
+    check("结算靠 interrupt 的 next_button 推进活动页",
+          "next_button" in live["save_succeed_playresult"]["interrupt"], True)
+    check("rankup_confirm 恢复原样(只认专用模板)",
+          live["rankup_confirm"]["template"], "common/button/rankup_confirm.png")
+    d = json.loads(
+        Path("assets/resource/pipeline/daily.json").read_text(encoding="utf-8"))
+    pre = d["daily_pull_precheck"]
+    check("三抽前置校验认主页「演出」按钮",
+          pre["template"], "live/button/live_home.png")
+    # 2026-10-28 二次修:precheck 原来 next 直连 daily_pull,而 daily_pull 是必定
+    # 命中的跳板 —— post 一次 precheck 就等于整套三抽跑一遍,Python 又 post 一次,
+    # 每轮跑两遍(18:05 场日志两行「今日次数已抽完」)。它只能是阀门。
+    check("前置校验只当阀门,next 只能是 stop", pre["next"], ["stop"])
+    check("前置校验认不到就超时(不无限等)",
+          pre.get("timeout"), 5000)
+    # 2026-10-28 二次修:抽卡页加载时 story_loading_wait 会误命中(「NOWLOADING…」
+    # 「5MB/5MB」),而它的 next 只回剧情链 → 超时把整轮三抽带走。三抽链改用
+    # 专用 loading 节点,加载完回 daily_pull_find_gacha 继续。
+    for owner in ("daily_pull", "daily_pull_find_gacha", "daily_pull_btn_check"):
+        check("%s 用专用 loading 节点" % owner,
+              d[owner]["next"][0], "daily_pull_loading")
+        check("%s 不再挂 story_loading_wait" % owner,
+              "story_loading_wait" in d[owner]["next"], False)
+    check("loading 结束后回三抽链",
+          d["daily_pull_loading"]["next"], ["daily_pull_loading",
+                                            "daily_pull_find_gacha"])
+
+    # main 任务失败 → 不再当作"正常打完",打歌循环立即收尾
+    fake = FakeTasker(fail_nodes={"main"})
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 3), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._song_play_seq = 0
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("main 失败 -> 不再重试打歌(只跑一次 main)",
+          fake.posted.count("main"), 1)
+
+    # 不在主页(弹窗挡屏):前置校验失败 → 跳过三抽并告警,不再盲跑
+    fake = FakeTasker(fire_out=True, fail_nodes={"daily_pull_precheck"})
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 2), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._song_play_seq = 0
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("不在主页 -> 跳过三抽(不跑 daily_pull)",
+          fake.posted,
+          ["daily", "main", "activity_back_to_home", "daily_pull_precheck"])
+
+    # 2026-10-28 二次修:precheck 跳过只跳过这一轮三抽,不能把整场清火带走。
+    # 现场 autodori-20261028-180117.log:三抽在抽卡页链断 → precheck 报"不在主页"
+    # → 阶段A break → 只打了一首就收工,火还剩 12、游戏停在抽卡页。
+    fake = FakeTasker(fail_nodes={"daily_pull_precheck"})
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 2), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._song_play_seq = 0
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("前置校验跳过 -> 继续打下一首(不中止日常)",
+          fake.posted,
+          ["daily", "main", "daily_pull_precheck",
+           "main", "daily_pull_precheck",
+           "daily_pull_precheck"])          # 最后一条是收尾复核(force)
+
+    # 三抽链自身失败(界面识别超时/链断):画面可能停在半路,立即收尾。
+    fake = FakeTasker(fail_nodes={"daily_pull"})
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 3), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._song_play_seq = 0
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("三抽链失败 -> 立即停止打歌并收尾复核",
+          fake.posted,
+          ["daily", "main", "daily_pull_precheck", "daily_pull",
+           "daily_pull_precheck", "daily_pull"])
+
+    # 2026-10-28 用户反馈「打完第一首没三抽」:阶段1 的 start_app 兜底可能已经
+    # 打掉一首(游戏先前不在主页),那首不经过阶段A 的 _pull。进循环前要先补一次。
+    fake = FakeTasker()
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 1), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._song_play_seq = 1          # 阶段1 已打掉一首
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("阶段1 已打一首 -> 进循环前先查三抽",
+          fake.posted[1:3], ["daily_pull_precheck", "daily_pull"])
+
+
 def test_pull_each_song_mode():
     print("=== 1b. 交替模式:每首打完先三抽再继续打(2026-10-17) ===")
     src = Path("src/autodori.py").read_text(encoding="utf-8")
@@ -233,6 +393,8 @@ def test_pull_each_song_mode():
           "liveagain" not in pipes["save_succeed_playresult"]["next"], True)
     check("save_succeed_playresult 先认再次演出",
           "activity_liveagain" in pipes["save_succeed_playresult"]["next"], True)
+    check("override 结算链也不挂 rankup_confirm(白底误命中)",
+          "rankup_confirm" in pipes["save_succeed_playresult"]["next"], False)
     check("save_succeed_playresult 不再点「确定」(confirm_button 已摘掉)",
           "confirm_button" not in pipes["save_succeed_playresult"]["interrupt"], True)
     check("save_succeed_playresult 交回 daily_song_done",
@@ -611,6 +773,7 @@ def test_select_live_home_back():
 def main():
     test_flow_gating()
     test_no_play_retry()
+    test_rankup_popup()
     test_pull_each_song_mode()
     test_boost_zero_stops_daily()
     test_select_live_home_back()

@@ -114,7 +114,16 @@ AVATAR_PATH = os.path.join(BASE, "assets", "resource", "image", "common",
                            "avatar", "henceforth.png")
 
 # photogate 自动校准参数(见 _calibrate_gate)
-CAL_STEP_MS = 15        # 校准步长上限(ms),偏差大时快速收敛
+# 步长上限 2026-10-28 由 15 收到 10:实机 18:01 场 gate=76、结算 fast=234,
+# 自动校准一步 +15 直接过冲到 91,下一首变成 slow=134,再花两首(4ms/5ms)
+# 才回到 82(全 PERFECT)。单步太大 = 用过冲换速度,现在按 10ms 走。
+CAL_STEP_MS = 10        # 校准步长上限(ms),常规偏斜时精调
+# 一边倒时的放宽上限(2026-10-29 用户实测):#342 徒花 great 598 全是 FAST、
+# off_ratio=0.82,理论步长 41ms 被上面的 10ms 封顶,从 30 爬回 55 要走 3 首,
+# 这三首一直在刷 FAST,观感就是「越打越 fast」。FAST/SLOW 占判定总数过半
+# (CAL_HIGH_RATIO)说明整首一边倒,不是噪声,允许一步 25~30ms 直接收敛。
+CAL_STEP_MS_HIGH = 30   # 一边倒时的步长上限(ms)
+CAL_HIGH_RATIO = 0.5    # FAST+SLOW 占判定总数的比例达到此值 = 一边倒
 CAL_MIN_DIFF = 3        # |FAST-SLOW| 低于此值视为信号弱,不调整
 CAL_RANGE = (0, 150)    # photogate 允许范围(ms)
 CAL_COLLAPSE_STEP = 15  # 打歌中途崩(无结算)时按上次方向继续调整的步长(ms)
@@ -189,12 +198,13 @@ def _fmt_count(value):
     return "-" if count < 0 else str(count)
 
 
-def _calibrate_gate(data, current_ms):
+def _calibrate_gate(data, current_ms, prev_direction=0):
     """根据本曲 FAST/SLOW 判定,返回建议的 photogate 值;信号不足返回 None。
 
     语义:FAST 偏多=按早了=photogate 偏小→增大;SLOW 偏多=按晚了→减小。
     步长按"歪曲比例"自适应:歪得多大步快速收敛,歪得少小步精调,不再固定 ±10。
     任何核心字段 <0(OCR 失败)或信号太弱(|FAST-SLOW|<CAL_MIN_DIFF)都跳过。
+    prev_direction = 上一曲的校准方向(0 = 无),用于反转时减半步长。
     """
     try:
         fast = int(data.get("fast", 0) or 0)
@@ -215,12 +225,20 @@ def _calibrate_gate(data, current_ms):
         return None  # 信号太弱,暂不调整
 
     # 误差量级估计:FAST+SLOW 占全部判定的比例越高,photogate 偏离越大。
-    # 经验系数 50ms/100%:2% 歪→步长 1ms 精调,10%→5ms,30%→15ms(封顶)。
+    # 经验系数 50ms/100%:2% 歪→步长 1ms 精调,10%→5ms,20% 以上→10ms(封顶)。
     total = perfect + great + good + bad + miss
     off_ratio = (fast + slow) / max(total, 1)
-    step = max(1, min(CAL_STEP_MS, round(off_ratio * 50)))
+    # 一边倒(FAST/SLOW 覆盖过半判定)时放宽步长上限,见 CAL_STEP_MS_HIGH 注释。
+    cap = CAL_STEP_MS_HIGH if off_ratio >= CAL_HIGH_RATIO else CAL_STEP_MS
+    step = max(1, min(cap, round(off_ratio * 50)))
 
     direction = 1 if bias > 0 else -1
+    # 抗振荡(2026-10-27):一晚实测 photogate 被这条校准推成
+    # 47→55→70→85→70→55→40,方向来回反转说明单曲信号在把值拉向两边
+    # (曲内漂移、单曲噪声都被当成全局偏移)。反转时步长减半,让轨迹收敛
+    # 而不是来回跳;连续同向时保持原自适应步长,收敛速度不受影响。
+    if prev_direction and direction != prev_direction:
+        step = max(1, step // 2)
     new_ms = current_ms + direction * step
     return max(CAL_RANGE[0], min(CAL_RANGE[1], new_ms))
 
@@ -283,7 +301,15 @@ A:可以反馈到 GitHub Issues。
 # 每发一版在上方**追加**一段,旧版本段落保留不删(用户要求);格式与 v1.3.2 保持一致:
 # `## vX.Y.Z更新内容` + 每行一条 `- [x] ...`(DocView 会把 `- [x] ` 渲染成打钩框)。
 CHANGELOG = """## v1.3.5更新内容
+- [x] 新增「阅读角色故事」,自动阅读小故事并领取奖励
+- [x] 限制每轮最多阅读 50 篇,读完自动暂停
+- [x] 新增道具不足时自动暂停的处理
+- [x] 新增「rank up」弹窗的自动处理
+- [x] 修复生命值耗尽后无法退出演出、整局停止的问题
 - [x] 修复部分电脑上打歌判定逐渐偏晚的问题
+- [x] 修复部分曲目开局判定失准的问题
+- [x] 优化 photogate 自动校准的稳定性
+- [x] 优化判定整体偏早时的校准响应速度
 
 ## v1.3.4更新内容
 - [x] 支持打 FULL 版长曲
@@ -330,6 +356,7 @@ class AutodoriGUI:
         self.proc = None
         self.q = queue.Queue()
         self._last_cal_direction = 0  # 上次校准方向:+1 增大 / -1 减小 / 0 未知
+        self._cal_direction_prev = 0  # 上一曲的校准方向(反转时步长减半用)
         self._log_buf = collections.deque(maxlen=1500)
         # 完整原始日志(含时间戳/级别/logger),与显示用的精简缓冲分离:
         # 导出日志时输出这份全量,而不是被"关键事件"过滤后的精简集。
@@ -397,6 +424,7 @@ class AutodoriGUI:
         self._device_scanning = False
         self._shots = {}            # adb address -> 截图路径(多开时肉眼区分实例)
         self.gate = self._read_gate()
+        self.measure_anchor = self._read_measure_anchor()
 
         T.set_theme(self.theme)
         W.set_base_size(self.font_size)
@@ -468,6 +496,24 @@ class AutodoriGUI:
             return int(timing.get("photogate_latency_ms", 30))
         except Exception:
             return 30
+
+    def _read_measure_anchor(self):
+        """读 config.yml 的 timing.measure_anchor(首音锚点实测开关)。
+
+        2026-10-28 用户要求做成 GUI 开关:以前只能手改 data/config.yml,
+        每次测试都要重新配一遍。bot 每首开打前重读该键,所以这里改完
+        **下一首生效**,不用重打包、也不用重启 bot。
+        """
+        try:
+            with open(CONFIG, encoding="utf-8") as f:
+                text = f.read()
+            if not text.strip():
+                return False
+            data = yaml.safe_load(text)
+            timing = data.get("timing") if isinstance(data, dict) else None
+            return bool(timing.get("measure_anchor")) if isinstance(timing, dict) else False
+        except Exception:
+            return False
 
     def _version(self):
         try:
@@ -731,7 +777,11 @@ class AutodoriGUI:
         if self.view == "settings.ui":
             return self._detail_ui(master)
         if self.view == "daily":
-            return self._detail_daily(master)
+            # 日常页两张卡片:清理日常 + 阅读角色故事(2026-10-25 新增)。
+            wrap = tk.Frame(master, bg=T.get()["surface"])
+            self._detail_daily(wrap).pack(fill="x")
+            self._detail_story(wrap).pack(fill="x", pady=(12, 0))
+            return wrap
         return self._detail_about(master)
 
     def _detail_show(self, master):
@@ -907,13 +957,35 @@ class AutodoriGUI:
         toggle.pack(fill="x", pady=(14, 4))
         tk.Label(toggle, text="自动校准 photogate", bg=th["surface"],
                  fg=th["text"], font=T.font(self.font_size)).pack(side="left")
-        W.ToggleSwitch(toggle, value=self.auto_cal,
-                       on_change=self._on_auto_cal).pack(side="left", padx=16)
+        # 保存句柄:手动改 photogate 时会程序化关掉它(见 _disable_auto_cal),
+        # 视觉状态必须跟着变,否则界面上开关还亮着、实际已经关了。
+        self.auto_cal_switch = W.ToggleSwitch(toggle, value=self.auto_cal,
+                                              on_change=self._on_auto_cal)
+        self.auto_cal_switch.pack(side="left", padx=16)
         tk.Label(toggle, text="根据每首结算的 FAST/SLOW 自动微调",
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(side="left")
 
-        tk.Label(card.body, text="手动调参:SLOW 偏多则减小,FAST 偏多则增大",
+        # L2 实测首音锚点(2026-10-28 用户要求做成开关):原来只能手改
+        # data/config.yml 的 timing.measure_anchor,每次测试都要重新配。
+        # 写入 config.yml 而不是 gui_config.json —— bot 每首开打前读的是前者
+        # (_reload_photogate),单一来源,不搞两份状态。
+        anchor_row = tk.Frame(card.body, bg=th["surface"])
+        anchor_row.pack(fill="x", pady=(10, 4))
+        tk.Label(anchor_row, text="实测首音锚点", bg=th["surface"],
+                 fg=th["text"], font=T.font(self.font_size)).pack(side="left")
+        self.measure_anchor_switch = W.ToggleSwitch(
+            anchor_row, value=self.measure_anchor,
+            on_change=self._on_measure_anchor)
+        self.measure_anchor_switch.pack(side="left", padx=16)
+        tk.Label(anchor_row,
+                 text="触发后实测下落速度,按实测推算按键时刻(实验,下一首生效)",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(side="left")
+
+        tk.Label(card.body,
+                 text="手动调参:SLOW 偏多则减小,FAST 偏多则增大;"
+                      "手动修改会自动关闭上方校准,改完从下一首生效",
                  bg=th["surface"], fg=th["text_2"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(10, 0))
 
@@ -1084,6 +1156,39 @@ class AutodoriGUI:
             anchor="w", pady=(8, 0))
         return card
 
+    def _detail_story(self, master):
+        """阅读角色故事(2026-10-25 新增,用户定的口径)。
+
+        分工 —— 用户负责前置:在游戏里把成员按「小故事未读」(或「回忆小故事
+        未读」)筛选好,停在「乐队-培养」页面,再点按钮交给 bot 按列表顺序
+        依次阅读。游戏一次只能筛选一种未读,所以是两个独立入口。
+        """
+        th = T.get()
+        card = W.Card(master)
+        W.SectionTitle(card.body, "阅读角色故事",
+                       "按列表顺序依次阅读并领取奖励").pack(fill="x", pady=(0, 12))
+        tk.Label(card.body,
+                 text="使用前提:需要先手动点击「乐队-培养」右上角-筛选-选择未读小故事，\n"
+                      "并停在「乐队-培养」界面",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(0, 12))
+        btns = tk.Frame(card.body, bg=th["surface"])
+        btns.pack(anchor="w")
+        # 只留「阅读小故事」一个入口:回忆小故事每篇解锁消耗的道具太多,
+        # 不合算,用户 2026-10-25 定砍掉(后端 --story-type memoir 保留,
+        # 命令行仍可调试,GUI 不再暴露)。
+        W.PushButton(btns, "阅读小故事",
+                     command=lambda: self.start(mode="story_member"),
+                     kind="primary", width=160, height=36).pack(side="left")
+        tk.Label(card.body,
+                 text="每次最多阅读 50 篇,读完暂停;若还有未读,再次点击继续\n"
+                      "请确保有足够的中小碎片解锁小故事",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(8, 0))
+        return card
+
     def _on_daily_auto_clear_fire(self, value):
         self.daily_auto_clear_fire = bool(value)
         self._save_gui_config()
@@ -1194,14 +1299,40 @@ class AutodoriGUI:
         self._write_config()
 
     def _on_gate_manual(self, value):
-        self.gate = value
-        self._write_config()
+        # 手动输入框/± 按钮的提交。原来这里只 self.gate=value + 写文件,不打任何
+        # 日志 —— 2026-10-28 排查「gate 67→60 找不到对应信号」时才发现:手动改
+        # 值(含打字后失焦、点「开始演出」时的强制 commit)是全流程唯一不留痕迹
+        # 的写值路径。统一走 _apply_photogate(source="手动输入"),改动会以
+        # CAL 行出现在控制台,和自动校准分得开。
+        if value == self.gate:
+            self._write_config()  # 值没变也要落盘(配置文件可能被外部改过)
+        else:
+            self._apply_photogate(value, source="手动输入")
+            # 2026-10-28:手动设定视为「锁定」。以前手动值不设防,下一首结算
+            # 的自动校准立刻按 FAST/SLOW 再推一次(18:05 场实测:第 3 首全 P →
+            # 手动设 75 → 第 4 首结算又被改成 74),用户看起来就像"改了没用"。
+            # 方向记忆也一起清零,否则接手的第一首会拿旧方向做"反转减半"。
+            self._reset_cal_memory()
+            self._disable_auto_cal("手动修改 photogate")
         if getattr(self, "status_gate", None):
             self.status_gate.configure(text="photogate %d ms" % self.gate)
 
     def _on_auto_cal(self, value):
         self.auto_cal = bool(value)
         self._save_gui_config()
+
+    def _on_measure_anchor(self, value):
+        """首音锚点实测(L2)开关:写进 data/config.yml 的 timing.measure_anchor。
+
+        2026-10-28 用户要求:以前只能手改 config.yml,每次测试都要重新配。
+        写 config.yml 而不是 gui_config.json —— bot 每首开打前读的是前者
+        (src/autodori.py::_reload_photogate),单一来源。改完下一首生效。
+        """
+        self.measure_anchor = bool(value)
+        if self._write_timing({"measure_anchor": bool(value)},
+                              what="首音锚点实测"):
+            self._emit("", "CAL", "首音锚点实测: {}".format(
+                "开启" if value else "关闭"))
 
     def _on_theme_pick(self, value):
         self._pending_theme = "dark" if value == "暗色" else "light"
@@ -1303,6 +1434,13 @@ class AutodoriGUI:
             stamp = time.strftime("%H:%M:%S")
         item = (stamp, level, message)
         self._log_buf.append(item)
+        # GUI 侧决策(photogate 变更)也镜像进原始日志,这样「导出日志」里有据可查。
+        # 原来 CAL 只写界面缓冲,关掉窗口就没了 —— 2026-10-28 排查 gate 67→60
+        # 就是卡在这儿。只镜像 CAL:WARN/ERROR 里混着 bot 原始行,镜像会与
+        # _handle_line 写入 _raw_log 的那份重复。
+        if level == "CAL":
+            self._raw_log.append("{}[INFO][gui] {}".format(
+                time.strftime("%Y-%m-%d %H:%M:%S"), message))
         console = getattr(self, "full_log", None)
         # 切走「运行日志」页再切回时,full_log 可能指向已被重建销毁的旧控件;
         # 若在销毁窗口里对它 .line() 会抛 TclError 并连带杀死 _poll_log 轮询。
@@ -1354,6 +1492,7 @@ class AutodoriGUI:
         )
         if not self.auto_cal:
             return
+        prev_dir = getattr(self, "_cal_direction_prev", 0)
         try:
             fast_c = int(data.get("fast", 0) or 0)
             slow_c = int(data.get("slow", 0) or 0)
@@ -1361,9 +1500,17 @@ class AutodoriGUI:
                 1 if fast_c > slow_c else (-1 if slow_c > fast_c else 0)
             )
         except Exception:
+            fast_c = slow_c = 0
             self._last_cal_direction = 0
         cur = self.gate
-        new_val = _calibrate_gate(data, cur)
+        if fast_c == 0 and slow_c == 0:
+            # 本曲没有 FAST/SLOW:游戏内关了显示,或 OCR 没读出来。以前是静默跳过,
+            # 用户会以为自动校准一直在工作(2026-10-27 反馈「MAA 不一定调整」)。
+            # 明确告知本曲不参与校准、gate 保持不动,别让人误判成校准生效了。
+            self._set_cal("本曲无 FAST/SLOW,未参与校准(确认游戏内显示 FAST/SLOW)")
+            return
+        new_val = _calibrate_gate(data, cur, prev_dir)
+        self._cal_direction_prev = self._last_cal_direction
         if new_val is None:
             self._set_cal("本曲信号不足/无需调整,photogate 保持 {}".format(cur))
             return
@@ -1382,25 +1529,47 @@ class AutodoriGUI:
         if lbl is not None and lbl.winfo_exists():
             lbl.configure(text=text)
 
-    def _apply_photogate(self, new_val):
-        """写新 photogate 到 config(保留 life/boost 设置),并更新界面。
+    def _reset_cal_memory(self):
+        """清掉自动校准的方向记忆(2026-10-28)。
 
-        单独改写 timing 字段,不复用 _write_config,避免覆盖用户已选的其他策略。
+        反转减半步长靠 _cal_direction_prev / _last_cal_direction 两个记忆,
+        它们跨手动改动保留 —— 手动设定后让自动校准接手时,第一首会拿旧方向
+        判"反转"、只走半步,行为不可预期。手动改值 / 恢复默认时归零。
         """
-        old = self.gate
-        self.gate = new_val
-        step = getattr(self, "gate_step", None)
-        if step is not None and step.winfo_exists():
-            step.set(new_val)
-        sg = getattr(self, "status_gate", None)
-        if sg is not None and sg.winfo_exists():
-            sg.configure(text="photogate %d ms" % self.gate)
+        self._cal_direction_prev = 0
+        self._last_cal_direction = 0
+
+    def _disable_auto_cal(self, reason):
+        """手动改值即锁定:关掉自动校准,别让下一首结算把手动值又推走。
+
+        2026-10-28 用户反馈"改了像没用":自动校准每首结算都会用 self.gate
+        再算一次并写文件,手动设的值下一首就被改(18:05 场 82→手动 75→74)。
+        手动设定只关一次开关,不写"N 首内不校准"这种隐式状态 —— 要恢复自动
+        校准,用户重新勾选即可,状态一眼可见。
+        """
+        if not self.auto_cal:
+            return
+        self.auto_cal = False
+        sw = getattr(self, "auto_cal_switch", None)
+        if sw is not None and sw.winfo_exists():
+            sw.set(False)
+        self._save_gui_config()
+        self._emit("", "CAL",
+                   "已关闭自动校准({}):之后保持手动值,需要时重新勾选".format(reason))
+
+    def _write_timing(self, updates, what="photogate"):
+        """把若干 timing.* 键合并写回 data/config.yml(别的键一律不动)。
+
+        只改 timing,不整份覆盖,避免把用户已选的其他策略写没。
+        data/config.yml 是 YAML —— bot 侧(src/autodori.py)用 yaml.safe_load 读,
+        这里必须用同一个解析器。原来用 json.loads:用户手写成 YAML 风格
+        (注释 / 无引号 key)时解析失败 → cfg={} → 紧接着的写回把
+        stop_when_game_exits、device.filter、song_strategy_reject_limit
+        全部抹掉。开了自动校准时这条路径**每首歌结算都会走一次**。
+        解析失败**不要**写回:宁可这次不落盘,也不能静默清空配置。
+        返回 True/False,调用方决定要不要记日志。
+        """
         try:
-            # data/config.yml 是 YAML —— bot 侧(src/autodori.py)用 yaml.safe_load 读,
-            # 这里必须用同一个解析器。原来用 json.loads:用户手写成 YAML 风格
-            # (注释 / 无引号 key)时解析失败 → cfg={} → 紧接着的写回把
-            # stop_when_game_exits、device.filter、song_strategy_reject_limit
-            # 全部抹掉。开了自动校准时这条路径**每首歌结算都会走一次**。
             cfg = {}
             content = ""
             try:
@@ -1417,18 +1586,42 @@ class AutodoriGUI:
             if not isinstance(timing, dict):
                 timing = {}
                 cfg["timing"] = timing
-            timing["photogate_latency_ms"] = new_val
+            timing.update(updates)
             os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
             with open(CONFIG, "w", encoding="utf-8") as f:
                 yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
         except Exception as e:
-            # 解析失败时**不要**写回:宁可这次校准不落盘,也不能静默清空配置
-            self._emit("", "ERROR", "写入 photogate 配置失败(未修改文件): {}".format(e))
+            self._emit("", "ERROR",
+                       "写入 {} 配置失败(未修改文件): {}".format(what, e))
+            return False
+        return True
+
+    def _apply_photogate(self, new_val, source="自动校准"):
+        """写新 photogate 到 config(保留 life/boost 设置),并更新界面。
+
+        单独改写 timing 字段,不复用 _write_config,避免覆盖用户已选的其他策略。
+        source 只用于 CAL 日志,区分「自动校准 / 手动输入 / 恢复默认」——
+        2026-10-28 之前手动改值完全不留日志,事后无法判断 gate 是谁改的。
+        """
+        old = self.gate
+        self.gate = new_val
+        step = getattr(self, "gate_step", None)
+        if step is not None and step.winfo_exists():
+            step.set(new_val)
+        sg = getattr(self, "status_gate", None)
+        if sg is not None and sg.winfo_exists():
+            sg.configure(text="photogate %d ms" % self.gate)
+        if not self._write_timing({"photogate_latency_ms": new_val}):
             return
-        self._emit("", "CAL", "photogate: {} → {} ms".format(old, new_val))
+        if new_val != old:
+            self._emit("", "CAL", "photogate({}): {} → {} ms".format(
+                source, old, new_val))
 
     def _reset_gate(self):
-        self._apply_photogate(30)
+        self._apply_photogate(30, source="恢复默认")
+        # 与手动改值同口径:清方向记忆 + 关自动校准,否则下一首结算立刻又改走。
+        self._reset_cal_memory()
+        self._disable_auto_cal("恢复默认 photogate")
         self._set_cal("photogate 已恢复为默认 30ms")
 
     # ---------- start / stop ----------
@@ -1439,6 +1632,11 @@ class AutodoriGUI:
             args = ["--mode", "main", "--difficulty", str(self.challenge_difficulty),
                     "--livemode", "challengelive", "--challenge-finish",
                     "exit" if self.challenge_exit_game else "home"]
+        elif mode in ("story_member", "story_memoir"):
+            # 阅读角色故事(2026-10-25 新增):游戏一次只能筛选一种未读,
+            # 小故事与回忆小故事是两个独立入口,对应 --story-type。
+            args = ["--mode", "story", "--story-type",
+                    "memoir" if mode == "story_memoir" else "member"]
         else:
             # 2026-10-17 合并入口:「日常」是唯一的常规打歌入口(main 按钮已删)。
             # 难度/选歌策略/火罐策略都取自「自由演出设置」,日常阶段2 现在真读 --difficulty
@@ -2055,7 +2253,13 @@ class AutodoriGUI:
     def _write_config(self):
         life = "auto" if self.life_mode == "自动退出重新选歌" else "wait"
         cfg = {
-            "timing": {"photogate_latency_ms": self.gate},
+            # measure_anchor = 首音锚点实测(L2)开关,由时机校准页的开关控制;
+            # 界面值是唯一来源,这里与 photogate 一起落盘,bot 每首重读。
+            # getattr 兜底:测试桩对象/旧实例没有该属性时按「关闭」处理,
+            # 免得一个可选开关把 _write_config 整条打断。
+            "timing": {"photogate_latency_ms": self.gate,
+                       "measure_anchor": bool(
+                           getattr(self, "measure_anchor", False))},
             "on_life_exhausted": life,
             # 火罐为 0 的三态(2026-10-17 合并「开始自由演出」与「日常」后,
             # 选项只留一处,日常也读它):
@@ -2100,6 +2304,28 @@ class AutodoriGUI:
                 timing = dict(old_timing)
                 timing.update(cfg["timing"])
                 cfg["timing"] = timing
+            # 审计(2026-10-28):这一步会用界面里的 self.gate 覆盖文件里的值。
+            # 如果文件被外部改过(手动编辑 / 另一个 GUI 实例还揣着旧值 / 别的脚本
+            # 写过),覆盖是静默的 —— 事后只在 bot 日志里看到 gate 莫名其妙变了,
+            # 找不到是谁改的。值不一致就在这里报一条 WARN,把「界面值覆盖文件值」
+            # 摆到明面上;同一次不一致只报一次,免得每次切设置都刷屏。
+            old_gate = old_timing.get("photogate_latency_ms") if isinstance(
+                old_timing, dict) else None
+            try:
+                old_gate = int(old_gate) if old_gate is not None else None
+            except (TypeError, ValueError):
+                old_gate = None
+            if old_gate is not None and old_gate != self.gate:
+                if getattr(self, "_gate_mismatch_warned", None) != (
+                        old_gate, self.gate):
+                    self._gate_mismatch_warned = (old_gate, self.gate)
+                    self._emit(
+                        "", "WARN",
+                        "配置里的 photogate={} ms 与界面 {} ms 不一致,"
+                        "已按界面值写回".format(old_gate, self.gate),
+                    )
+            else:
+                self._gate_mismatch_warned = None
             merged.update(cfg)
             with open(CONFIG, "w", encoding="utf-8") as f:
                 yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)

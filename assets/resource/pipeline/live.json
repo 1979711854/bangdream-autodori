@@ -271,10 +271,30 @@
   "template": "live/button/liveagain.png",
   "threshold": 0.7,
   "action": "Click",
-  "next": "select_song",
+  "next": [
+   "select_song",
+   "rankup_confirm"
+  ],
   "post_delay": 500,
   "interrupt": [
    "event_reward_confirm"
+  ]
+ },
+ "rankup_confirm": {
+  "recognition": "TemplateMatch",
+  "template": "common/button/rankup_confirm.png",
+  "roi": [
+   480,
+   460,
+   340,
+   170
+  ],
+  "threshold": 0.85,
+  "action": "Click",
+  "post_delay": 1500,
+  "next": [
+   "rankup_confirm",
+   "liveagain"
   ]
  },
  "daily_song_done": {
@@ -363,17 +383,31 @@
    600,
    100
   ],
-  "action": "Click",
-  "target": [
-   560,
-   500,
-   160,
-   90
+  "timeout": 3000,
+  "next": [
+   "event_reward_ok",
+   "next_button"
+  ]
+ },
+ "event_reward_ok": {
+  "recognition": "TemplateMatch",
+  "template": [
+   "common/button/ok/white.png",
+   "common/button/confirm/white.png"
   ],
+  "roi": [
+   400,
+   400,
+   480,
+   280
+  ],
+  "threshold": 0.8,
+  "action": "Click",
   "timeout": 3000,
   "post_delay": 800,
   "next": [
    "liveagain",
+   "next_button",
    "live_home_button"
   ]
  },
@@ -416,22 +450,7 @@
   "action": "Click",
   "post_delay": 1200,
   "timeout": 5000,
-  "on_error": "stop",
-  "next": "life_exhausted_confirm"
- },
- "life_exhausted_confirm": {
-  "recognition": "OCR",
-  "expected": "退出",
-  "roi": [
-   630,
-   395,
-   280,
-   90
-  ],
-  "action": "Click",
-  "post_delay": 1000,
-  "timeout": 5000,
-  "on_error": "stop",
+  "on_error": "main",
   "next": "handle_life_exhausted"
  },
  "handle_life_exhausted": {

@@ -17,7 +17,8 @@
         ],
         "interrupt": [
             "ok_button",
-            "confirm_button"
+            "confirm_button",
+            "close_button"
         ]
     },
     "select_live_home_back": {

@@ -1,0 +1,216 @@
+{
+    "story": {
+        "next": [
+            "story_bandlist_check",
+            "story_reward_dialog",
+            "story_insufficient",
+            "story_member_back"
+        ]
+    },
+    "story_insufficient": {
+        "recognition": "TemplateMatch",
+        "template": "story/story_insufficient.png",
+        "roi": [
+            480,
+            225,
+            320,
+            50
+        ],
+        "threshold": 0.85,
+        "action": "Custom",
+        "custom_action": "StoryInsufficient",
+        "on_error": [
+            "stop"
+        ]
+    },
+    "story_bandlist_check": {
+        "recognition": "TemplateMatch",
+        "template": "story/story_bandlist_tab.png",
+        "roi": [
+            0,
+            150,
+            280,
+            160
+        ],
+        "threshold": 0.85,
+        "next": [
+            "story_click_avatar"
+        ]
+    },
+    "story_click_avatar": {
+        "action": "Custom",
+        "custom_action": "StoryAvatarClick",
+        "post_delay": 1200,
+        "next": [
+            "story_member_detail"
+        ],
+        "on_error": [
+            "stop"
+        ]
+    },
+    "story_member_detail": {
+        "recognition": "TemplateMatch",
+        "template": "story/story_member_btn.png",
+        "roi": [
+            100,
+            560,
+            300,
+            110
+        ],
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "story_unlock_dialog",
+            "story_insufficient",
+            "story_unlocked_dialog",
+            "story_load_wait",
+            "story_dialogue_menu",
+            "story_reward_dialog",
+            "story_member_detail"
+        ]
+    },
+    "story_unlock_dialog": {
+        "recognition": "TemplateMatch",
+        "template": "story/story_unlock_btn.png",
+        "roi": [
+            620,
+            495,
+            300,
+            100
+        ],
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "story_unlocked_dialog",
+            "story_load_wait",
+            "story_dialogue_menu",
+            "story_reward_dialog"
+        ]
+    },
+    "story_unlocked_dialog": {
+        "recognition": "TemplateMatch",
+        "template": "story/story_novoice_btn.png",
+        "roi": [
+            460,
+            535,
+            340,
+            110
+        ],
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1500,
+        "next": [
+            "story_load_wait",
+            "story_dialogue_menu",
+            "story_reward_dialog"
+        ]
+    },
+    "story_load_wait": {
+        "recognition": "OCR",
+        "expected": [
+            "LOADING",
+            ".*MB/.*"
+        ],
+        "roi": [
+            0,
+            540,
+            1280,
+            180
+        ],
+        "timeout": 3000,
+        "post_delay": 3000,
+        "next": [
+            "story_load_wait",
+            "story_dialogue_menu",
+            "story_dialogue_skip",
+            "story_reward_dialog"
+        ]
+    },
+    "story_dialogue_menu": {
+        "recognition": "TemplateMatch",
+        "template": "common/reader/menu.png",
+        "roi": [
+            1000,
+            0,
+            280,
+            120
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 1000,
+        "next": [
+            "story_dialogue_skip",
+            "story_dialogue_menu"
+        ]
+    },
+    "story_dialogue_skip": {
+        "recognition": "TemplateMatch",
+        "template": "common/reader/skip.png",
+        "roi": [
+            480,
+            0,
+            320,
+            120
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 800,
+        "next": [
+            "story_skip_confirm",
+            "story_dialogue_menu",
+            "story_dialogue_skip"
+        ]
+    },
+    "story_skip_confirm": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/skip/pink.png",
+        "roi": [
+            600,
+            390,
+            340,
+            105
+        ],
+        "threshold": 0.8,
+        "action": "Click",
+        "post_delay": 2500,
+        "next": [
+            "story_reward_dialog"
+        ]
+    },
+    "story_reward_dialog": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/rankup_confirm.png",
+        "roi": [
+            480,
+            490,
+            340,
+            130
+        ],
+        "threshold": 0.85,
+        "action": "Custom",
+        "custom_action": "StoryRewardOk",
+        "post_delay": 2000,
+        "next": [
+            "story_reward_dialog",
+            "story_member_back"
+        ]
+    },
+    "story_member_back": {
+        "recognition": "TemplateMatch",
+        "template": "story/story_member_back.png",
+        "roi": [
+            0,
+            0,
+            140,
+            130
+        ],
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "story_bandlist_check"
+        ]
+    }
+}
