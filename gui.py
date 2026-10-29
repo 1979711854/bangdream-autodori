@@ -137,6 +137,34 @@ SONG_RE = re.compile(r"Save song:\s*(.+)$")
 # 作为歌名更新的第二条来源,避免依赖单一行偶发漏读。
 PLAY_RE = re.compile(r"打歌:\s*(.+?)\s*\(#\d+-\w+\)")
 
+# 下发链错位报告(2026-10-29)。bot 的滞后诊断在命令流与谱面对不上时打两行:
+#   WARN 服务端执行滞后: 有 8926/28010 条与谱面错位(仅诊断)
+#   WARN   焚音打 本局跳过统计,不影响打歌
+# 这类局的动作流本身有问题,它的 FAST/SLOW 归属不可信 —— 实测 #684 焚音打
+# 32% 错位、fast 805,被自动校准当成「整体偏早」把 gate 从 60 一路推到 85,
+# 属于误伤。拿到这条报告就跳过本曲校准。
+# 正则只认第一行的数字(曲名在第二行):日志栏宽度约 57 个半角,把曲名与
+# 数字塞进一行会被硬折成三行、长短参差(2026-10-29 用户反馈),所以拆两行。
+LAG_MISALIGN_RE = re.compile(
+    r"服务端执行滞后:\s*有\s*(\d+)/(\d+)\s*条与谱面错位")
+# 错位比例达到此值即跳过校准。默认 0.02 = 「只要 bot 报了就不校准」:bot 本身
+# 只在错位 >2% 时才打这条 WARNING,取同一门槛就不会漏判。
+# (#763 熱色スターマイン 9% 也跳过 —— 那局 fast/slow 本来就是 0,跳过无损失;
+#  留着它等于拿不可信的数据调 gate。)
+CAL_MISALIGN_SKIP_RATIO = 0.02
+# 曲内漂移报告(2026-10-29)。bot 曲末会打一行:
+#   INFO 服务端执行滞后[歌名]: 音符命令 N 条, lag@10%=… 音符曲内增长=-31.1ms
+# 漂移大 = 下发链在曲内越跑越偏,**不是 gate 的整首偏移**。这种曲的 FAST/SLOW
+# 不能拿去调 gate:实测 #395 曲内 -31ms、fast 28 → 校准 +1(gate 65→66),
+# 下一首 #2 时间线本来很干净(+2.5ms)却被推晚,掉了 10 个 slow。
+# 报告比同曲结算早到 30~40 秒(见 MISALIGN_TTL_S 注释),结算时能直接取用。
+LAG_DRIFT_RE = re.compile(r"音符曲内增长=(-?\d+(?:\.\d+)?)ms")
+CAL_DRIFT_SKIP_MS = 20.0   # |曲内增长| 达到此值即跳过本曲校准
+# 报告有效期(秒)。dump 跑在 daemon 线程里,实测比同曲结算早 30~40 秒到达
+# (17:42:26 vs 17:43:02),所以正常都能在结算前命中;崩局那首没有结算,
+# 报告会一直挂着,超过有效期就丢弃。
+MISALIGN_TTL_S = 900
+
 # 左栏选项树:(分组名, ((key, 标签, 图标), ...))
 OPTION_TREE = (
     ("演出", (
@@ -183,6 +211,36 @@ def _parse_play_result(line):
     except Exception:
         pass
     return None
+
+
+def _parse_misalign(line):
+    """从 bot 日志行解析下发链错位报告,返回 (错位条数, 总条数)。
+
+    纯函数,便于离线测试。认不出返回 None。
+    曲名不在这一行(见 LAG_MISALIGN_RE 注释),归属靠「本曲开打后收到的
+    第一份报告」判定 —— 报告总是本曲的,换曲时由新的「打歌:」行清掉。
+    """
+    m = LAG_MISALIGN_RE.search(line)
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_drift(line):
+    """从 bot 日志行解析「音符曲内增长=X ms」,返回毫秒(float);认不出返回 None。
+
+    纯函数,便于离线测试。漂移 = 曲尾与曲首的滞后差,负=越打越早,正=越打越晚。
+    """
+    m = LAG_DRIFT_RE.search(line)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
 
 
 def _fmt_count(value):
@@ -307,6 +365,10 @@ CHANGELOG = """## v1.3.5更新内容
 - [x] 新增「rank up」弹窗的自动处理
 - [x] 修复生命值耗尽后无法退出演出、整局停止的问题
 - [x] 修复部分电脑上打歌判定逐渐偏晚的问题
+- [x] 修复打歌时判定逐渐偏早、FAST 增多的问题
+- [x] 修复**迷星叫**固定漏 2 个判定的问题
+- [x] 修复**シル・ヴ・プレジデント**被加载成另一份谱面的问题
+- [x] 修复崩局后卡在「退出」确认弹窗的问题
 - [x] 修复部分曲目开局判定失准的问题
 - [x] 优化 photogate 自动校准的稳定性
 - [x] 优化判定整体偏早时的校准响应速度
@@ -367,6 +429,14 @@ class AutodoriGUI:
         self.started_at = None
         self.songs_done = 0
         self.current_song = ""
+        # 本曲的下发链错位报告 (错位比例, 到达时刻),结算时据此跳过校准。
+        # 只留一份:报告永远属于「最近一首」,换曲时清空(见 _handle_line)。
+        self._misalign_pending = None
+        # 本曲的曲内漂移报告 (毫秒, 到达时刻),结算时据此跳过校准(2026-10-29)
+        self._drift_pending = None
+        # 小额偏置累计:单曲 |FAST-SLOW|<CAL_MIN_DIFF 不动 gate,但累加到
+        # CAL_MIN_DIFF 就微调 1ms —— 「擦着爆 1 个 slow」才调得动。
+        self._bias_acc = 0
         self._idle_text = "就绪"
 
         # 读取 GUI 偏好设置
@@ -949,9 +1019,13 @@ class AutodoriGUI:
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(side="left", padx=8)
 
-        tk.Label(card.body, text="± 每次 1 ms;按住 Shift 点击 ± 每次 10 ms",
+        # 分行(2026-10-29 用户要求):原来两句挤在一行,读起来像一句长话。
+        tk.Label(card.body, text="点击±:每次1ms",
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(8, 0))
+        tk.Label(card.body, text="按住Shift点击±:每次10ms",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w")
 
         toggle = tk.Frame(card.body, bg=th["surface"])
         toggle.pack(fill="x", pady=(14, 4))
@@ -966,28 +1040,29 @@ class AutodoriGUI:
                  bg=th["surface"], fg=th["text_3"],
                  font=T.font(self.font_size - 1)).pack(side="left")
 
-        # L2 实测首音锚点(2026-10-28 用户要求做成开关):原来只能手改
-        # data/config.yml 的 timing.measure_anchor,每次测试都要重新配。
-        # 写入 config.yml 而不是 gui_config.json —— bot 每首开打前读的是前者
-        # (_reload_photogate),单一来源,不搞两份状态。
-        anchor_row = tk.Frame(card.body, bg=th["surface"])
-        anchor_row.pack(fill="x", pady=(10, 4))
-        tk.Label(anchor_row, text="实测首音锚点", bg=th["surface"],
-                 fg=th["text"], font=T.font(self.font_size)).pack(side="left")
-        self.measure_anchor_switch = W.ToggleSwitch(
-            anchor_row, value=self.measure_anchor,
-            on_change=self._on_measure_anchor)
-        self.measure_anchor_switch.pack(side="left", padx=16)
-        tk.Label(anchor_row,
-                 text="触发后实测下落速度,按实测推算按键时刻(实验,下一首生效)",
-                 bg=th["surface"], fg=th["text_3"],
-                 font=T.font(self.font_size - 1)).pack(side="left")
+        # L2 实测首音锚点的开关**已从界面下线**(2026-10-29 用户决定:
+        # 「直接从 GUI 删掉,但代码先保留」)。原因:实测口径没通过验证 ——
+        # AGENTS 第 8 节记的 15 次实测全部「超限回退」或「速度不可信跳过」,
+        # 今天 17:54 那首 #395 也是「跳过(速度不可信(样本2)),用常量 75ms」。
+        # 放在界面上只会让人以为「开了就更好」,而它也不产生 photogate 建议
+        # (建议只来自结算 FAST/SLOW)。
+        # 代码保留:_read_measure_anchor / _on_measure_anchor / _write_config 的
+        # measure_anchor 落盘链路都在,手改 data/config.yml 即可启用:
+        #     timing:
+        #       measure_anchor: true
+        # bot 每首开打前重读(_reload_photogate),下一首生效,不用重启。
+        # 必须保留 _write_config 里对该键的写入:否则点开始打歌时会把它写回
+        # false,手改的配置活不过一首。
 
+        # 分行(2026-10-29 用户要求):两件事(怎么调 / 会关校准)分开写。
         tk.Label(card.body,
-                 text="手动调参:SLOW 偏多则减小,FAST 偏多则增大;"
-                      "手动修改会自动关闭上方校准,改完从下一首生效",
+                 text="手动调参:SLOW偏多则减小;FAST偏多则增大",
                  bg=th["surface"], fg=th["text_2"],
                  font=T.font(self.font_size - 1)).pack(anchor="w", pady=(10, 0))
+        tk.Label(card.body,
+                 text="手动修改会关闭上方自动校准",
+                 bg=th["surface"], fg=th["text_2"],
+                 font=T.font(self.font_size - 1)).pack(anchor="w")
 
         self.cal_label = tk.Label(card.body, text="", bg=th["surface"],
                                   fg=th["accent_text"], justify="left",
@@ -1477,6 +1552,8 @@ class AutodoriGUI:
     def _on_play_result(self, data):
         """结算 OCR 到达:展示判定汇总;开启自动校准时按 FAST/SLOW 微调 photogate。"""
         self.songs_done += 1
+        # 先消费错位报告:哪怕自动校准关着也要清掉,免得留到后面误伤。
+        misalign = self._take_misalign()
         ms = getattr(self, "m_songs", None)
         if ms is not None and ms.winfo_exists():
             ms.set("%d 首" % self.songs_done)
@@ -1491,6 +1568,25 @@ class AutodoriGUI:
             ),
         )
         if not self.auto_cal:
+            return
+        if misalign is not None:
+            # 本曲命令流与谱面错位(2026-10-29):下发时机本身就乱了,FAST/SLOW
+            # 归属不可信。跳过校准,连方向记忆也不更新 —— 错信号不该影响下一首
+            # 的「反转减半」判断。gate 保持原值,界面写清原因。
+            self._set_cal("本曲下发链错位({:.0%}),未参与校准".format(misalign))
+            self._emit("", "WARN",
+                       "本曲下发链错位 {:.1%},跳过本曲校准".format(misalign))
+            return
+        drift = self._take_drift()
+        if drift is not None:
+            # 曲内漂移(2026-10-29):越打越早/晚是下发链在曲内跑偏,不是 gate 的
+            # 整首偏移。它的 FAST/SLOW 拿去调 gate 会误伤下一首(#395 -31ms/fast 28
+            # → gate 65→66,#2 掉了 10 个 slow)。跳过,并清掉方向记忆 —— 漂移方向
+            # 不能当「上一曲方向」参与下一首的反转减半。
+            self._set_cal("本曲曲内漂移 {:.0f}ms,未参与校准".format(drift))
+            self._emit("", "WARN",
+                       "本曲曲内漂移 {:.0f}ms,跳过本曲校准".format(drift))
+            self._cal_direction_prev = 0
             return
         prev_dir = getattr(self, "_cal_direction_prev", 0)
         try:
@@ -1507,8 +1603,35 @@ class AutodoriGUI:
             # 本曲没有 FAST/SLOW:游戏内关了显示,或 OCR 没读出来。以前是静默跳过,
             # 用户会以为自动校准一直在工作(2026-10-27 反馈「MAA 不一定调整」)。
             # 明确告知本曲不参与校准、gate 保持不动,别让人误判成校准生效了。
-            self._set_cal("本曲无 FAST/SLOW,未参与校准(确认游戏内显示 FAST/SLOW)")
+            # 不写"确认游戏内显示 FAST/SLOW":AP 局本来就没有 FAST/SLOW,
+            # 那样写会让正常 AP 看起来像出错(2026-10-29 用户反馈)。
+            self._set_cal("本曲无 FAST/SLOW,未参与校准")
             return
+        bias = fast_c - slow_c
+        if abs(bias) < CAL_MIN_DIFF:
+            # 小额偏置累计(2026-10-29 用户反馈):「时基只差一点、擦着边缘爆 1 个
+            # slow」时 |FAST-SLOW| 永远 < CAL_MIN_DIFF,以前永远不调。现在记进
+            # 跨曲累计,攒到 CAL_MIN_DIFF 就微调 1ms —— 单曲 1 个音不动 gate
+            # (噪声),连续几首同向才动,避免 47→85→40 那种摆动。
+            self._bias_acc = getattr(self, "_bias_acc", 0) + bias
+            if abs(self._bias_acc) < CAL_MIN_DIFF:
+                self._set_cal(
+                    "本曲信号弱(FAST {}/SLOW {}),偏置累计 {:+d},未调整".format(
+                        fast_c, slow_c, self._bias_acc))
+                return
+            acc = self._bias_acc
+            self._bias_acc = 0
+            step = 1 if acc > 0 else -1
+            new_val = max(CAL_RANGE[0], min(CAL_RANGE[1], cur + step))
+            if new_val == cur:
+                self._set_cal("photogate 已在边界 {},不再调整".format(cur))
+                return
+            self._apply_photogate(new_val)
+            self._cal_direction_prev = self._last_cal_direction
+            self._set_cal("小额偏置累计 {:+d} → photogate {} → {} ms".format(
+                acc, cur, new_val))
+            return
+        self._bias_acc = 0
         new_val = _calibrate_gate(data, cur, prev_dir)
         self._cal_direction_prev = self._last_cal_direction
         if new_val is None:
@@ -1521,6 +1644,46 @@ class AutodoriGUI:
         self._apply_photogate(new_val)
         self._set_cal("自动校准: photogate {} → {} ms · {}".format(
             cur, new_val, verb))
+
+    def _take_misalign(self):
+        """取出本曲的下发链错位报告,返回错位比例或 None(消费即清空)。
+
+        不再按曲名匹配:报告里的曲名在第二行(为了日志栏不折断),而报告本身
+        永远属于「最近一首」—— 换曲时新的「打歌:」行会把它清掉,所以这里
+        只需要看比例是否过门槛、以及有没有过期(崩局那首没有结算,报告会
+        一直挂着)。
+        比例低于 CAL_MISALIGN_SKIP_RATIO 的也不拦 —— 默认门槛与 bot 报出
+        这条 WARNING 的门槛一致,所以实际效果是「报了就不校准」。
+        """
+        pending = getattr(self, "_misalign_pending", None)
+        self._misalign_pending = None
+        if not pending:
+            return None
+        try:
+            ratio, ts = pending
+        except (TypeError, ValueError):
+            return None
+        if time.time() - ts > MISALIGN_TTL_S:
+            return None
+        return ratio if ratio >= CAL_MISALIGN_SKIP_RATIO else None
+
+    def _take_drift(self):
+        """取出本曲「音符曲内增长」;未报到/过期/未达门槛返回 None(消费即清空)。
+
+        与 _take_misalign 同一套口径:报告属于「最近一首」,换曲时清掉;
+        超过 MISALIGN_TTL_S 视为过期(崩局那首没有结算,报告会一直挂着)。
+        """
+        pending = getattr(self, "_drift_pending", None)
+        self._drift_pending = None
+        if not pending:
+            return None
+        try:
+            growth, ts = pending
+        except (TypeError, ValueError):
+            return None
+        if time.time() - ts > MISALIGN_TTL_S:
+            return None
+        return growth if abs(growth) >= CAL_DRIFT_SKIP_MS else None
 
     def _set_cal(self, text):
         # 切走 live.gate 页后,cal_label 指向的旧控件已被销毁,仅判非空会命中死控件
@@ -1538,6 +1701,9 @@ class AutodoriGUI:
         """
         self._cal_direction_prev = 0
         self._last_cal_direction = 0
+        # 手动设定/恢复默认后清掉小额累计:它是「自动校准攒出来的证据」,
+        # 手动值已经被用户拍板,不该再叠一笔旧证据上去。
+        self._bias_acc = 0
 
     def _disable_auto_cal(self, reason):
         """手动改值即锁定:关掉自动校准,别让下一首结算把手动值又推走。
@@ -1653,6 +1819,10 @@ class AutodoriGUI:
             return
         self.songs_done = 0
         self.current_song = ""
+        # 上一轮残留的错位报告不能带进新一轮(换了难度/策略,未必还错位)。
+        self._misalign_pending = None
+        self._drift_pending = None
+        self._bias_acc = 0
         if getattr(self, "m_songs", None):
             self.m_songs.set("0 首")
         if getattr(self, "m_song", None):
@@ -1823,6 +1993,10 @@ class AutodoriGUI:
         if not song:
             song = PLAY_RE.search(msg)  # 兜底:「打歌: {歌名}」INFO 行
         if song:
+            # 换曲了:上一首留下的错位报告不再属于本曲(崩局那首没有结算,
+            # 报告会挂在这里),直接丢掉,免得结算时误伤新的一首。
+            self._misalign_pending = None
+            self._drift_pending = None
             name = song.group(1).strip()
             if name and name != self.current_song:
                 self.current_song = name
@@ -1845,6 +2019,17 @@ class AutodoriGUI:
         if data is not None:
             self._on_play_result(data)
             return
+        mis = _parse_misalign(line)
+        if mis is not None:
+            # 只记账,不 return:这一行还要按普通 WARNING 显示到日志栏。
+            # 比例供 _take_misalign 按 CAL_MISALIGN_SKIP_RATIO 过滤。
+            n_bad, n_all = mis
+            self._misalign_pending = (
+                (n_bad / n_all) if n_all > 0 else 1.0, time.time())
+        drift = _parse_drift(line)
+        if drift is not None:
+            # 同上:只记账。本曲的曲内增长到结算时用来判断该不该参与校准。
+            self._drift_pending = (drift, time.time())
         if "打歌中生命值耗尽" in msg:
             self._on_life_exhausted()
             self._emit(stamp, "WARN", msg)

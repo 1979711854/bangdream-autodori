@@ -32,6 +32,11 @@ class Stub:
         self.emitted.append((stamp, level, message))
 
     # _on_play_result 会用到这些
+    # 2026-10-29:_on_play_result 开头会消费「下发链错位 / 曲内漂移」两个报告
+    # (漂移门控),直接借用真方法 —— 桩上没有 _misalign_pending 就当没报告。
+    _take_misalign = gui.AutodoriGUI._take_misalign
+    _take_drift = gui.AutodoriGUI._take_drift
+
     def _set_cal(self, text):
         pass
 

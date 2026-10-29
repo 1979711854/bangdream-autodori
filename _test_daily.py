@@ -236,6 +236,23 @@ def test_rankup_popup():
           "next_button" in live["save_succeed_playresult"]["interrupt"], True)
     check("rankup_confirm 恢复原样(只认专用模板)",
           live["rankup_confirm"]["template"], "common/button/rankup_confirm.png")
+    # ⚠ 2026-10-29 事故(autodori-20261029-214857.log 22:02):get_song_name 的
+    # interrupt 挂 confirm_button,而「最终确认页」右下角的「演出开始」与
+    # confirm/pink|white 同款 —— comfirm_song 的 OCR 慢 5 秒就给了它两次机会,
+    # 演出被提前点开、bot 还在等确认页 → 火量读空 → 抛异常 → 整场任务失败。
+    # 但直接删掉会卡在选曲列表(那条点击本来就是进确认页的唯一动作,
+    # autodori-20261029-221036.log 实测 4s 超时 → 重选死循环),所以改成
+    # 按**文字**点:列表页是「确定」,确认页是「演出开始」。
+    check("选曲确认链不再挂 confirm_button 中断",
+          "confirm_button" in live["get_song_name"].get("interrupt", []), False)
+    check("get_song_name 先点列表页「确定」再等确认页",
+          live["get_song_name"]["next"], ["select_song_ok", "comfirm_song"])
+    ok_node = live["select_song_ok"]
+    check("列表页确认用 OCR 锚定「确定」", ok_node["expected"], ["^确定$"])
+    check("「确定」限定在底部按钮区", ok_node["roi"], [980, 600, 220, 70])
+    check("不能拿 confirm 模板(与演出开始同款)",
+          "template" in ok_node, False)
+    check("点完「确定」进确认页", ok_node["next"], ["comfirm_song"])
     d = json.loads(
         Path("assets/resource/pipeline/daily.json").read_text(encoding="utf-8"))
     pre = d["daily_pull_precheck"]

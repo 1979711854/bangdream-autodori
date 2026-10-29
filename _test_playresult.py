@@ -162,6 +162,12 @@ check("_fmt_count(1234) == '1234'", gui._fmt_count(1234) == "1234")
 class Stub:
     """只承载 _on_play_result 依赖的状态,避开 Tk 控件。"""
 
+    # 2026-10-29:_on_play_result 开头会消费「下发链错位」与「曲内漂移」两个
+    # 报告(漂移门控)。直接借用真方法而不是在桩里重写一份 —— 它们只读
+    # self._misalign_pending / _drift_pending,桩上没有就当没报告。
+    _take_misalign = gui.AutodoriGUI._take_misalign
+    _take_drift = gui.AutodoriGUI._take_drift
+
     def __init__(self):
         self.songs_done = 0
         self.m_songs = None

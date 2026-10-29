@@ -50,12 +50,29 @@
   "recognition": "Custom",
   "custom_recognition": "SongRecognition",
   "custom_action": "SaveSong",
-  "next": "comfirm_song",
-  "interrupt": [
-   "confirm_button"
+  "next": [
+   "select_song_ok",
+   "comfirm_song"
   ],
   "timeout": 4000,
   "on_error": "random_choice_song"
+ },
+ "select_song_ok": {
+  "recognition": "OCR",
+  "expected": [
+   "^确定$"
+  ],
+  "roi": [
+   980,
+   600,
+   220,
+   70
+  ],
+  "action": "Click",
+  "post_delay": 1200,
+  "next": [
+   "comfirm_song"
+  ]
  },
  "set_difficulty": {},
  "comfirm_song": {

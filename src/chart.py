@@ -51,6 +51,19 @@ class Chart:
         self.actions_to_cmd_index = 0
         self._a2c_offset = 0
         self._a2c_rounded_loss = 0.0
+        # 本曲「睡不了」的 wait 情况(2026-10-29),给 play_song 的理想指针补齐用
+        # (lag_feedback_apply_skipped):
+        #   skipped_wait_ms = 所有没发出去的 wait 时长合计(时间线欠账)。
+        #     来源有两类:补偿整段吃掉、以及本来就是 <0.5ms 的间隙(密集曲常见)。
+        #     #684 焚音打实测 92 条、曲内 -73ms,而「补偿抽干」只有 8 条 ——
+        #     所以判据只能看时长,看条数会漏。
+        #   drained_waits  = 其中由补偿吃掉的那部分(纯诊断)。
+        self.skipped_wait_ms = 0.0
+        self.drained_waits = 0
+        # 本曲为「同指 down/up 后紧跟同刻 move」额外插入的 commit 条数
+        # (2026-10-29,见 actions_to_MNTcmd 里 last_by_finger 的注释)。
+        # 它是这条修复是否生效的指纹:动作数不变、命令串里多出这么多 'c'。
+        self.detached_moves = 0
         # 已发射 wait 命令的「理想时长」队列(滞后反馈的测量基准,2026-10-23 第四版)。
         # ⚠ 四版演变,都写在这里防止后人重蹈(测量端口径的完整踩坑史):
         #   第一版(基准=命令串解析的实际值):字符串解析丢小数,账本虚高
@@ -498,6 +511,26 @@ class Chart:
         def round_tuple(target):
             return tuple(round(x) for x in target)
 
+        # 同帧 down/up 与 move 覆盖起点(2026-10-29):每条手指上一次发出的
+        # 指令类型与时刻,用来判断「这条 move 与同指的 down/up 落在同一帧」。
+        # 背景:#489/#649-special 每局固定 649 PERFECT + miss 2,差的正是最后
+        # 两个判定点 —— 一条 10.1 秒滑条的头(84.63s)和尾。生成的动作是
+        # `84631.6ms down f1 (641.5, lane3)` 与 `84631.6ms move f1 → 422.5
+        # (lane1.5)`,move 只晚 10μs,不够插 wait,于是同一个 minitouch commit;
+        # evdev 一帧内同 contact 只保留**最终**位置,游戏看到触点一出现就在
+        # lane1.5,头判丢失 → 整条滑条无效 → 尾也 miss。
+        # #304-special 的 97800ms 处同族(down lane3 与 move lane1.68)。
+        # 修法:down/up 与同刻 move 之间强制插一次 commit()(不插 wait),
+        # 让判定点独占一帧,下一帧再开始移动。时刻不变,只多一帧。
+        # 只按**同指**判:跨指同帧是正常的(evdev 按 contact 各自取最终位置),
+        # 零 miss 的谱面同样满是跨指同刻冲突,一起切帧纯属白费。
+        # 实测注入处数(#489/#649 156、#304 193、#409 166、#522 144、#146 123):
+        # 绝大多数只是同 lane 内的几十 px 微移,只有「一跳超过一个 lane」的那
+        # 一两处会丢判定;但帧语义只认最终位置,不按位移大小分档更省心 ——
+        # 多切一帧不动时刻,服务端每条 commit 的开销(几十 μs)由滞后反馈补。
+        # 批边界不用管:发布时 publish() 末尾本来就会 commit,那两条天然分帧。
+        last_by_finger = {}
+
         # append
         for i, action in enumerate(actions):
             action_type = action["type"]
@@ -531,9 +564,22 @@ class Chart:
                     ),
                     action_index,
                 )
+                last_by_finger[finger] = (action["time"], "down")
             elif action_type == "move":
                 self._a2c_offset += move_offset
                 finger = action["finger"]
+                # 同指 down/up 之后紧跟着同刻 move:先封一帧,保住按下/抬起
+                # 那个位置(见上面 last_by_finger 的注释)。0.001ms 与下面插
+                # wait 的判据同一个门槛 —— 够不上插 wait 的就是同一帧。
+                _prev = last_by_finger.get(finger)
+                if (
+                    _prev is not None
+                    and _prev[1] in ("down", "up")
+                    and action["time"] - _prev[0] <= 0.001
+                ):
+                    append(builder.commit())
+                    self.detached_moves += 1
+                last_by_finger[finger] = (action["time"], "move")
                 append(
                     builder.move(
                         finger,
@@ -549,6 +595,7 @@ class Chart:
                 self._a2c_offset += up_offset
                 finger = action["finger"]
                 append(builder.up(finger), action_index)
+                last_by_finger[finger] = (action["time"], "up")
 
             elif action_type == "wait":
                 self._a2c_offset += wait_offset
@@ -590,6 +637,16 @@ class Chart:
                     # action["length"](未补偿/未取整),与 _dump_server_lag_async
                     # 的理想流重建口径一致 —— 在线 lag 与 dump 可直接对照。
                     self.wait_ideal_ms.append(action["length"])
+                else:
+                    # 这条间隙被跳过(补偿整段吃掉,或本来就不足 0.5ms)
+                    # (密集曲一次几十条)。这里累加的是**原始间隙时长**而不是
+                    # 补偿后的剩值 —— 因为在线估计器的理想指针只按「发出的 wait」
+                    # 推进,没发出的这条它压根不会计入,指针就永久落后这么多。
+                    # 指针落后 → lag 被算得偏正(假"晚") → 反馈持续往早推 →
+                    # 越打越早。#684 焚音打 92 条、欠账约 73ms、曲内 -73ms。
+                    self.skipped_wait_ms += action["length"]
+                    if offset_adjust >= 0.5:
+                        self.drained_waits += 1
 
         self.actions_to_cmd_index += size
 

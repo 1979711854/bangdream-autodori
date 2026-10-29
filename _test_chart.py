@@ -231,6 +231,111 @@ def test_finger_budget():
               if a["type"] in ("down", "move", "up")))
 
 
+def test_drained_wait_counter():
+    """被补偿整段吃掉的 wait 要计数(2026-10-29)。
+
+    play_song 的保护③靠这个数判断「在线滞后口径已错位」——抽干的 wait 不发
+    命令、没有 jlog 回执,#395 应发 4617/实发 4594 之后反馈就一直报 0。
+    """
+    print("\n[7] 补偿抽干 wait 的计数")
+
+    chart = build([BPM_NOTE, {"type": "Single", "lane": 3, "beat": 0}])
+    off = {"up": 0, "down": 0, "move": 0, "wait": 0, "interval": 0}
+
+    # 正常情况:池水为 0,短 wait 也照发(不会被吃掉)
+    chart.actions = [{"type": "wait", "length": 0.8, "time": 0.0,
+                      "index": 0}]
+    chart.actions_to_cmd_index = 0
+    chart.actions_to_MNTcmd(RESOLUTION, 0, off, size=50)
+    check("池水为 0 时不抽干", chart.drained_waits == 0,
+          "drained=%d" % chart.drained_waits)
+    check("池水为 0 时无欠账", round(chart.skipped_wait_ms, 3) == 0.0,
+          "skipped=%.3f" % chart.skipped_wait_ms)
+
+    # 池水充足:0.8ms 的 wait 被整段抽掉 → 计数 +1,且不发 wait 命令
+    chart = build([BPM_NOTE, {"type": "Single", "lane": 3, "beat": 0}])
+    chart.actions = [{"type": "wait", "length": 0.8, "time": 0.0,
+                      "index": 0}]
+    chart.actions_to_cmd_index = 0
+    chart._a2c_offset = 5.0
+    chart.wait_ideal_ms.clear()
+    chart.actions_to_MNTcmd(RESOLUTION, 0, off, size=50)
+    check("池水充足 → 抽干 +1", chart.drained_waits == 1,
+          "drained=%d" % chart.drained_waits)
+    check("抽干记入欠账时长(原始 0.8ms)",
+          abs(chart.skipped_wait_ms - 0.8) < 0.05,
+          "skipped=%.3f" % chart.skipped_wait_ms)
+    check("抽干后不发 wait、也不入理想队列",
+          (len(chart.wait_ideal_ms), sum(
+              1 for c in chart._commands
+              if str(c.get("command") or "").startswith("w "))) == (1, 0)
+          or len(chart.wait_ideal_ms) == 0,
+          "ideal=%s" % list(chart.wait_ideal_ms))
+
+
+def test_same_frame_down_move_split():
+    """同指 down/up 后紧跟同刻 move 要单独成帧(2026-10-29)。
+
+    #489/#649-special 每局固定 649 PERFECT + miss 2:一条 10.1s 滑条的头
+    (84.63s)与尾。`down f1 (lane3)` 与 `move f1 → lane1.5` 同一时间戳(move
+    只晚 10μs,不够插 wait)→ 同一个 minitouch commit → evdev 一帧内同 contact
+    只保留最终位置 → 游戏看到触点一出现就在 lane1.5 → 头判丢失,整条无效。
+    修法:两者之间插一条 commit(不插 wait),让判定点独占一帧。
+    #304-special 的 97800ms 处同族(lane3 → lane1.68)。
+    """
+    print("\n[8] 同指 down 后紧跟同刻 move → 独占一帧")
+    off = {"up": 0, "down": 0, "move": 0, "wait": 0, "interval": 0}
+
+    def cmds_of(chart):
+        while chart.actions_to_cmd_index < len(chart.actions):
+            chart.actions_to_MNTcmd(RESOLUTION, 0, off, size=100)
+        return [c["command"] for c in chart._commands]
+
+    def split_after_down(cmds):
+        """数「d → c → m」三连:只有本次插入的 commit 会落在 down 与 move
+        之间。注意普通单键也有 d → c(wait 前必 commit),但那条 c 后面是
+        wait 而不是 move,所以要连看三条。"""
+        return sum(1 for i in range(len(cmds) - 2)
+                   if cmds[i].startswith("d ") and cmds[i + 1] == "c"
+                   and cmds[i + 2].startswith("m "))
+
+    # 滑条头:down 与首个 move 同刻,必须插 commit
+    chart = build([BPM_NOTE, {
+        "type": "Slide",
+        "connections": [{"lane": 1, "beat": 2}, {"lane": 5, "beat": 3}],
+    }])
+    cmds = cmds_of(chart)
+    check("滑条头插了 1 条 commit", chart.detached_moves == 1,
+          "detached=%d" % chart.detached_moves)
+    check("命令流里出现 d → c → m(判定点独占一帧)",
+          split_after_down(cmds) == 1,
+          "split=%d" % split_after_down(cmds))
+    check("时刻不变(move 仍在头的 +10μs)",
+          [a["type"] for a in chart.actions if a["type"] != "wait"][:2]
+          == ["down", "move"])
+
+    # 负对照:纯单键(没有同刻 move)不得多切帧
+    chart = build([BPM_NOTE, {"type": "Single", "lane": 3, "beat": 0},
+                   {"type": "Single", "lane": 1, "beat": 1}])
+    cmds = cmds_of(chart)
+    check("纯单键不插 commit", chart.detached_moves == 0,
+          "detached=%d" % chart.detached_moves)
+    check("纯单键没有 d → c → m 三连",
+          split_after_down(cmds) == 0, "split=%d" % split_after_down(cmds))
+
+    # 跨指负对照:滑条 A 在滑动中途,另一个单键 B 同刻按下 —— 不是同指,
+    # 不能多切帧(零 miss 的 #522 有 236 处跨指同刻冲突,一起切是白切)。
+    chart = build([BPM_NOTE,
+                   {"type": "Slide",
+                    "connections": [{"lane": 1, "beat": 0}, {"lane": 5, "beat": 4}]},
+                   {"type": "Single", "lane": 0, "beat": 2}])
+    cmds = cmds_of(chart)
+    check("跨指同刻不额外切帧(只有滑条头那 1 处)",
+          chart.detached_moves == 1, "detached=%d" % chart.detached_moves)
+    check("d → c → m 三连只有滑条头那 1 处",
+          split_after_down(cmds) == 1, "split=%d" % split_after_down(cmds))
+
+
 def main():
     test_zero_length_segment()
     test_normal_slide_not_broken()
@@ -239,6 +344,8 @@ def main():
     test_long_and_flick_untouched()
     test_no_illegal_minitouch_command()
     test_finger_budget()
+    test_drained_wait_counter()
+    test_same_frame_down_move_split()
     print("\n合计: %d 通过 / %d 失败" % (PASS, FAIL))
     return 1 if FAIL else 0
 
