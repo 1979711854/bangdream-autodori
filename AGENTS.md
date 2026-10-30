@@ -55,8 +55,13 @@
 | 配置 | `data/gui_config.json` / `data/config.yml` |
 | 战绩 | `data/play_records.db`(SQLite) |
 | 打包 | `build.py`(`ZIP_FILENAME` 动态拼版本号) |
-| 回归测试(已入库,可 `git ls-files '_test_*'` 核) | 根目录 `_test_*.py`(20+ 个) |
-| 本机一次性诊断脚本/截图(**不入库**) | `debug/local/`(2026-10-28 从根目录归拢 111 个);根目录另留少数已入库的 `_diag_*.py`(`lagsim`/`gap`/`tpl` 等) |
+| 回归测试 / 检测脚本(已入库) | `scripts/_test_*.py`(25 个)、`scripts/_diag_*.py`(7 个)、`scripts/_cmp_zip_assets.py`;路径引导 `scripts/_bootstrap.py` |
+| 本机一次性诊断脚本/截图(**不入库**) | `debug/local/`(2026-10-28 从根目录归拢 111 个) |
+
+> **2026-10-30 起脚本位置变了**:`_test_*` / `_diag_*` / `_cmp_zip_assets.py` 全部从仓库根
+> 移进 `scripts/`,跑法改成 `python scripts/xxx.py`。每个脚本顶部有 `import _bootstrap`,
+> 它会把 CWD 切回仓库根再注入 `sys.path`,所以**从任何目录调用都能跑**(以前要求先 cd 到根)。
+> 下文提到这些脚本时不再逐个写 `scripts/` 前缀,一律按 `scripts/` 下理解。
 
 ## 3. MAA 管线三条铁律(最容易踩)
 
@@ -102,9 +107,11 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
    - 日常:`daily`、`daily_home`、`daily_boost_check`、`daily_pull`、`daily_pull_home`、
      `daily_pull_open_gacha`、`daily_pull_find_gacha`、`daily_pull_btn_check`
    - 启动:`start_app`
-5. `scripts/check_pipeline.py` 校验 → 实测(`src\autodori.py --mode daily`)。
-6. 离线回归:改 daily 逻辑跑 `_test_daily.py`;改结算读数跑 `_test_playresult.py`;
-   改谱面解算跑 `_test_chart.py`;改看门狗跑 `_test_watchdog.py`。
+5. 管线查重校验(`check_pipeline.py`,本机脚本未入库;基线 120 节点 0 问题)→
+   实测(`src\autodori.py --mode daily`)。
+6. 离线回归(都在 `scripts/` 下):改 daily 逻辑跑 `python scripts/_test_daily.py`;
+   改结算读数跑 `python scripts/_test_playresult.py`;改谱面解算跑
+   `python scripts/_test_chart.py`;改看门狗跑 `python scripts/_test_watchdog.py`。
 7. **弹窗内的按钮不要用固定 target 坐标点**(2026-10-26 event_reward_confirm 踩坑:
    「获得报酬」弹窗版式随活动类型变化,固定 (640,545) 点不中 OK(实际在 y582-619),
    弹窗留在屏上 → next 全不命中 → main 链结束 → 日常直接收工退出)。正确写法:
@@ -168,10 +175,38 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
 
   预发布版:未经充分实机测试(验证充分后再发正式版 vX.Y.Z)。
   修复 + 优化版本,配置格式无变更 —— 下载解压后覆盖到旧目录即可(data/ 与 cache/ 会保留)。
+- **`RELEASE_NOTES.md` 开头的 `<!-- -->` 注释不用担心**:CI 把整份文件当 Release
+  正文,但 GitHub 按 HTML 注释渲染、**页面上看不到**(2026-10-30 用 v1.3.5 实测:
+  抓页面 HTML 里搜不到注释文字,`gh release view --json body` 才看得到原文)。
+  所以维护者提醒可以留在文件里;真要审阅正文请用渲染后的页面,别用 API 的原始 body
+  下结论。
 - 发版:更新三处文本 → 提交推送 → `git tag -a vX.Y.Z[-rcN]` + push → CI 自动构建发 Release。
 - **用户 2026-10-17 明确:不要每次改完就自动递增版本号/打包**,等用户说"打包"再执行。
 
 ## 8. 踩坑清单(按重要度)
+
+- **彩色模板「永远匹配不上」= 抓图是 RGB、识别按 BGR(2026-10-30 定位,坑了一整天)**:
+  `_grab_screen()` / `ipc_capture_display()` 返回的是 **RGB**(`_snap` 里
+  `cv2.imwrite` 前要 `[:, :, ::-1]` 就是因为这个),而 `context.run_recognition`
+  底下的 OpenCV 按 **BGR** 解释。**灰度/白底模板看不出问题**(暂停按钮、白「确定」
+  饱和度≈0~1,通道互换后基本不变),只有**彩色模板**会静默失效:
+  `common/button/exit/pink.png` 在正确帧上 **1.0000**、通道错位 **0.6734** ——
+  0.673 就是 `maa.log` 里 `life_exit_confirm_btn` 打出来的那个分数;白「确定」
+  同理 0.6147。后果是 `_force_leave_live` 的三条判据从来没命中过,崩局后每次都
+  「三样都没认到」→ 放行 → 卡在「确认退出返回主页吗?」弹窗上。
+  **修法**:`_force_leave_live` 里抓完帧先 `screen[:, :, ::-1]` 再识别。
+  **判据**:模板分数差一点点(0.6~0.7)而上限明确、同时又只在这个调用点出现,
+  先查通道顺序;OCR 正常说明不了问题(灰度不敏感)。以后任何新的彩色模板判据,
+  都要在这个调用点确认帧已经是 BGR。
+- **Ctrl+C 停不下来(MAA 阻塞在 C 层,2026-10-30)**:用户实测「按了没反应,只能
+  关窗口」。根因:`KeyboardInterrupt` 只在**主线程执行 Python 字节码**时投递,而
+  打歌/识别全程卡在 `job.wait().get()` 里,信号一直挂着。
+  **修法**:`_start_console_stop()`(在 `_main_impl` 跑任务之前调用)①给 SIGINT/
+  SIGBREAK 装回调;②另起 daemon 线程读 stdin,读到任意一行就
+  `_console_stop()` → `_shutdown()`(`os._exit`,必退)。GUI/打包态没有控制台
+  stdin,线程 EOF 即结束,零副作用。启动时会在真终端里打一行「停止方式:Ctrl+C,
+  或直接在这里按一次回车」。**别指望再加什么定时器**:主线程不在 Python 层,
+  和信号、`sys.exit`、`atexit` 都无关,只有独立线程能把它带走。
 
 - **崩局收尾被一个死节点判死(2026-10-29 已修,待实机验证)**:现场
   `autodori-20261029-121834.log` 12:35 场 #606 V.I.P MONSTER 崩局。`life_exhausted_exit`
