@@ -55,7 +55,7 @@ FULL versions now combo as accurately as regular songs.
 - **Run log**: key events only; open log folder / export the full log / clear; logs older than 7 days are removed automatically on startup
 - Settings are persisted in `data/gui_config.json` (theme / font size / window / current page, ...)
 
-![GUI main window](screenshots/gui.jpg)
+![GUI main window](screenshots/gui.png)
 
 ## 🎯 Challenge Live CP clearing
 
