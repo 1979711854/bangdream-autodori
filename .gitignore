@@ -638,6 +638,8 @@ NVIDIA Corporation/
 # ---- 只留在本地的诊断脚本 ----
 # _test_*.py(离线回归测试)与 _diag_play.py(按歌聚合打歌诊断)会随仓库提交,
 # 不要通配掉。下面这几个只对本机环境有意义,故不入库:
+# 2026-10-30:入库的那些已整体移到 scripts/,以下规则按文件名匹配、不分层,
+# 所以忽略行为与之前完全一致,新写的 scripts/_test_xxx.py 仍会正常入库。
 #   _chk_exe.py / _chk_keyerror.py —— 反编译本机 exe 核对装的是哪份源码
 #   _diag_maa.py                   —— 依赖本机资源目录布局
 #   _diag_{anchor,chart786,duprule,exe_chart,exe_src,fail,fail2,gate,jitter,
