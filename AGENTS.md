@@ -1291,6 +1291,19 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
   `assets/build_metadata.json` 已拷,版本号与新符号(lagdump、音符曲内增长)
   核对通过。**未写发版文本、未打 tag**(取证阶段,等判读结论出来再定
   v1.3.4 的 Release 内容)。
+- **超高难度活动崩局兜底会掉回自由演出链(2026-11-03 修)**:`--mode special` 的
+  override 原来只改写 `wait_playresult` / `save_succeed_playresult` /
+  `handle_life_exhausted` 三个节点。`_test_special.py` 有一条「运行期图里不可达
+  liveagain」的断言,一直是 **FAIL**,根因是第四条边:`playsong.on_error` →
+  `life_exhausted_exit`(OCR「退出」)→ 它自己的 `on_error = main` → 自由演出主页
+  链 → `live_home_button` 的 interrupt `event_reward_confirm` → `event_reward_ok`
+  → `liveagain`。也就是「崩局 + 退出按钮没认出来」时会去重新选歌/点再次演出,
+  而超高难度按设计是一首一跑。
+  **修法**:special 分支补第四个 override `life_exhausted_exit`,只把
+  `on_error` 从 `main` 改成 `["special_stop"]`(零点击终止),其余字段与 live.json
+  逐字一致;`_test_special.py` 的「正好改写三个节点」同步改四个,并加两条断言。
+  **别混淆**:普通歌选 SPECIAL 难度走的是 `main`/`daily` + `live.json`,
+  `liveagain` 在那边是正常的连打节点;这条约束只属于超高难度活动。
 - git 提交用 Conventional Commits 中文描述;注释写清背景原因(本仓库风格)。
 
 ## 9. 2026-10-17 的改动与当前状态

@@ -5382,9 +5382,9 @@ def _get_override_pipeline():
 
     if SPECIAL_MODE:
         # 超高难度活动:曲目与难度都固定,不需要 set_difficulty / select_live_mode。
-        # 只把「打完之后去哪」这三处从"回选歌继续挖矿"改写成"收尾并停止"。
-        # 三处都给**完整节点定义**(不依赖框架的字段级合并语义),其中
-        # wait_playresult / save_succeed_playresult 的其余字段与 live.json 逐字一致。
+        # 只把「打完之后去哪」这四处从"回选歌继续挖矿"改写成"收尾并停止"。
+        # 四处都给**完整节点定义**(不依赖框架的字段级合并语义),其中各节点的其余
+        # 字段与 live.json 逐字一致。
         all_pipelines["wait_playresult"] = {
             "recognition": "TemplateMatch",
             "template": ["live/scored.png", "live/activity_scored.png"],
@@ -5426,6 +5426,23 @@ def _get_override_pipeline():
             # (已用 _diag_duprule.py 实证)。
             "next": ["special_stop"],
             "on_error": ["stop"],
+        }
+        # 崩局兜底也要收尾(2026-11-03):life_exhausted_exit 是「演出失败」弹窗上的
+        # 「退出」按钮(OCR)。它的 on_error 原本是 main —— 点不掉那个按钮时掉回
+        # **自由演出**的主页链(live_home_button → 奖励弹窗 → liveagain)。
+        # 超高难度不能再次演出,这条兜底等于把收尾流程变成「重新选歌/再开一局」,
+        # 而且是崩局之后最乱的时候。改成零点击的 special_stop 直接停。
+        # 其余字段与 live.json 逐字一致,避免依赖字段级合并语义。
+        all_pipelines["life_exhausted_exit"] = {
+            "recognition": "OCR",
+            "expected": "退出",
+            "roi": [300, 420, 160, 70],
+            "action": "Click",
+            "post_delay": 1200,
+            "timeout": 5000,
+            # 原值 "main" —— 见上,活动模式必须收尾停止。
+            "on_error": ["special_stop"],
+            "next": "handle_life_exhausted",
         }
         return all_pipelines
 

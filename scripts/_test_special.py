@@ -410,7 +410,7 @@ def test_bot_branch():
     print("[3] bot 分支接线")
     tree, src = load_toplevel(BOT_SRC)
 
-    # 3.1 _get_override_pipeline 在 SPECIAL_MODE 下提前返回三条改写
+    # 3.1 _get_override_pipeline 在 SPECIAL_MODE 下提前返回四条改写
     fn = next(n for n in tree.body
               if isinstance(n, ast.FunctionDef) and n.name == "_get_override_pipeline")
     seg = ast.get_source_segment(src, fn)
@@ -418,15 +418,22 @@ def test_bot_branch():
     check("分支提前返回", seg.index("if SPECIAL_MODE:") < seg.index("# set_difficulty"))
 
     overrides = special_branch_dicts(tree)
-    check("分支正好改写三个节点",
+    check("分支正好改写四个节点",
           set(overrides) == {"wait_playresult", "save_succeed_playresult",
-                             "handle_life_exhausted"}, sorted(overrides))
+                             "handle_life_exhausted", "life_exhausted_exit"},
+          sorted(overrides))
     check("save_succeed_playresult.next -> special_finish",
           (overrides.get("save_succeed_playresult") or {}).get("next") == ["special_finish"])
     check("handle_life_exhausted.next -> special_stop(失败不盲点按钮)",
           (overrides.get("handle_life_exhausted") or {}).get("next") == ["special_stop"])
     check("wait_playresult.on_error -> special_finish",
           (overrides.get("wait_playresult") or {}).get("on_error") == ["special_finish"])
+    # 2026-11-03:「演出失败→退出」认不出时原本 on_error=main,会掉回自由演出的
+    # 主页链(奖励弹窗 → 再次演出)。超高难度不能再次演出,必须直接收尾停止。
+    check("life_exhausted_exit.on_error -> special_stop(崩局兜底不回到自由演出链)",
+          (overrides.get("life_exhausted_exit") or {}).get("on_error") == ["special_stop"])
+    check("life_exhausted_exit.next 仍是 handle_life_exhausted",
+          (overrides.get("life_exhausted_exit") or {}).get("next") == "handle_life_exhausted")
     flat = json.dumps(overrides, ensure_ascii=False)
     check("改写里不再出现 liveagain / live_home_button",
           "liveagain" not in flat and "live_home_button" not in flat)
