@@ -160,8 +160,10 @@ CAL_MISALIGN_SKIP_RATIO = 0.02
 # 报告比同曲结算早到 30~40 秒(见 MISALIGN_TTL_S 注释),结算时能直接取用。
 LAG_DRIFT_RE = re.compile(r"音符曲内增长=(-?\d+(?:\.\d+)?)ms")
 CAL_DRIFT_SKIP_MS = 20.0   # |曲内增长| 达到此值即跳过本曲校准
-# 环境卡顿报告(2026-10-31)。bot 曲末/崩局收尾会打 WARNING:
-#   WARNING 模拟器响应异常: 本曲打歌期间单批执行偏差峰值 182.7ms(超限 6 批),…
+# 环境卡顿报告(2026-10-31)。bot 曲末/崩局收尾会打两行 WARNING:
+#   WARNING 模拟器响应异常：单批执行偏差峰值 182.7ms（6 批超过 30ms 上限）
+#   WARNING 本曲 FAST/SLOW 读数不可信，已跳过判定时机校准；…
+# 只解析第一行(数字行,2026-11-03 起全角标点;旧半角格式仍兼容)。
 # 判据见 src/autodori.py 的 _LAG_STALL_*(jlog 单批偏差 >60ms 或超限 ≥3 批)。
 # 卡顿下的 FAST/SLOW 是模拟器/主机被抢 CPU 造成的,不是 gate 的整首偏移;
 # 拿它调 gate 会把环境问题写进下一首(实机 #2 结算 fast59/slow35 就来自卡顿,

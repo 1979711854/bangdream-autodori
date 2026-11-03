@@ -821,11 +821,16 @@ def lag_feedback_batch_delta(chart, batch_no: int, now=None) -> float:
             else -_LAG_FB_MAX_BATCH_INJECT_MS
         )
         if _lag_fb["overshoot_n"] == 1:
+            # 2026-11-03 用户反馈: 原文案「本批偏差 61.2ms 超过单批上限 30ms,
+            # 只补 30ms(批#72),其余下批继续」有三处读不懂 —— 「批#72」是多少
+            # 批之后?「只补」是被丢弃还是顺延?「其余」是剩多少?改成显式账本:
+            # 第几批、残差多少、本批补多少、余额多少顺延。
+            # 残差为负(时间线偏早、往晚放)时同样带符号打印,避免"只补 -30"歧义。
             logging.warning(
-                "滞后反馈: 本批偏差 %.1fms 超过单批上限 %.0fms,只补 %.0fms"
-                "(批#%d),其余下批继续",
-                delta, _LAG_FB_MAX_BATCH_INJECT_MS,
-                abs(clamped), batch_no,
+                "滞后反馈：第 %d 批残差 %+.1fms，超过单批补偿上限 %.0fms，"
+                "本批补 %+.1fms，余额 %+.1fms 顺延到下一批",
+                batch_no, delta, _LAG_FB_MAX_BATCH_INJECT_MS,
+                clamped, delta - clamped,
             )
         else:
             logging.debug(
@@ -2466,11 +2471,13 @@ class HandleLifeExhausted(CustomAction):
             # 位置随机、读着费劲。第一行只放数字(也是 GUI 侧 LAG_STALL_RE 的
             # 采集行,「模拟器响应异常 … 峰值 Xms」必须留在同一行),第二行给结论。
             logging.warning(
-                "模拟器响应异常: 单批执行偏差峰值 %.0fms(超限 %d 批)",
+                "模拟器响应异常：单批执行偏差峰值 %.0fms（%d 批超过 %.0fms 上限）",
                 _lag_fb["overshoot_peak_ms"], _lag_fb["overshoot_n"],
+                _LAG_FB_MAX_BATCH_INJECT_MS,
             )
             logging.warning(
-                "本曲崩局由卡顿引起,不是谱面/时序问题,建议关闭占用 CPU 的程序后重试"
+                "本曲崩局由模拟器卡顿引起，不是谱面或时序问题；"
+                "建议关闭占用 CPU 的程序后重试"
             )
         logging.info("生命值耗尽,自动继续打歌")
         return CustomAction.RunResult(True)
@@ -4284,11 +4291,17 @@ def play_song(context=None):
             # 50~180ms。这种局的 FAST/SLOW 不能用来调 photogate(见 gui 的
             # _take_stall),也不能拿来判断这首歌打得怎么样。
             # 用固定前缀「模拟器响应异常」给 GUI 解析,文案本身给用户看。
+            # 2026-11-03 用户反馈: 一行 60+ 字、且「(超限 N 批)」看不出超的什么限。
+            # 与崩局版统一成分行: 第一行只放数字(GUI 的 LAG_STALL_RE 要求
+            # 「模拟器响应异常 … 峰值 Xms」在同一行),第二行给结论与建议。
             logging.warning(
-                "模拟器响应异常: 本曲打歌期间单批执行偏差峰值 %.0fms"
-                "(超限 %d 批),FAST/SLOW 不可信,本曲数据不参与校准;"
-                "建议关闭占用 CPU 的程序后再打歌",
+                "模拟器响应异常：单批执行偏差峰值 %.0fms（%d 批超过 %.0fms 上限）",
                 _lag_fb["overshoot_peak_ms"], _lag_fb["overshoot_n"],
+                _LAG_FB_MAX_BATCH_INJECT_MS,
+            )
+            logging.warning(
+                "本曲 FAST/SLOW 读数不可信，已跳过判定时机校准；"
+                "建议关闭占用 CPU 的程序后重试"
             )
     # 同指同帧修正的指纹(2026-10-29):动作数不变、命令串里多出这么多 'c'。
     # #489/#649-special 应各 2 处(滑条头/尾),其余曲目按谱面结构多少不等。
