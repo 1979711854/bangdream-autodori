@@ -160,6 +160,13 @@ CAL_MISALIGN_SKIP_RATIO = 0.02
 # 报告比同曲结算早到 30~40 秒(见 MISALIGN_TTL_S 注释),结算时能直接取用。
 LAG_DRIFT_RE = re.compile(r"音符曲内增长=(-?\d+(?:\.\d+)?)ms")
 CAL_DRIFT_SKIP_MS = 20.0   # |曲内增长| 达到此值即跳过本曲校准
+# 环境卡顿报告(2026-10-31)。bot 曲末/崩局收尾会打 WARNING:
+#   WARNING 模拟器响应异常: 本曲打歌期间单批执行偏差峰值 182.7ms(超限 6 批),…
+# 判据见 src/autodori.py 的 _LAG_STALL_*(jlog 单批偏差 >60ms 或超限 ≥3 批)。
+# 卡顿下的 FAST/SLOW 是模拟器/主机被抢 CPU 造成的,不是 gate 的整首偏移;
+# 拿它调 gate 会把环境问题写进下一首(实机 #2 结算 fast59/slow35 就来自卡顿,
+# 同场正常曲全 AP)。和曲内漂移一样:跳过校准、清零方向记忆。
+LAG_STALL_RE = re.compile(r"模拟器响应异常.*?峰值\s*(\d+(?:\.\d+)?)ms")
 # 报告有效期(秒)。dump 跑在 daemon 线程里,实测比同曲结算早 30~40 秒到达
 # (17:42:26 vs 17:43:02),所以正常都能在结算前命中;崩局那首没有结算,
 # 报告会一直挂着,超过有效期就丢弃。
@@ -235,6 +242,21 @@ def _parse_drift(line):
     纯函数,便于离线测试。漂移 = 曲尾与曲首的滞后差,负=越打越早,正=越打越晚。
     """
     m = LAG_DRIFT_RE.search(line)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_stall(line):
+    """从 bot 的「模拟器响应异常」行解析单批执行偏差峰值(ms);认不出返回 None。
+
+    纯函数,便于离线测试。2026-10-31:模拟器卡顿时 jlog 单批偏差 50~180ms,
+    这一局的 FAST/SLOW 完全失真,必须跳过 photogate 自动校准。
+    """
+    m = LAG_STALL_RE.search(line)
     if not m:
         return None
     try:
@@ -434,6 +456,9 @@ class AutodoriGUI:
         self._misalign_pending = None
         # 本曲的曲内漂移报告 (毫秒, 到达时刻),结算时据此跳过校准(2026-10-29)
         self._drift_pending = None
+        # 本曲的「模拟器卡顿」报告 (单批偏差峰值 ms, 到达时刻),结算时跳过校准
+        # (2026-10-31;卡顿下的 FAST/SLOW 不可信,见 LAG_STALL_RE 注释)
+        self._stall_pending = None
         # 小额偏置累计:单曲 |FAST-SLOW|<CAL_MIN_DIFF 不动 gate,但累加到
         # CAL_MIN_DIFF 就微调 1ms —— 「擦着爆 1 个 slow」才调得动。
         self._bias_acc = 0
@@ -847,10 +872,12 @@ class AutodoriGUI:
         if self.view == "settings.ui":
             return self._detail_ui(master)
         if self.view == "daily":
-            # 日常页两张卡片:清理日常 + 阅读角色故事(2026-10-25 新增)。
+            # 日常页三张卡片:清理日常 + 阅读角色故事 + 阅读活动故事
+            # (角色故事 2026-10-25 新增,活动故事 2026-10-31 新增)。
             wrap = tk.Frame(master, bg=T.get()["surface"])
             self._detail_daily(wrap).pack(fill="x")
             self._detail_story(wrap).pack(fill="x", pady=(12, 0))
+            self._detail_event_story(wrap).pack(fill="x", pady=(12, 0))
             return wrap
         return self._detail_about(master)
 
@@ -1264,6 +1291,38 @@ class AutodoriGUI:
                  justify="left").pack(anchor="w", pady=(8, 0))
         return card
 
+    def _detail_event_story(self, master):
+        """阅读活动故事(2026-10-31 新增,用户定的口径)。
+
+        分工 —— 用户负责前置:手动进入**活动主页**(有「演出」「活动故事」
+        按钮的那一页),再点按钮交给 bot。bot 进「活动故事」话列表,从最下面的
+        未读话开始按剧情顺序读。
+        解锁机制(用户 2026-10-31 说明):每话要活动 PT 达阈值;PT 不够、或前面
+        剧情没读就点后面,会提示「该剧情尚未解锁」且「阅读」按钮变暗点不动。
+        所以无法读时不是跳过,而是暂停并提示,下次运行从同一话重试。
+        """
+        th = T.get()
+        card = W.Card(master)
+        W.SectionTitle(card.body, "阅读活动故事",
+                       "按剧情顺序逐话阅读并领取达成奖励").pack(fill="x", pady=(0, 12))
+        tk.Label(card.body,
+                 text="使用前提:需要先手动进入活动主页（有「演出」「活动故事」按钮的页面）",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(0, 12))
+        btns = tk.Frame(card.body, bg=th["surface"])
+        btns.pack(anchor="w")
+        W.PushButton(btns, "阅读活动故事",
+                     command=lambda: self.start(mode="event_story"),
+                     kind="primary", width=160, height=36).pack(side="left")
+        tk.Label(card.body,
+                 text="每话需活动 PT 达标才解锁；PT 不足时会自动暂停并提示\n"
+                      "已读进度以游戏内「NEW」标记为准，再次点击会从下一话继续",
+                 bg=th["surface"], fg=th["text_3"],
+                 font=T.font(self.font_size - 1), anchor="w",
+                 justify="left").pack(anchor="w", pady=(8, 0))
+        return card
+
     def _on_daily_auto_clear_fire(self, value):
         self.daily_auto_clear_fire = bool(value)
         self._save_gui_config()
@@ -1577,6 +1636,18 @@ class AutodoriGUI:
             self._emit("", "WARN",
                        "本曲下发链错位 {:.1%},跳过本曲校准".format(misalign))
             return
+        stall = self._take_stall()
+        if stall is not None:
+            # 环境卡顿(2026-10-31):模拟器/主机被抢 CPU 时 jlog 单批偏差
+            # 50~180ms,游戏同时吞输入。这一局的 FAST/SLOW 与 gate 无关,
+            # 拿去校准会把环境问题写进下一首(#2 结算 fast59/slow35 即此)。
+            self._set_cal(
+                "本曲模拟器响应异常(峰值 {:.0f}ms),未参与校准".format(stall))
+            self._emit(
+                "", "WARN",
+                "本曲模拟器响应异常(峰值 {:.0f}ms),跳过本曲校准".format(stall))
+            self._cal_direction_prev = 0
+            return
         drift = self._take_drift()
         if drift is not None:
             # 曲内漂移(2026-10-29):越打越早/晚是下发链在曲内跑偏,不是 gate 的
@@ -1684,6 +1755,26 @@ class AutodoriGUI:
         if time.time() - ts > MISALIGN_TTL_S:
             return None
         return growth if abs(growth) >= CAL_DRIFT_SKIP_MS else None
+
+    def _take_stall(self):
+        """取出本曲的「模拟器卡顿」报告;未报到/过期返回 None(消费即清空)。
+
+        与 _take_drift 同一套口径:报告属于「最近一首」,换曲时清掉;
+        超过 MISALIGN_TTL_S 视为过期(崩局那首没有结算,报告会一直挂着)。
+        门槛由 bot 侧判(bot 只在超限 ≥3 批或峰值 >60ms 时才打这一行),
+        这里不做二次过滤 —— 报了就不校准。
+        """
+        pending = getattr(self, "_stall_pending", None)
+        self._stall_pending = None
+        if not pending:
+            return None
+        try:
+            peak, ts = pending
+        except (TypeError, ValueError):
+            return None
+        if time.time() - ts > MISALIGN_TTL_S:
+            return None
+        return peak
 
     def _set_cal(self, text):
         # 切走 live.gate 页后,cal_label 指向的旧控件已被销毁,仅判非空会命中死控件
@@ -1803,6 +1894,10 @@ class AutodoriGUI:
             # 小故事与回忆小故事是两个独立入口,对应 --story-type。
             args = ["--mode", "story", "--story-type",
                     "memoir" if mode == "story_memoir" else "member"]
+        elif mode == "event_story":
+            # 阅读活动故事(2026-10-31 新增):用户停在活动主页,bot 自己点
+            # 「活动故事」入口,所以不需要额外参数。
+            args = ["--mode", "eventstory"]
         else:
             # 2026-10-17 合并入口:「日常」是唯一的常规打歌入口(main 按钮已删)。
             # 难度/选歌策略/火罐策略都取自「自由演出设置」,日常阶段2 现在真读 --difficulty
@@ -1822,6 +1917,7 @@ class AutodoriGUI:
         # 上一轮残留的错位报告不能带进新一轮(换了难度/策略,未必还错位)。
         self._misalign_pending = None
         self._drift_pending = None
+        self._stall_pending = None
         self._bias_acc = 0
         if getattr(self, "m_songs", None):
             self.m_songs.set("0 首")
@@ -1997,6 +2093,7 @@ class AutodoriGUI:
             # 报告会挂在这里),直接丢掉,免得结算时误伤新的一首。
             self._misalign_pending = None
             self._drift_pending = None
+            self._stall_pending = None
             name = song.group(1).strip()
             if name and name != self.current_song:
                 self.current_song = name
@@ -2030,6 +2127,10 @@ class AutodoriGUI:
         if drift is not None:
             # 同上:只记账。本曲的曲内增长到结算时用来判断该不该参与校准。
             self._drift_pending = (drift, time.time())
+        stall = _parse_stall(line)
+        if stall is not None:
+            # 同上:只记账。模拟器卡顿导致的 FAST/SLOW 失真,结算时跳过校准。
+            self._stall_pending = (stall, time.time())
         if "打歌中生命值耗尽" in msg:
             self._on_life_exhausted()
             self._emit(stamp, "WARN", msg)

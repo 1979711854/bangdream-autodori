@@ -1,0 +1,177 @@
+{
+    "eventstory": {
+        "recognition": "Custom",
+        "custom_recognition": "EventStoryEntry",
+        "action": "Click",
+        "timeout": 3000,
+        "post_delay": 2500,
+        "next": [
+            "eventstory_pick"
+        ],
+        "on_error": [
+            "eventstory_not_home"
+        ]
+    },
+    "eventstory_not_home": {
+        "action": "Custom",
+        "custom_action": "EventStoryNotHome",
+        "next": [
+            "stop"
+        ]
+    },
+    "eventstory_pick": {
+        "recognition": "Custom",
+        "custom_recognition": "EventChapterPick",
+        "action": "Custom",
+        "custom_action": "EventChapterPickClick",
+        "timeout": 30000,
+        "post_delay": 1200,
+        "next": [
+            "eventstory_read"
+        ],
+        "on_error": [
+            "eventstory_done"
+        ]
+    },
+    "eventstory_read": {
+        "recognition": "TemplateMatch",
+        "template": "event/event_read_btn.png",
+        "roi": [
+            940,
+            600,
+            300,
+            90
+        ],
+        "threshold": 0.85,
+        "timeout": 6000,
+        "action": "Click",
+        "post_delay": 1200,
+        "next": [
+            "eventstory_play_dialog",
+            "eventstory_loading",
+            "eventstory_reader_menu"
+        ],
+        "on_error": [
+            "eventstory_locked"
+        ]
+    },
+    "eventstory_locked": {
+        "action": "Custom",
+        "custom_action": "EventChapterLocked",
+        "next": [
+            "stop"
+        ]
+    },
+    "eventstory_play_dialog": {
+        "recognition": "TemplateMatch",
+        "template": "event/event_no_voice_btn.png",
+        "roi": [
+            520,
+            530,
+            260,
+            110
+        ],
+        "threshold": 0.85,
+        "action": "Click",
+        "post_delay": 2000,
+        "next": [
+            "eventstory_loading",
+            "eventstory_reader_menu"
+        ]
+    },
+    "eventstory_loading": {
+        "recognition": "OCR",
+        "expected": [
+            "LOADING",
+            ".*MB/.*"
+        ],
+        "roi": [
+            0,
+            540,
+            1280,
+            180
+        ],
+        "timeout": 4000,
+        "post_delay": 3000,
+        "next": [
+            "eventstory_loading",
+            "eventstory_reader_menu"
+        ]
+    },
+    "eventstory_reader_menu": {
+        "recognition": "TemplateMatch",
+        "template": "common/reader/menu.png",
+        "roi": [
+            1000,
+            0,
+            280,
+            120
+        ],
+        "threshold": 0.9,
+        "timeout": 8000,
+        "action": "Click",
+        "post_delay": 1000,
+        "next": [
+            "eventstory_reader_skip",
+            "eventstory_reader_menu"
+        ]
+    },
+    "eventstory_reader_skip": {
+        "recognition": "TemplateMatch",
+        "template": "common/reader/skip.png",
+        "roi": [
+            480,
+            0,
+            320,
+            120
+        ],
+        "threshold": 0.9,
+        "action": "Click",
+        "post_delay": 800,
+        "next": [
+            "eventstory_skip_confirm",
+            "eventstory_reader_menu"
+        ]
+    },
+    "eventstory_skip_confirm": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/skip/pink.png",
+        "roi": [
+            600,
+            390,
+            340,
+            105
+        ],
+        "threshold": 0.9,
+        "action": "Click",
+        "post_delay": 2500,
+        "next": [
+            "eventstory_reward"
+        ]
+    },
+    "eventstory_reward": {
+        "recognition": "TemplateMatch",
+        "template": "common/button/rankup_confirm.png",
+        "roi": [
+            480,
+            490,
+            340,
+            130
+        ],
+        "threshold": 0.85,
+        "timeout": 8000,
+        "action": "Custom",
+        "custom_action": "EventChapterDone",
+        "post_delay": 2000,
+        "next": [
+            "eventstory_pick"
+        ]
+    },
+    "eventstory_done": {
+        "action": "Custom",
+        "custom_action": "EventStoryFinish",
+        "next": [
+            "stop"
+        ]
+    }
+}

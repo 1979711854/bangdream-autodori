@@ -53,10 +53,18 @@ def check(label, cond, extra=""):
 
 
 def build(notes):
-    """用合成谱面构造 Chart 并解算,返回 Chart 实例;异常原样抛出给调用方断言。"""
-    with mock.patch.object(chart_mod.BestdoriAPI, "get_chart", return_value=notes):
+    """用合成谱面构造 Chart 并解算,返回 Chart 实例;异常原样抛出给调用方断言。
+
+    2026-10-31:notes_to_actions 会去取「方向 flick 方向表」(联网读游戏 BMS),
+    合成谱面没有真实曲目,这里显式打桩成 None —— 本文件保持纯离线,方向逻辑
+    单独由 scripts/_test_flickdir.py 覆盖。
+    """
+    with mock.patch.object(chart_mod.BestdoriAPI, "get_chart", return_value=notes), \
+         mock.patch.object(
+             chart_mod.BestdoriAPI, "get_flick_directions", return_value=None
+         ):
         chart = chart_mod.Chart(("0", "special"), "synthetic")
-    chart.notes_to_actions(RESOLUTION, MOVE_SLICE)
+        chart.notes_to_actions(RESOLUTION, MOVE_SLICE)
     return chart
 
 

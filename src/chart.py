@@ -20,6 +20,41 @@ import yaml
 MAX_FINGERS = 10
 
 
+def infer_flick_direction(connections):
+    """拿不到游戏 BMS 时,按滑条轨迹反推方向 flick 往左还是往右。
+
+    背景(2026-10-31):Bestdori 的 chart JSON 只标 `flick: true`,不带方向;
+    #413/#189/#344 这类谱面的滑条尾其实是「方向フリック」,游戏要左右划,
+    向上划每条都判 MISS。能拿到游戏 BMS 时以 BMS 为准(api.get_flick_directions);
+    拿不到(老曲没有资源 / 断网)才用这里兜底。
+
+    规则(用三首的游戏 BMS 逐条对账标定):
+      · 头尾不在同一轨:方向 = 与「头→尾」位移**相反**的一侧;
+      · 头尾同轨(回旋滑条):朝最远中段点的方向划;
+      · 头尾同轨且没有中段点(纯长条):猜不出,返回 None。
+    实测准确率:#413 34/37、#189 22/31、#344 21/31;猜错的集中在零位移长条,
+    所以它只配当兜底,不替代 BMS。
+    ⚠ 2026-11-02 补测:14 张有 BMS 的谱面、191 条 flick 尾里,它把 83/95 条
+    普通 flick 也判成了方向 flick —— 所以它只能当兜底,别当成可信判据。
+    """
+    if not connections:
+        return None
+    head = connections[0].get("lane")
+    tail = connections[-1].get("lane")
+    if head is None or tail is None:
+        return None
+    if tail != head:
+        return "L" if tail > head else "R"
+    mids = [c.get("lane") for c in connections[1:-1] if c.get("lane") is not None]
+    if mids:
+        far = max(mids, key=lambda m: abs(m - tail))
+        if far > tail:
+            return "R"
+        if far < tail:
+            return "L"
+    return None
+
+
 class PlayRecord(Model):
     class Meta:
         database = SqliteDatabase("data/play_records.db")
@@ -167,9 +202,72 @@ class Chart:
         default_move_slice_size,
     ):
         notes: list[dict] = self._chart_data
+        lane_config = util.get_runtime_info(screen_resolution)["lane"]
+
+        # 方向フリック(2026-10-31):见 api.get_flick_directions 的注释。
+        # 拿不到(老曲没有 BMS / 断网)返回 None,下面按轨迹反推兜底。
+        # 统计归类:dir=BMS 给的方向,plain=BMS 说是普通 flick,guessed=反推,
+        # unknown=反推不出来(维持原来的上划)。
+        # 没有 flick 尾的谱面(大多数)连查都不查,省掉一次联网/缓存查找。
+        has_flick_tail = any(
+            isinstance(n, dict)
+            and n.get("type") in ("Slide", "Long")
+            and n.get("connections")
+            and n["connections"][-1].get("flick")
+            for n in notes
+        )
+        flick_dirs = None
+        flick_overrides = {}
+        if has_flick_tail:
+            try:
+                flick_dirs = BestdoriAPI.get_flick_directions(
+                    self._id_, self._difficulty
+                )
+            except Exception as e:  # noqa: BLE001 —— 取方向失败绝不能影响打歌
+                logging.warning(
+                    "方向フリック表取不到(%s): %s", self._chart_name, e
+                )
+                flick_dirs = None
+            try:
+                # 按曲覆盖(2026-10-31):老曲 BMS 取不到、方向反推不出来时,
+                # 用实机 combo 反推手工补 —— 只含方向的小文件,优先级最高。
+                flick_overrides = BestdoriAPI.get_flick_direction_overrides(
+                    self._id_, self._difficulty
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.warning(
+                    "方向覆盖读取失败(%s): %s", self._chart_name, e
+                )
+                flick_overrides = {}
+        flick_stat = {"dir": 0, "left": 0, "right": 0, "plain": 0,
+                      "guessed": 0, "unknown": 0, "override": 0}
+
+        def resolve_flick_dir(connections):
+            """flick 尾 → (方向 "L"/"R" 或 None, 归类)。"""
+            tail = connections[-1]
+            beat = round(tail.get("beat", 0.0), 3)
+            lane = tail.get("lane", 0)
+            width = tail.get("width") or 1
+            # ① 按曲覆盖优先(人工/A-B 反推补的方向)
+            #    "U" = 明确按普通 flick 上划(轨迹反推猜错时用来排除干扰)。
+            for lane_i in range(lane, lane + width):
+                direction = flick_overrides.get((beat, lane_i))
+                if direction == "U":
+                    return None, "override"
+                if direction:
+                    return direction, "override"
+            if flick_dirs is not None:
+                # ② BMS:查得到 = 方向 flick;查不到 = 普通 flick,维持上划。
+                for lane_i in range(lane, lane + width):
+                    direction = flick_dirs.get((beat, lane_i))
+                    if direction:
+                        return direction, "dir"
+                return None, "plain"
+            # ③ 都没有:按轨迹反推(零位移长条反推不出来 → 维持上划)
+            direction = infer_flick_direction(connections)
+            return (direction, "guessed") if direction else (None, "unknown")
 
         def get_lane_position(lane: int) -> tuple[int, int]:
-            lane_config = util.get_runtime_info(screen_resolution)["lane"]
             return (
                 lane_config["start_x"] + (lane + 0.5) * lane_config["w"],
                 lane_config["h"],
@@ -428,16 +526,36 @@ class Chart:
                         end_pos = get_lane_position(connection["lane"])
 
                 if end_flick:
-                    add_smooth_move(
-                        note_index,
-                        finger,
-                        to_time,
-                        80,
-                        end_pos,
-                        (end_pos[0], end_pos[1] - 300),
-                        down=False,
-                        up=False,
-                    )
+                    flick_dir, how = resolve_flick_dir(note_data["connections"])
+                    flick_stat[how] += 1
+                    if flick_dir:
+                        flick_stat["left" if flick_dir == "L" else "right"] += 1
+                        # 方向 flick:沿判定线水平划 2 条轨道宽(720p 下约 294px)。
+                        # 靠边时夹在屏幕内,最窄实测也有 ~200px,足够触发。
+                        dist = lane_config["w"] * 2
+                        to_x = end_pos[0] + (dist if flick_dir == "R" else -dist)
+                        to_x = max(0, min(screen_resolution[0] - 1, to_x))
+                        add_smooth_move(
+                            note_index,
+                            finger,
+                            to_time,
+                            80,
+                            end_pos,
+                            (to_x, end_pos[1]),
+                            down=False,
+                            up=False,
+                        )
+                    else:
+                        add_smooth_move(
+                            note_index,
+                            finger,
+                            to_time,
+                            80,
+                            end_pos,
+                            (end_pos[0], end_pos[1] - 300),
+                            down=False,
+                            up=False,
+                        )
                 actions.append(
                     {
                         "finger": finger,
@@ -475,6 +593,20 @@ class Chart:
             for index, action in enumerate(actions_with_wait)
         ]
         self.actions = actions_with_wait
+
+        if (flick_stat["dir"] or flick_stat["guessed"]
+                or flick_stat["unknown"] or flick_stat["override"]):
+            # 只有存在「需要判断方向」的尾巴才打这一行,普通谱面不刷屏。
+            # 判读:BMS 缺失时 guessed>0、unknown>0 说明兜底在起作用;方向
+            # 这条线是否修好,以实机的 miss 归零为准(见 AGENTS 9.6 验证口径)。
+            self._logger.info(
+                "flick 尾统计: 方向 flick %d 条(左 %d / 右 %d),普通 flick %d 条,"
+                "按轨迹推测 %d 条,判不出方向 %d 条,按曲覆盖 %d 条%s",
+                flick_stat["dir"], flick_stat["left"], flick_stat["right"],
+                flick_stat["plain"], flick_stat["guessed"], flick_stat["unknown"],
+                flick_stat["override"],
+                "(谱面文件取不到,方向靠推测)" if flick_dirs is None else "",
+            )
 
         if finger_missed:
             self._logger.warning(

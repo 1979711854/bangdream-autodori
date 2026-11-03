@@ -8,7 +8,7 @@
 lag 被算大 → 「补足到池」把虚高值注回去 → 时间线推早 → 批量 FAST/miss。
 原两道保护都在 autodori.lag_feedback_batch_delta 里:
   ① wait 回执积压持续超限(默认 400 条 / 2.0s)→ 本曲停注入 + 清空池水;
-  ② 单批补足 > 30ms(往早推那一侧)→ 丢弃并记数,不注。
+  ② 单批补足 > 30ms → 钳到 30ms 照补(2026-10-30 由「整批丢弃」改掉:
 
 2026-10-29 补两块(「越打越早」的根因 = 理想指针漏算没睡成的 wait):
   ③ wait 欠账改成**只告警、不停注入**(停注入会把整首歌推晚,#489 实测);
@@ -76,17 +76,50 @@ def main():
     check("lag 12 / 池 4 → 注入 8", call(FakeChart(pool=4.0)), 8.0)
     check("lag≈池(噪声 <0.01)→ 不注入", call(FakeChart(pool=12.0)), 0.0)
 
-    print("== 保护②:单批补足 >30ms 丢弃(只拦往早推的正向) ==")
+    print("== 保护②:单批补足超过 30ms → 钳到 30ms 补(2026-10-30 由丢弃改钳制) ==")
+    # 老语义「整批丢弃」会把真实存量永久锁死:实测一场丢 89/109 批,两首 lag
+    # 一路 80ms(slow 98 / miss 12)。现在按上限补,下一批接着补。
+    limit = autodori._LAG_FB_MAX_BATCH_INJECT_MS
     autodori.reset_lag_feedback()
     autodori._lag_fb["lag"] = 117.0
-    check("lag 117 / 池 0 → 丢弃", call(FakeChart(pool=0.0)), 0.0)
-    check("丢弃计数 = 1", autodori._lag_fb["overshoot_n"], 1)
-    check("再丢一次仍是 0", call(FakeChart(pool=0.0, backlog=10)), 0.0)
-    check("丢弃计数 = 2", autodori._lag_fb["overshoot_n"], 2)
-    check("30ms 整不拦(边界)", call(FakeChart(pool=87.0)), 30.0)
+    check("lag 117 / 池 0 → 只补 30", call(FakeChart(pool=0.0)), limit)
+    check("钳制计数 = 1", autodori._lag_fb["overshoot_n"], 1)
+    check("再补一次仍是 30", call(FakeChart(pool=0.0, backlog=10)), limit)
+    check("钳制计数 = 2", autodori._lag_fb["overshoot_n"], 2)
+    check("30ms 整不触发钳制(边界)", call(FakeChart(pool=87.0)), 30.0)
     autodori.reset_lag_feedback()
     autodori._lag_fb["lag"] = -50.0
-    check("负向(池水多于残差)不拦 → 往晚放", call(FakeChart(pool=0.0)), -50.0)
+    check("负向同样钳到 -30(往晚放也会掉 SLOW)",
+          call(FakeChart(pool=0.0)), -limit)
+
+    # 真实存量能在几批内被拉回:80ms 残差、每批补 30、池水按补的量排水
+    print("== 保护② 回归:80ms 存量不再被锁死 ==")
+    autodori.reset_lag_feedback()
+    lag, pool, batches = 80.0, 0.0, 0
+    while lag > 0.5 and batches < 10:
+        autodori._lag_fb["lag"] = lag
+        delta = call(FakeChart(pool=pool))
+        pool = max(0.0, pool + delta)          # 补进池
+        pool = max(0.0, pool - 30.0)           # 这一批会被排水喝掉一部分
+        lag = max(0.0, lag - 30.0)             # 残差同步下降
+        batches += 1
+    check("80ms 残差在 3 批内拉回", batches <= 3, True)
+
+    print("== 环境卡顿判定(2026-10-31) ==")
+    # 实机取证:崩局前 2~5 秒都有单批执行偏差 +67~183ms(模拟器被抢 CPU)。
+    # 判据:峰值 >60ms 或 超限 ≥3 批;正常曲实测 0 批,不误报。
+    autodori.reset_lag_feedback()
+    autodori._lag_fb["lag"] = 100.0
+    call(FakeChart(pool=0.0))
+    check("钳制时记录峰值 100", autodori._lag_fb["overshoot_peak_ms"], 100.0)
+    check("峰值 100 > 60 → 判卡顿", autodori._lag_is_stalled(), True)
+    autodori.reset_lag_feedback()
+    autodori._lag_fb["lag"] = -45.0
+    call(FakeChart(pool=0.0))
+    check("负方向峰值取绝对值 45", autodori._lag_fb["overshoot_peak_ms"], 45.0)
+    check("峰值 45 / 1 批 → 不算卡顿", autodori._lag_is_stalled(), False)
+    autodori._lag_fb["overshoot_n"] = 3
+    check("超限 3 批 → 判卡顿", autodori._lag_is_stalled(), True)
 
     print("== 保护①:回执积压持续超限 → 本曲停注入 ==")
     autodori.reset_lag_feedback()
@@ -132,8 +165,8 @@ def main():
     # 只看条数不看时长会漏:#684 焚音打抽干只有 8 条,欠账却 73ms
     autodori.reset_lag_feedback()
     autodori._lag_fb["lag"] = -73.0
-    check("#684 形态(抽干 8 条/欠账 73ms)照常注入,由反馈把时间还回来",
-          call(FakeChart(pool=0.0, skipped=73.0, drained=8)), -73.0)
+    check("#684 形态(抽干 8 条/欠账 73ms)照常注入(单批钳到 -30,后续继续补)",
+          call(FakeChart(pool=0.0, skipped=73.0, drained=8)), -30.0)
 
     print("== 理想指针补齐:没睡成的 wait 要推进 ideal(2026-10-29) ==")
     # 不补齐的话 lag 恒偏「晚」(假残差),反馈一直往早推;补齐后指针与 dump
@@ -222,6 +255,7 @@ def main():
     autodori.reset_lag_feedback()
     for key, want in (("off", False), ("backlog_since", None),
                       ("backlog_peak", 0), ("overshoot_n", 0),
+                      ("overshoot_peak_ms", 0.0),
                       ("lag", 0.0), ("ideal", None),
                       ("skip_applied", 0.0), ("pending_skip", 0.0),
                       ("skip_warned", False)):

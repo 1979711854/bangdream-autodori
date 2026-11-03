@@ -53,6 +53,16 @@ import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
 from challenge import ChallengeCPRecognition, SelectChallengeCP, challenge_overrides, click
+from eventstory import (
+    EventChapterDone,
+    EventChapterLocked,
+    EventChapterPick,
+    EventChapterPickClick,
+    EventStoryEntry,
+    EventStoryFinish,
+    EventStoryNotHome,
+    event_story_state,
+)
 from story import (
     DEFAULT_MAX_STORIES,
     StoryAvatarClick,
@@ -100,6 +110,11 @@ _STORY_TYPE = "member"
 #: 本轮阅读上限(--mode story 启动时从 config.yml 的 story.max_stories 读,
 #: 默认 50;GUI 不暴露此配置)
 _STORY_LIMIT = DEFAULT_MAX_STORIES
+#: 本次进程跑的是不是「阅读活动故事」模式(--mode eventstory,2026-10-31 新增)。
+#: 用户手动停在活动主页,bot 点「活动故事」进话列表,从最下面的未读话按剧情
+#: 顺序逐话跳过并领奖;PT 不足/前置未读导致阅读按钮点不动时停任务并提示。
+#: 流程、模板与进度记录见 src/eventstory.py 与 pipeline/eventstory.json。
+_EVENTSTORY_MODE = False
 #: 清火与三抽**同时**开启时的交替模式(用户 2026-10-17 定的新流程):
 #: 每成功打完一首歌,检查一次每日免费三抽,三抽完再回去继续打歌,
 #: 直到火量不足收工。只有两个开关同时打开才生效。
@@ -109,11 +124,19 @@ _daily_fire_exhausted = False
 #: 日常入口火罐检查(用户 2026-10-17 需求):阶段1 回主页时火罐就是 0,
 #: 整个日常直接停止 —— 与打歌循环里的火量判定是两个独立入口。
 _daily_boost_zero = False
-#: 本次进程内已确认"今日免费三抽已做完 / 当前不可抽"。由管线节点
-#: daily_pull_done / daily_pull_locked 上的 MarkDailyPullDone 动作置位。
+#: 本次进程内已确认"今日免费三抽**已做完**(剩余 0 回)"。只由管线节点
+#: daily_pull_done 上的 MarkDailyPullDone 动作置位。
 #: 背景(用户 2026-10-17):每首打完都跑一遍三抽太慢(每首白耗 20-40s),
 #: 标记后每首打完只跳过,收尾时再复核一次。
+#: 2026-11-01 拆分:以前 locked(需先完成每日演出)也置这个位,于是"崩局那首
+#: 白跑一次三抽"之后被当成"三抽已确认"直接进连打/收尾 —— 现场
+#: autodori-20261101-083639.log:#13 崩局 → 08:39:51 locked → 08:39:54
+#: 「三抽已确认完成」→ 连打 6 秒就收工,用户看到的现象是"第一首崩了就停了"。
 _daily_pull_done = False
+#: 本次三抽被游戏拒绝:今日还没完成每日演出(管线节点 daily_pull_locked)。
+#: 与 _daily_pull_done 的区别是**不能当收工依据** —— 它只说明"这一轮抽不了,
+#: 先去把每日演出打了"。_run_daily_flow 收到后继续打歌,等下一首真出结算再查。
+_daily_pull_locked = False
 #: 交替模式下 main 任务是否"打完一首就停(回主页)"。
 #:    True  = 尚未确认三抽:每首打完必须回主页,才能进抽卡页检查(_get_override_pipeline
 #:            里把结算/打崩三处 next 改写成 daily_song_done)。
@@ -127,6 +150,13 @@ _daily_song_stop = True
 #: ②三抽确认后进入连打阶段、一个 main 任务里连打好几首 —— 两处都会让编号
 #: 与实际顺序对不上。计数下沉到 play_song(每首真正开打时 +1)才是准的。
 _song_play_seq = 0
+#: 上一首是否**真的打到了结算页**(SavePlayResult succeed=True:结算页识别成功,
+#: 战绩里读到了 perfect/great/连击)。每个 play_song 开打时清空,崩局
+#: (life_exhausted / 演出失败)保持 False。
+#: 2026-11-01 用户要求:三抽的前置条件是"完成每日演出",而崩局那首**不算完成**
+#: —— 以前不管有没有结算都去查三抽,崩局后必然 locked,白耗 10s 还误把流程带走
+#: (见 _daily_pull_done 注释的现场日志)。现在由这个标志把三抽卡在结算之后。
+_song_settled = False
 #: 交替模式下单轮打歌的安全上限,防止 main 任务因异常反复重启却永不收工。
 _DAILY_MAX_ROUNDS = 60
 #: main 任务「没打到歌就正常结束」的最大容忍次数。弹窗类管线节点(如 2026-10-19
@@ -157,6 +187,15 @@ maaresource.register_custom_action("SelectChallengeCP", SelectChallengeCP())
 maaresource.register_custom_action("StoryAvatarClick", StoryAvatarClick())
 maaresource.register_custom_action("StoryRewardOk", StoryRewardOk())
 maaresource.register_custom_action("StoryInsufficient", StoryInsufficient())
+# 阅读活动故事(2026-10-31 新增):入口识别 + 解锁进度 OCR、找最下面的未读话、
+# 点话、领奖计数、未解锁停任务、收工汇总。
+maaresource.register_custom_recognition("EventStoryEntry", EventStoryEntry())
+maaresource.register_custom_recognition("EventChapterPick", EventChapterPick())
+maaresource.register_custom_action("EventChapterPickClick", EventChapterPickClick())
+maaresource.register_custom_action("EventChapterDone", EventChapterDone())
+maaresource.register_custom_action("EventChapterLocked", EventChapterLocked())
+maaresource.register_custom_action("EventStoryNotHome", EventStoryNotHome())
+maaresource.register_custom_action("EventStoryFinish", EventStoryFinish())
 
 
 # ---------------------------------------------------------------------------
@@ -500,8 +539,13 @@ for _sid, _sinfo in all_songs.items():
 # 其余 3 组(閃光 / オレンジ / シル・ヴ・プレジデント)等级不同 = 谱面不同。
 #
 # 所以判据不是标题而是屏幕上的「乐曲等级」:该数字 = 高亮曲目在当前难度下的
-# playLevel,而"等级可区分"与"谱面不同"实测完全等价。等级相同的组随便选一个,
-# 等级不同的组按屏上数字挑;挑不出来就放弃本次选曲,绝不猜。
+# playLevel。等级不同的组按屏上数字挑;挑不出来就放弃本次选曲,绝不猜。
+#
+# ⚠ 2026-10-31 修正:「等级相同 = 谱面相同」**不成立**。オレンジ #316/#676
+# 在 expert 都是 25 级,谱面却不同(651 / 683 判定、BPM 200 / 140),按默认项
+# 打整首对不上(战绩库 10-27 起 8 局全崩,每次死在 4.4 秒)。现在等级全相同时
+# 还要比谱面指纹(见 `_charts_identical`),谱面不同再比选曲页右侧曲绘
+# (见 `_match_jacket` / `BestdoriAPI.get_song_jacket`)。
 _title_to_ids: dict[str, list[str]] = {}
 for _sid, _sinfo in all_songs.items():
     for _t in _sinfo.get("musicTitle") or []:
@@ -525,6 +569,21 @@ for _t, _ids in ambiguous_titles.items():
 # 在 (1092,455,77,24);用 debug/_exp_eval_match.py 复核,有等级数字的 48 轮样本
 # 全部落在匹配到的曲目在该难度下的等级集合内。
 _SONG_LEVEL_ROI = [1196, 450, 48, 32]
+# 选曲页右侧曲绘的位置(1280x720 绝对像素,2026-10-31 用实机截图量得)。
+# 只在「同名候选等级相同、但谱面经指纹比对确认不同」时用:
+# 把屏幕这块裁图与候选曲绘做灰度 NCC。
+#
+# ⚠ 2026-10-31 修正:ROI 只做**粗定位**,实际曲绘比它低约 8px(实测最优平移
+# (dx=2, dy=8)),差这 8px 会让正确曲绘的 NCC 从 0.87 掉到 0.51;而选曲页
+# 「オレンジ」那两次量出来只有 0.27(低于阈值 0.30),判成「分不开」→ 沿用
+# 默认 #676 → 打错谱面 4.3 秒崩。所以裁图时向外多留 `_JACKET_SEARCH_PAD`
+# 像素,由 `_jacket_ncc` 在窗口内滑动找最优位置(步长按 160px 归一化后自动)。
+# 实机复测(走り始めたばかりのキミに / コレカラ):正确 0.87 / 0.81,其它候选
+# ≤0.13 —— 阈值 0.30 + 领先 0.15 有充足余量。
+_SONG_JACKET_ROI = [682, 114, 318, 321]
+_JACKET_SEARCH_PAD = 12
+JACKET_MIN_NCC = 0.30
+JACKET_MIN_MARGIN = 0.15
 _DIFFICULTY_ORDER = ["easy", "normal", "hard", "expert", "special"]
 
 current_song_name: str = None
@@ -584,6 +643,11 @@ _LAG_FEEDBACK_ENABLED = True
 _lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0,
            "off": False, "backlog_since": None, "backlog_peak": 0,
            "overshoot_n": 0,
+           # 2026-10-31 加:本曲单批偏差峰值的绝对值(只读)。
+           # 环境卡顿(模拟器/主机被抢 CPU)时 jlog 会报单批差 50~180ms,
+           # 这类曲的 FAST/SLOW 不能拿去调 photogate(会把卡顿当整体偏移),
+           # 也不能据此判断「这首歌打得不好」。判定见 _LAG_STALL_* 常量。
+           "overshoot_peak_ms": 0.0,
            # 2026-10-28 加:测量端退化的两个直接计数(只读,不碰时序)。
            # 背景:同一天两场,一场线上 lag 全程 ±5ms 而 dump 曲内增长 -98ms
            # (ゼッタイ宣言,越打越快),另一场线上 lag 涨到 243ms 却在丢弃 75 批
@@ -611,11 +675,22 @@ _lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0,
 #   **本曲立刻停注入**,并清空池水 —— 不清的话虚高池水还会继续按
 #   OFFSET_LIMIT 排水,时间线继续往早推。停注入后回退开环 _adjust_offset,
 #   最差是偏晚(SLOW),不会批量 miss。
-# 保护②(挡虚高注入):正常每批新漂移 ~2ms,单批要补 30ms 以上只可能是
-#   测量异常。注早了要命(FAST/miss),不注最多偏晚,所以丢弃并记数。
+# 保护②(挡「一口气推太早」):正常每批新漂移 ~2ms,单批要补 30ms 以上只可能
+#   是测量异常或真实存量。**2026-10-30 改成钳制**:仍不接受单批推 >30ms,
+#   但按 30ms 补、下批接着补,不再整批丢弃 —— 丢弃会把真实存量永久锁死
+#   (实测一场丢 89/109 批,两首 lag 一路 80ms,slow 98 / miss 12)。
 _LAG_FB_MAX_BACKLOG = 400           # wait 回执积压上限(正常只领先 1~2 批)
 _LAG_FB_BACKLOG_HOLD_S = 2.0        # 持续超限多久判定「回执真的在丢」
 _LAG_FB_MAX_BATCH_INJECT_MS = 30.0  # 单批补足上限,超过当测量异常丢弃
+# 环境卡顿判定(2026-10-31)。实机取证(autodori-20261030-235815.log):同一场里
+# #2 STAR BEAT 第一局出现 10 批超限、结算 miss19/fast59/slow35;第二局崩前
+# 4 秒有一批 +135.2ms;#344 崩前 2 秒 +182.7ms;#320 崩前 5 秒 +67.9ms ——
+# 这些不是下发链的问题(Python 侧「发布余量」一次都没被抬高),而是模拟器里
+# minitouch 服务端被主机抢了 CPU(jlog 单批执行偏差 50~180ms),游戏侧同时
+# 卡顿、吞输入。判据取「峰值 >60ms 或 超限批数 >=3」:正常曲两场实测 0 批;
+# 偶发一批 ~50ms 的抖动对判定窗影响有限,不拦。
+_LAG_STALL_PEAK_MS = 60.0
+_LAG_STALL_MIN_N = 3
 # wait 欠账告警线(2026-10-29)。**只告警,不停注入、不清池水。**
 # 历史:这一天先按「欠账 ≥20ms 就停注入 + 清池」做的(当时指针对不上,反馈
 # 看不见这笔账),上线后实测它会**把歌推晚**:#489 第一局曲内 +37.7ms / 418
@@ -633,8 +708,21 @@ def reset_lag_feedback():
     global _lag_fb
     _lag_fb = {"lag": 0.0, "ideal": None, "last_start": None, "last_sched": 0.0,
                "off": False, "backlog_since": None, "backlog_peak": 0,
-               "overshoot_n": 0, "wait_recv": 0, "fallback_n": 0,
+               "overshoot_n": 0, "overshoot_peak_ms": 0.0,
+               "wait_recv": 0, "fallback_n": 0,
                "skip_applied": 0.0, "pending_skip": 0.0, "skip_warned": False}
+
+
+def _lag_is_stalled() -> bool:
+    """本曲是否出现「模拟器/主机卡顿」证据(判定阈值见 _LAG_STALL_* 常量)。
+
+    只读 `_lag_fb`,不碰时序。曲末汇总与崩局收尾都用它决定「这一首的数据
+    能不能信」;正常曲两场实测超限 0 批,不会误报。
+    """
+    return (
+        _lag_fb["overshoot_peak_ms"] > _LAG_STALL_PEAK_MS
+        or _lag_fb["overshoot_n"] >= _LAG_STALL_MIN_N
+    )
 
 
 def _lag_fb_snapshot() -> dict:
@@ -650,14 +738,16 @@ def _lag_fb_snapshot() -> dict:
         "fallback_n": _lag_fb["fallback_n"],
         "peak": _lag_fb["backlog_peak"],
         "overshoot_n": _lag_fb["overshoot_n"],
+        "overshoot_peak_ms": _lag_fb["overshoot_peak_ms"],
         "off": _lag_fb["off"],
         "skip_applied": _lag_fb["skip_applied"],
     }
 
 
 def lag_feedback_batch_delta(chart, batch_no: int, now=None) -> float:
-    """算出本批「补足到池」的池增量;返回 0 表示本批不注入(含两道保护)。
+    """算出本批「补足到池」的池增量(已按单批上限钳制);返回 0 = 本批不注入。
 
+    返回 0 的两种情况:本曲已被保护①停注入,或残差 <0.01ms(已对齐)。
     调用点:play_song 每批发布前、持 callback_data_lock 时 —— 与 _lag_fb /
     wait_ideal_ms 的其他读写同锁,这里读队列长度是安全的。
     chart 传当前 Chart(需要 `wait_ideal_ms` 与 `_a2c_offset`),None 视为无表。
@@ -710,23 +800,39 @@ def lag_feedback_batch_delta(chart, batch_no: int, now=None) -> float:
             return 0.0
 
     delta = _lag_fb["lag"] - getattr(chart, "_a2c_offset", 0.0)
-    if delta > _LAG_FB_MAX_BATCH_INJECT_MS:
-        # 保护②:虚高注入。只拦「往早推」这一侧(正增量把 wait 缩短);
-        # 负增量是池水多于残差,应用它等于往晚放,不影响安全性。
+    if abs(delta) > _LAG_FB_MAX_BATCH_INJECT_MS:
+        # 保护②(**2026-10-30 改成钳制,不再整批丢弃**):
+        # 原来「单批补足 > 30ms 就当测量异常整批丢掉」。问题是它分不清「测量
+        # 虚高」和「真实存量」—— 一旦主机抖动让时间线真短了 40~80ms,每一批
+        # 都超限、每一批都丢,反馈永久失效,整首歌一路晚着打完(实测
+        # autodori-20261030-184148.log:#320 SHINY DAYS 丢 89 批、lag 一路
+        # 80ms、slow 98;#763 丢 109 批、miss 12;同场没丢批的 3 首全 AP)。
+        # 现在改成**按上限补**:单批最多推 30ms,池水按每条 wait 1ms 排水,
+        # 最多把接下来 ~30 条音符挪 1ms,远在 ±60ms 判定窗内;下一批残差会
+        # 立刻反过来修正,所以既保住了「不许一次推 200ms」的安全性,又让
+        # 真实存量能在 2~3 批内被拉回来。负方向同样钳制(往晚放也一样会掉
+        # SLOW,别只拦一侧)。
         _lag_fb["overshoot_n"] += 1
+        _lag_fb["overshoot_peak_ms"] = max(
+            _lag_fb["overshoot_peak_ms"], abs(delta)
+        )
+        clamped = (
+            _LAG_FB_MAX_BATCH_INJECT_MS if delta > 0
+            else -_LAG_FB_MAX_BATCH_INJECT_MS
+        )
         if _lag_fb["overshoot_n"] == 1:
             logging.warning(
-                "滞后反馈: 单批补足 %.1fms 超过 %.0fms 上限,本批丢弃(lag=%.1fms "
-                "池=%.1fms 批#%d);后续同类丢弃只记 debug",
-                delta, _LAG_FB_MAX_BATCH_INJECT_MS, _lag_fb["lag"],
-                getattr(chart, "_a2c_offset", 0.0), batch_no,
+                "滞后反馈: 本批偏差 %.1fms 超过单批上限 %.0fms,只补 %.0fms"
+                "(批#%d),其余下批继续",
+                delta, _LAG_FB_MAX_BATCH_INJECT_MS,
+                abs(clamped), batch_no,
             )
         else:
             logging.debug(
-                "滞后反馈: 单批补足 %.1fms 超限丢弃(第 %d 次,批#%d)",
-                delta, _lag_fb["overshoot_n"], batch_no,
+                "滞后反馈: 偏差 %.1fms 按 %.0fms 补(第 %d 次,批#%d)",
+                delta, abs(clamped), _lag_fb["overshoot_n"], batch_no,
             )
-        return 0.0
+        return clamped
     return delta if abs(delta) > 0.01 else 0.0
 
 
@@ -988,13 +1094,144 @@ def _read_screen_song_level(context: Context, image) -> Optional[int]:
     return int(m.group()) if m else None
 
 
+def _charts_identical(ids: list, difficulty: str) -> bool:
+    """候选曲目在该难度下是不是同一份谱面(谱面 JSON 逐字节 md5 比较)。
+
+    ⚠ 2026-10-31:「等级相同」推不出「谱面相同」—— オレンジ #316/#676 在
+    expert 都是 25 级,谱面却不同(651 / 683 判定、BPM 200 / 140),按默认项
+    打整首对不上,8 局全崩且每次都死在 4.4 秒。所以「等级全相同」时还要做
+    这个比对:真一样才认默认项;不一样就交给曲绘判别。
+    任何一首取不到谱面都按「不同」处理(宁可多比一次曲绘,也不拿错谱面)。
+    """
+    import hashlib
+    fingerprints = set()
+    for sid in ids:
+        try:
+            chart = BestdoriAPI.get_chart(sid, difficulty)
+            fingerprints.add(hashlib.md5(
+                json.dumps(chart, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            ).hexdigest())
+        except Exception:
+            return False
+    return len(fingerprints) == 1
+
+
+def _jacket_ncc(crop, ref_bytes, search_pad=0) -> Optional[float]:
+    """屏幕曲绘与参考曲绘的灰度归一化互相关;算不出返回 None。
+
+    用各通道均值转灰度(与 RGB/BGR 顺序无关)。
+    search_pad > 0 时,crop 是「ROI 外扩 search_pad」的截图,参考图按 ROI 尺寸
+    在窗口内滑动取最优位置(cv2.matchTemplate + TM_CCOEFF_NORMED,它就是
+    NCC)。**必须滑动**:曲绘实际位置比 `_SONG_JACKET_ROI` 低约 8px,硬裁
+    正确曲绘只有 0.51,滑动后 0.87 —— 8px 的差足以让判别失败(2026-10-31)。
+    """
+    try:
+        ref = cv2.imdecode(np.frombuffer(ref_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+    except Exception:
+        return None
+    if ref is None or ref.size == 0:
+        return None
+    a = np.asarray(crop, dtype=np.float32)
+    if a.ndim == 3:
+        a = a.mean(axis=2)
+    if a.size == 0:
+        return None
+    h, w = a.shape[:2]
+    win_h, win_w = h - 2 * search_pad, w - 2 * search_pad
+    if search_pad <= 0 or win_h < 16 or win_w < 16:
+        # 无搜索余量(或调用方传的就是精确裁图):等比缩放到同一尺寸直接算。
+        a = cv2.resize(a, (160, 160))
+        r = cv2.resize(ref, (160, 160))
+        return float(cv2.matchTemplate(a, r.astype(np.float32),
+                                       cv2.TM_CCOEFF_NORMED).max())
+    # 缩到 ROI 边长约 160 再滑动:平移量按同一比例缩,精度足够、耗时 ~10ms。
+    scale = 160.0 / float(max(win_h, win_w))
+    a_s = cv2.resize(a, (max(1, int(round(w * scale))),
+                         max(1, int(round(h * scale)))))
+    r_s = cv2.resize(ref, (max(1, int(round(win_w * scale))),
+                           max(1, int(round(win_h * scale)))))
+    if r_s.shape[0] > a_s.shape[0] or r_s.shape[1] > a_s.shape[1]:
+        return None
+    return float(cv2.matchTemplate(a_s, r_s.astype(np.float32),
+                                   cv2.TM_CCOEFF_NORMED).max())
+
+
+def _match_jacket(image, ids: list):
+    """拿选曲页右侧曲绘在重名候选里挑 id → (id, best, second) 或 None。
+
+    只在候选 ≥2、且每张候选曲绘都取得到时返回;任何一张取不到就返回 None,
+    让调用方走默认项 —— 判别失败绝不能比改动前更差。
+    """
+    if image is None or len(ids) < 2:
+        return None
+    arr = np.asarray(image)
+    if arr.ndim < 2 or arr.shape[0] < 100 or arr.shape[1] < 100:
+        return None
+    h, w = arr.shape[:2]
+    sx, sy = w / 1280.0, h / 720.0
+    x, y, rw, rh = _SONG_JACKET_ROI
+    pad_x = int(round(_JACKET_SEARCH_PAD * sx))
+    pad_y = int(round(_JACKET_SEARCH_PAD * sy))
+    x0 = max(0, int(x * sx) - pad_x)
+    y0 = max(0, int(y * sy) - pad_y)
+    x1 = min(w, int((x + rw) * sx) + pad_x)
+    y1 = min(h, int((y + rh) * sy) + pad_y)
+    crop = arr[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+    # 实际外扩量可能被屏幕边缘截掉,按缺口折半回填给 _jacket_ncc
+    search_pad = min((crop.shape[1] - int(rw * sx)) // 2,
+                     (crop.shape[0] - int(rh * sy)) // 2)
+    scores = []
+    for sid in ids:
+        data = BestdoriAPI.get_song_jacket(sid)
+        if not data:
+            return None
+        score = _jacket_ncc(crop, data, search_pad=max(0, search_pad))
+        if score is None:
+            return None
+        scores.append((sid, score))
+    scores.sort(key=lambda t: t[1], reverse=True)
+    if (scores[0][1] < JACKET_MIN_NCC
+            or scores[0][1] - scores[1][1] < JACKET_MIN_MARGIN):
+        # 只在「判不出来」时落盘:成功时写图纯属攒垃圾
+        _dump_jacket_crop(image, crop, scores)
+    return scores[0][0], scores[0][1], scores[1][1]
+
+
+def _dump_jacket_crop(image, crop, scores):
+    """判重名曲目时把整帧落盘(debug/jacket/),供事后核对判别依据。
+
+    2026-10-31:オレンジ 的告警只有「0.27 vs -0.05」两个数,事后看不出画面
+    是不是选曲页、曲绘在哪、哪张图分数更高 —— 排查只能重新等它被抽到。
+    写整帧而不是裁图:ROI 与曲绘的相对位置也要能复核。
+    只在重名曲目走曲绘这条分支时触发(_pick_song_id 每首最多一次)。
+    """
+    try:
+        frame = np.asarray(image)
+        if frame.ndim == 3 and frame.shape[2] >= 3:
+            # MAA 递给识别的帧是 RGB,cv2.imwrite 要 BGR(反向切片不连续,要拷一份)
+            frame = np.ascontiguousarray(frame[:, :, :3][:, :, ::-1])
+        os.makedirs("debug/jacket", exist_ok=True)
+        name = "debug/jacket/%s-%s.jpg" % (
+            time.strftime("%H%M%S"),
+            "-".join("%s_%.2f" % (s, v) for s, v in scores),
+        )
+        cv2.imwrite(name, np.asarray(frame, dtype=np.uint8))
+        logging.debug("曲绘裁图已落盘 %s", name)
+    except Exception as e:  # noqa: BLE001 —— 诊断落盘失败不能影响选曲
+        logging.debug("曲绘裁图落盘失败: %s", e)
+
+
 def _pick_song_id(context: Context, image, name: str, ids: list) -> Optional[str]:
     """重名标题下挑出正确的曲目 id。挑不出返回 None(调用方按"识别失败"处理)。
 
     先用曲库里的等级筛:
-      * 候选在当前难度下等级**全相同** → 实测这些条目谱面字节级一致,选默认项即可;
-      * 等级不同 → 读屏上的「乐曲等级」,唯一命中的那个就是它;
-      * 读不到 / 没有唯一命中 → 返回 None。宁可重抽,也不要拿错谱面打整首。
+      * 候选在当前难度下等级不同 → 读屏上的「乐曲等级」,唯一命中的那个就是它;
+      * 等级全相同 → 先比谱面指纹:真一样选默认项;
+      * 等级相同但谱面不同(如 オレンジ #316/#676 expert)→ 比选曲页曲绘;
+      * 曲绘也分不开 → 沿用默认项并告警(比改动前不多错,只是会打日志);
+      * 等级读不到 / 没有唯一命中 → 返回 None。宁可重抽,也不要拿错谱面打整首。
     """
     if not ids:
         return None
@@ -1002,6 +1239,30 @@ def _pick_song_id(context: Context, image, name: str, ids: list) -> Optional[str
         return ids[0]
     levels = [_song_level(i, DIFFICULTY) for i in ids]
     if len(set(levels)) == 1:
+        if _charts_identical(ids, DIFFICULTY):
+            return ids[0]
+        hit = _match_jacket(image, ids)
+        if hit:
+            sid, best, second = hit
+            if best >= JACKET_MIN_NCC and best - second >= JACKET_MIN_MARGIN:
+                logging.info(
+                    "重名曲目 %r:曲绘匹配选中 #%s(%.2f vs %.2f,候选 %s)",
+                    name, sid, best, second, ids,
+                )
+                return sid
+            # 文案按用户 2026-10-31 要求改:「曲绘分不开(0.27 vs -0.05)」读不出
+            # 后果,写清「没认准、按哪个打、可能打错谱面」。
+            logging.warning(
+                "重名曲目「%s」:封面比对没认准(最高 %.2f,阈值 %.2f),"
+                "本次先按 #%s 打,可能对错了谱面",
+                name, best, JACKET_MIN_NCC, ids[0],
+            )
+            return ids[0]
+        logging.warning(
+            "重名曲目「%s」:封面取不到,没法分辨 #%s 还是别首,本次先按 #%s 打,"
+            "可能对错了谱面",
+            name, "/".join(str(i) for i in ids), ids[0],
+        )
         return ids[0]
     screen_level = _read_screen_song_level(context, image)
     if screen_level is not None:
@@ -1886,17 +2147,15 @@ def _watchdog_loop() -> None:
 
 
 def _start_stuck_watchdog() -> None:
-    """启动卡死看门狗。special(故事)模式不启动:连续点「下一步」是正常行为。"""
+    """启动卡死看门狗。special(故事)模式不启动:连续点「下一步」是正常行为。
+
+    启动时不打日志(2026-10-30 用户要求):这句只是「功能已启用」的说明,
+    每次开跑都刷一行没有信息量;真正介入时才会打 WARNING(见
+    `_StuckWatchdog.rescue`),那几条才是需要看的。
+    """
     threading.Thread(
         target=_watchdog_loop, name="stuck-watchdog", daemon=True
     ).start()
-    # 文案(2026-10-29 用户定):不叫「卡死自动恢复」,一行说完「什么时候会动、
-    # 按什么顺序动」;「脚本」一律写成 MAA(用户习惯的说法就是 MAA)。
-    logging.info(
-        "卡住保护:已启用(画面与 MAA 连续 %.0fs 都没有任何进展才会介入,"
-        "顺序:通知等待循环退出 → 点「演出失败→退出」→ 按返回键)",
-        _WATCHDOG_STATIC_S,
-    )
 
 
 def _exit_game_and_stop_task(context, reason: str = "退出游戏") -> None:
@@ -2027,22 +2286,25 @@ class HandleDailyBoostZero(CustomAction):
 
 @maaresource.custom_action("MarkDailyPullDone")
 class MarkDailyPullDone(CustomAction):
-    """把"今日免费三抽已做完/当前不可抽"标记到进程内(用户 2026-10-17 需求)。
+    """把"今日免费三抽已做完 / 当前不可抽"标记到进程内(用户 2026-10-17 需求)。
 
     挂在管线节点 daily_pull_done(剩余0回/今日已完成)与 daily_pull_locked
-    (尚未完成每日演出)上:这两条都是"这次抽不了"的终局状态。
+    (尚未完成每日演出)上。
 
     背景:原来每首打完都跑一遍三抽,一次 20-40 秒;标记之后
     _run_daily_flow 每首只跳过,收尾再复核一次。
+
+    2026-11-01(用户反馈"第一首崩局后 bot 就停了")以前两种情况共用一个
+    _daily_pull_done,locked 也被当成"三抽已确认"→ 直接进连打/收尾。现在拆开:
+      done   = 真的抽完了(或今日次数 0)→ 置 _daily_pull_done,可以收工;
+      locked = 还没完成每日演出,这一轮抽不了 → 只置 _daily_pull_locked,
+               调用方继续打歌,等下一首真出结算再来查。
     """
 
     def run(self, context: Context, argv: CustomAction.RunArg):
-        global _daily_pull_done
-        _daily_pull_done = True
+        global _daily_pull_done, _daily_pull_locked
         # reason 由管线节点的 custom_action_param 传入(2026-10-17 加):
         #   done   = 今日次数已抽完;locked = 需先完成每日演出,当前抽不了。
-        # 原来两种情况共用一句"已确认今日没有可抽次数",读日志时分不清是哪种,
-        # 排查"三抽为什么没抽"时会被误导。
         reason = ""
         try:
             reason = str(
@@ -2051,10 +2313,11 @@ class MarkDailyPullDone(CustomAction):
         except Exception:
             reason = ""
         if reason == "locked":
-            logging.info(
-                "每日免费三抽:需先完成每日演出,当前抽不了(收尾会再查一次)"
-            )
+            _daily_pull_locked = True
+            # 用户 2026-11-01:原文案「…当前抽不了(收尾会再查一次)」太啰嗦,精简。
+            logging.info("每日免费三抽:需先完成每日演出")
         else:
+            _daily_pull_done = True
             logging.info("每日免费三抽:今日次数已抽完")
         return CustomAction.RunResult(True)
 
@@ -2194,6 +2457,21 @@ class HandleLifeExhausted(CustomAction):
             _request_exit("生命值耗尽,等待手动操作")
             _run_node_once(context, "stop")
             return CustomAction.RunResult(False)
+        # 崩局归因(2026-10-31):本曲是否伴随「模拟器/主机卡顿」证据。
+        # 有证据时这一首不是谱面/时序问题(实测 #2/#320/#344 崩前 2~5 秒都有
+        # 单批 +135~183ms 的执行偏差),提示用户先关掉占 CPU 的程序;
+        # 没有证据的崩局(如方向 flick 那几首,超限 0 批)不会打这条,避免误导。
+        if _lag_is_stalled():
+            # 2026-11-01 用户要求分行精简:原来一条 60 多字的句子在小窗口里换行
+            # 位置随机、读着费劲。第一行只放数字(也是 GUI 侧 LAG_STALL_RE 的
+            # 采集行,「模拟器响应异常 … 峰值 Xms」必须留在同一行),第二行给结论。
+            logging.warning(
+                "模拟器响应异常: 单批执行偏差峰值 %.0fms(超限 %d 批)",
+                _lag_fb["overshoot_peak_ms"], _lag_fb["overshoot_n"],
+            )
+            logging.warning(
+                "本曲崩局由卡顿引起,不是谱面/时序问题,建议关闭占用 CPU 的程序后重试"
+            )
         logging.info("生命值耗尽,自动继续打歌")
         return CustomAction.RunResult(True)
 
@@ -2510,8 +2788,12 @@ class PlayResultRecognition(CustomRecognition):
 class SavePlayResult(CustomAction):
     def run(self, context: Context, argv: CustomAction.RunArg):
         try:
-            global current_song_id, play_failed_times
+            global current_song_id, play_failed_times, _song_settled
             succeed: bool = json.loads(argv.custom_action_param).get("succeed")
+            # 走到这里 = 结算页(分数/perfect/great/连击)已经认出来了,这一首
+            # **真的打完了**(succeed=True),或者确认是崩局(succeed=False)。
+            # 日常交替模式用它当"可以去查每日免费三抽"的门槛(2026-11-01)。
+            _song_settled = bool(succeed)
             if succeed:
                 # 成功即归零:MAX_FAILED_TIMES 的语义是「连续失败」而不是
                 # 「本次运行累计失败」。原来只在失败时 +1、从不归零,挂机久了
@@ -3162,6 +3444,13 @@ def save_song(name):
     # "选好歌后日志不显示歌名、打完才补上"的根因。用 INFO 级确保不被过滤。
     logging.info("Save song: {}".format(name))
     current_chart = _load_chart(current_song_id, current_song_name)
+    # 同名候选的「方向 flick 方向表」一起预热(2026-10-31):首音触发后可能按
+    # 分轨换谱面(_maybe_switch_chart_by_first_note → _load_chart →
+    # notes_to_actions),那一刻游戏已经在播,绝不能再等一次网络请求。
+    # 这里趁选曲阶段把候选都查一遍(get_flick_directions 自带缓存与失败兜底)。
+    for _sid in _ambiguous_song_ids:
+        if _sid != current_song_id:
+            BestdoriAPI.get_flick_directions(_sid, DIFFICULTY)
     current_orientation = _get_orientation()
     current_chart.actions_to_MNTcmd(
         (mnt.max_x, mnt.max_y), current_orientation, OFFSET, CMD_SLICE_SIZE
@@ -3252,6 +3541,16 @@ def _pick_id_by_first_lane(ids, difficulty: str, hits) -> Optional[str]:
     return matched[0] if len(matched) == 1 else None
 
 
+def _fmt_song_ids(ids) -> str:
+    """候选 id 的日志写法:`[#676, #316]`。
+
+    2026-11-03 用户反馈:原来直接把 Python 列表 `['676', '316']` 打进日志,
+    带引号、标点也跟中文句子混在一起,读着像调试输出。统一成「半角方括号 +
+    # 前缀」,与 `重名曲目 ... 选中 #316` 这类既有日志一致,也方便 grep `#676`。
+    """
+    return "[%s]" % ", ".join("#%s" % i for i in ids)
+
+
 def _maybe_switch_chart_by_first_note() -> None:
     """首音触发后,用触发轨道把同名候选里的谱面敲定(2026-10-30)。
 
@@ -3274,27 +3573,28 @@ def _maybe_switch_chart_by_first_note() -> None:
     hits = _FIRST_NOTE_DIAG.get("lane_hits") or ()
     if not hits:
         logging.info(
-            "同名候选 %s:首音没有记录到变化轨道,无法判谱面,沿用 #%s",
-            ids, current_song_id,
+            "同名曲目判别: 候选 %s, 首音分轨 未记录, 沿用 #%s 的谱面",
+            _fmt_song_ids(ids), current_song_id,
         )
         return
     picked = _pick_id_by_first_lane(ids, DIFFICULTY, hits)
     if picked is None:
         logging.warning(
-            "同名候选 %s:首音落在分轨 %s,分不开是哪一首,沿用 #%s",
-            ids, list(hits), current_song_id,
+            "同名曲目判别: 候选 %s, 首音分轨 %s, 无法唯一匹配候选, 沿用 #%s 的谱面",
+            _fmt_song_ids(ids), sorted(hits), current_song_id,
         )
         return
     if picked == current_song_id:
         logging.debug(
-            "同名候选 %s:首音分轨 %s 与 #%s 一致,正常打", ids, list(hits), picked
+            "同名曲目判别: 候选 %s, 首音分轨 %s, 与当前谱面 #%s 一致",
+            _fmt_song_ids(ids), sorted(hits), picked,
         )
         return
     logging.warning(
-        "同名候选 %s:首音落在分轨 %s,与 #%s 的谱面不符(#%s 首音在 %s),"
-        "改用 #%s 的谱面",
-        ids, list(hits), current_song_id, picked,
-        sorted(_first_judgment_lanes(picked, DIFFICULTY)), picked,
+        "同名曲目判别: 候选 %s, 首音分轨 %s, 当前谱面 #%s 首音轨不符, "
+        "换用 #%s(首音轨 %s)",
+        _fmt_song_ids(ids), sorted(hits), current_song_id, picked,
+        sorted(_first_judgment_lanes(picked, DIFFICULTY)),
     )
     current_song_id = picked
     current_chart = _load_chart(picked, current_song_name)
@@ -3712,8 +4012,11 @@ def _dump_server_lag_async(
 
 def play_song(context=None):
     # 每首真正开打时 +1:这里才是"第几首"的唯一可靠计数点(见 _song_play_seq 注释)。
-    global _song_play_seq
+    global _song_play_seq, _song_settled
     _song_play_seq += 1
+    # 新的一首还没结算:等真的走到结算页时由 SavePlayResult 置 True。
+    # 崩局/中途退出会一直保持 False,日常流程据此跳过三抽检查(2026-11-01)。
+    _song_settled = False
     logging.info("开始打歌 · 第 %d 首", _song_play_seq)
     _reload_photogate()
     cmd_log_list.clear()
@@ -3929,7 +4232,7 @@ def play_song(context=None):
                 # 测量滞后(发布领先 2~3s)使补足相位落后 1~2 批,误差方向
                 # 偏少注(安全侧),量级 ≤2×每批新漂移(~2ms),可接受。
                 if _LAG_FEEDBACK_ENABLED:
-                    # 两道保护(回执积压停注入 / 单批补足超限丢弃)在函数里判,
+                    # 两道保护(回执积压停注入 / 单批补足超限钳制)在函数里判,
                     # 返回 0 就是本批不注入;背景见 lag_feedback_batch_delta 上方。
                     _fb_pool_before = current_chart._a2c_offset
                     _fb_delta = lag_feedback_batch_delta(
@@ -3963,18 +4266,30 @@ def play_song(context=None):
         # 2026-10-29 末尾两项:被跳过的等待(含其中补偿抽干条数)与
         # 「已补进理想指针」的量。两者应相等;不等说明补齐链路有漏批。
         logging.info(
-            "滞后反馈汇总: 回执积压峰值 %d 条(上限 %d), 单批超限丢弃 %d 批;"
-            " wait 回执 %d 条, 队列空兜底 %d 条; 等待被跳过 %.1fms(告警线 %.0f,"
-            "其中补偿抽干 %d 条), 已补进理想指针 %.1fms%s",
+            "滞后反馈汇总: 回执积压峰值 %d 条(上限 %d), 单批超限钳制 %d 批"
+            "(峰值 %.0fms); wait 回执 %d 条, 队列空兜底 %d 条;"
+            " 等待被跳过 %.1fms(告警线 %.0f,其中补偿抽干 %d 条),"
+            " 已补进理想指针 %.1fms%s",
             _lag_fb["backlog_peak"], _LAG_FB_MAX_BACKLOG,
-            _lag_fb["overshoot_n"], _lag_fb["wait_recv"],
-            _lag_fb["fallback_n"],
+            _lag_fb["overshoot_n"], _lag_fb["overshoot_peak_ms"],
+            _lag_fb["wait_recv"], _lag_fb["fallback_n"],
             getattr(current_chart, "skipped_wait_ms", 0.0),
             _LAG_FB_SKIP_WARN_MS,
             getattr(current_chart, "drained_waits", 0),
             _lag_fb["skip_applied"],
             ", 本曲已停注入" if _lag_fb["off"] else "",
         )
+        if _lag_is_stalled():
+            # 环境卡顿(2026-10-31):模拟器/主机被抢 CPU,jlog 单批执行偏差
+            # 50~180ms。这种局的 FAST/SLOW 不能用来调 photogate(见 gui 的
+            # _take_stall),也不能拿来判断这首歌打得怎么样。
+            # 用固定前缀「模拟器响应异常」给 GUI 解析,文案本身给用户看。
+            logging.warning(
+                "模拟器响应异常: 本曲打歌期间单批执行偏差峰值 %.0fms"
+                "(超限 %d 批),FAST/SLOW 不可信,本曲数据不参与校准;"
+                "建议关闭占用 CPU 的程序后再打歌",
+                _lag_fb["overshoot_peak_ms"], _lag_fb["overshoot_n"],
+            )
     # 同指同帧修正的指纹(2026-10-29):动作数不变、命令串里多出这么多 'c'。
     # #489/#649-special 应各 2 处(滑条头/尾),其余曲目按谱面结构多少不等。
     if getattr(current_chart, "detached_moves", 0):
@@ -5114,6 +5429,12 @@ def _get_override_pipeline():
         }
         return all_pipelines
 
+    if _EVENTSTORY_MODE:
+        # 阅读活动故事(2026-10-31 新增):eventstory.json 是闭环链,不需要
+        # set_difficulty / select_live_mode 等打歌节点,也不需要动 pipeline 里
+        # 的任何既有节点(模板都在 event/ 目录与 common/reader 里),直接早退。
+        return all_pipelines
+
     if _STORY_MODE:
         # 阅读角色故事(2026-10-25 新增):story.json 是闭环链,不需要
         # set_difficulty / select_live_mode 等打歌节点,照 SPECIAL_MODE 的
@@ -5424,19 +5745,28 @@ def _run_daily_flow(entry: str) -> None:
     2026-10-17 用户改需求:
     1. 清火与三抽**同时**开启时不是"先清火再抽卡",而是先打一首、检查三抽
        (_DAILY_PULL_EACH_SONG),确认做完之后**后续连打不再逐首回主页**。
-    2. 三抽**只在还没确认做完时才跑**:管线节点 daily_pull_done / daily_pull_locked
-       命中后由 MarkDailyPullDone 置 _daily_pull_done,之后每首直接跳过(每首白跑
+    2. 三抽**只在还没确认做完时才跑**:管线节点 daily_pull_done 命中后由
+       MarkDailyPullDone 置 _daily_pull_done,之后每首直接跳过(每首白跑
        一次要 20-40 秒);收尾再复核一次(用户要求"保险起见")。
+       daily_pull_locked(需先完成每日演出)只置 _daily_pull_locked,**不算**
+       做完 —— 继续打歌(见 _song_settled / 第 5 条)。
     3. 火罐为 0 不再是"无条件停",而是读「火罐为0时」三态:停在游戏主界面(默认) /
        继续挖矿 / 退出游戏。选 stop 时这里会先退回主页再收尾 —— 管线里的 stop 只是
        停在选曲确认页,与选项名承诺的"停在游戏主界面"不符。
     4. **回主页只在两个时刻发生**(用户 2026-10-17 反馈"每首打完都回主界面太麻烦"):
        还未确认三抽时,每首打完回一次(才能进抽卡页);三抽确认完成后改连打,
        直到火尽,收尾复核三抽前再回一次。
+    5. **只有真的打到结算页才查三抽**(用户 2026-11-01 要求)。崩局那首(生命值
+       耗尽/演出失败)没有结算,游戏也不会把"每日演出"算完成 —— 这时去查三抽
+       必然是 locked,白耗一次还被误判成"三抽已确认"收工。现在用 _song_settled
+       把三抽卡在结算之后:崩局就接着打下一首,直到有一首出结算(perfect/great/
+       连击都读到了),再去查三抽。
     """
     global _daily_boost_zero, _daily_pull_done, _daily_song_stop, _daily_fire_exhausted
+    global _daily_pull_locked
     _daily_boost_zero = False
     _daily_pull_done = False
+    _daily_pull_locked = False
     _daily_song_stop = True
     job = maatasker.post_task(entry, _get_override_pipeline()).wait()
     job.get()
@@ -5449,11 +5779,13 @@ def _run_daily_flow(entry: str) -> None:
         return
 
     def _pull(reason: str, force: bool = False) -> str:
-        """做一次每日免费三抽,返回三态字符串:
+        """做一次每日免费三抽,返回四态字符串:
 
-        "ok"   = 做完了(或本来就抽完/不需要抽);
-        "skip" = 前置校验认不到主页「演出」按钮,本轮**不抽**,打歌照常继续;
-        "fail" = 三抽链自身失败(界面识别超时/链断),调用方应收尾。
+        "ok"     = 做完了(或本来就抽完/不需要抽);
+        "locked" = 今日还没完成每日演出,游戏不让抽 —— 调用方继续打歌,
+                   等下一首真出结算再查(2026-11-01 新增);
+        "skip"   = 前置校验认不到主页「演出」按钮,本轮**不抽**,打歌照常继续;
+        "fail"   = 三抽链自身失败(界面识别超时/链断),调用方应收尾。
 
         2026-10-28 修:以前只返回 bool,precheck 一失败就当异常处理,阶段A
         直接 break(autodori-20261028-180117.log:打了一首、三抽被跳过、火还剩
@@ -5461,11 +5793,14 @@ def _run_daily_flow(entry: str) -> None:
         另外 precheck 原先 next 直连 daily_pull,校验成功就会把整套三抽跑一遍,
         Python 又 post 一次 → 每轮跑两遍(18:05 场两行「今日次数已抽完」)。
         """
+        global _daily_pull_locked
         if not _DAILY_FREE_PULL:
             return "ok"
         if _daily_pull_done and not force:
             logging.debug("每日免费三抽已确认完成,跳过检查(%s)", reason)
             return "ok"
+        # 每轮先清 locked:只有这一轮真的被游戏拒绝才算数(下一首结算后再查)。
+        _daily_pull_locked = False
         logging.info("执行每日免费三抽(%s)", reason)
         # 2026-10-28 rank up 弹窗事故:进抽卡流程前先确认人在游戏主界面。
         # daily_pull 是无 recognition 的跳板节点(必定命中),任何画面进来都能
@@ -5497,6 +5832,9 @@ def _run_daily_flow(entry: str) -> None:
         except Exception as e:
             logging.warning("每日免费三抽异常结束(%s)", e)
             return "fail"
+        if _daily_pull_locked and not _daily_pull_done:
+            # 游戏拒绝:今日每日演出还没完成。这不是收工条件,交给调用方继续打歌。
+            return "locked"
         return "ok"
 
     def _return_to_home(reason: str) -> None:
@@ -5523,9 +5861,9 @@ def _run_daily_flow(entry: str) -> None:
             logging.warning("收尾回主页失败(%s): %s", reason, e)
 
     if _DAILY_CLEAR_FIRE and _DAILY_PULL_EACH_SONG:
-        # 阶段A:逐首打(main 每首一停,override 保证),打完就查三抽,直到确认完成。
-        # 平时一两首就够 —— 三抽要么做完(daily_pull_done)要么因"未完成每日演出"
-        # 不可抽(daily_pull_locked),两者都会置 _daily_pull_done。
+        # 阶段A:逐首打(main 每首一停,override 保证),打出结算就查三抽,直到确认完成。
+        # 三抽做完(daily_pull_done)→ 进连打;还没完成每日演出(daily_pull_locked)
+        # → 继续打歌,下一首结算后再查。崩局那首连查都不查(见 _song_settled)。
         confirmed = False
         no_play_streak = 0
         # 2026-10-28 用户反馈「打完第一首没去三抽」:阶段1(daily)的 start_app 兜底
@@ -5533,15 +5871,23 @@ def _run_daily_flow(entry: str) -> None:
         # 结算,紧跟 11:16:52 才 post 第一个 main)。那首走的是 daily 任务,不经过
         # 下面循环里的 _pull,于是三抽被跳过、直接进连打。
         # 这里补一次:进循环前按已打首数查三抽,确认完成就直接进连打阶段。
-        if _song_play_seq > 0:
+        if _song_play_seq > 0 and _song_settled:
             res = _pull("第 %d 首打完(启动阶段)" % _song_play_seq)
             if res == "fail":
                 logging.warning("启动阶段那首打完后的三抽异常,继续清火")
-            elif res == "skip":
-                # 不在主页只影响这一轮抽卡,清火照常继续(见 _pull docstring)。
-                logging.warning("启动阶段那首打完后的三抽被跳过,继续清火")
+            elif res in ("skip", "locked"):
+                # 不在主页 / 还没完成每日演出,都只影响这一轮抽卡,清火照常继续
+                # (见 _pull docstring)。
+                logging.warning("启动阶段那首打完后的三抽没做成,继续清火")
             elif _daily_pull_done:
                 confirmed = True
+        elif _song_play_seq > 0:
+            # 阶段1 打的那首崩了(没有结算页):游戏不会把它算成完成每日演出,
+            # 这时查三抽必然 locked,所以直接跳过,交给下面的循环继续打(2026-11-01)。
+            logging.info(
+                "第 %d 首未到结算(崩局/中途退出),继续打歌,结算后再查三抽",
+                _song_play_seq,
+            )
         for round_no in range(1, _DAILY_MAX_ROUNDS + 1):
             if confirmed:
                 break
@@ -5586,13 +5932,24 @@ def _run_daily_flow(entry: str) -> None:
                 # 一条带火量的(用户 2026-10-17 反馈两行一模一样,冗余)。
                 _return_to_home("火罐不足")
                 break
+            if not _song_settled:
+                # 崩局(生命值耗尽/演出失败)或没走到结算页:这一首游戏不算完成
+                # 每日演出,查三抽必然 locked 且白耗 10 秒 —— 直接接着打下一首,
+                # 等有结算的那首再来查(2026-11-01 用户要求)。
+                logging.info(
+                    "第 %d 首未到结算(崩局/中途退出),继续打歌,结算后再查三抽",
+                    _song_play_seq,
+                )
+                continue
             # 用实际开打的序号(不是阶段A 的 round_no):阶段1 可能已经打过一首。
             res = _pull("第 %d 首打完" % _song_play_seq)
             if res == "fail":
                 # 三抽链自身失败(界面识别超时/链断):画面可能停在半路,收尾。
                 break
-            if res == "skip":
-                # 只是没在主页、这一轮抽不了:继续打下一首,别把整场清火带走。
+            if res in ("skip", "locked"):
+                # skip  = 没在主页,这一轮抽不了;
+                # locked= 每日演出还没完成(结算了但游戏没认?):都别把清火带走,
+                #         继续打下一首,下一首结算后再查。
                 continue
             if _daily_pull_done:
                 confirmed = True
@@ -5610,15 +5967,39 @@ def _run_daily_flow(entry: str) -> None:
             _daily_song_stop = False
             _daily_fire_exhausted = False
             logging.info("每日三抽已确认完成,后续打歌不再逐首回主页")
-            try:
-                job = maatasker.post_task("main", _get_override_pipeline()).wait()
-                job.get()
-            except Exception as e:
-                logging.warning("连打阶段异常结束(%s)", e)
-            else:
+            # 2026-11-01:以前这里只 post 一次 main。命中断头弹窗(节点没有 next,
+            # 如教程弹窗 tutorial_close)时任务会"成功"返回但一首都没打,
+            # 现象就是「三抽做完之后一场都没再打」。现场 autodori-20261101-083639.log:
+            # 08:39:58 live_home_button → 08:39:59 tutorial_close → 08:40:00 直接
+            # 回主页收尾。这里与上面清火分支同款重试(判据:开打序号是否增长)。
+            no_play_streak = 0
+            while True:
+                seq_before = _song_play_seq
+                try:
+                    job = maatasker.post_task("main", _get_override_pipeline()).wait()
+                    job.get()
+                except Exception as e:
+                    logging.warning("连打阶段异常结束(%s)", e)
+                    break
                 # 2026-10-28:连打阶段的失败同样是结算弹窗点不掉导致的超时,
                 # 以前被 .get() 吞掉,后面照样回主页、照样跑三抽。
-                _task_failed(job, "连打阶段")
+                if _task_failed(job, "连打阶段"):
+                    break
+                if _daily_fire_exhausted:
+                    break
+                if _song_play_seq == seq_before:
+                    no_play_streak += 1
+                    if no_play_streak >= _MAIN_NO_PLAY_MAX:
+                        logging.warning(
+                            "连打入口连续 %d 次提前结束,停止继续打歌", no_play_streak
+                        )
+                        break
+                    logging.info(
+                        "连打入口提前结束(未进入演出,可能被弹窗打断),重试 %d/%d",
+                        no_play_streak, _MAIN_NO_PLAY_MAX,
+                    )
+                    continue
+                no_play_streak = 0
             if _daily_fire_exhausted:
                 logging.info("火罐不足，日常已停止")
             # 连打收工停在选曲确认页,三抽只能从主页进 —— 收尾前先退回去。
@@ -5685,12 +6066,13 @@ def _main_impl():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["main", "special", "daily", "story"],
+        choices=["main", "special", "daily", "story", "eventstory"],
         help=(
             "Specify the mode to run. 'main' = 常规挖矿;"
             "'special' = 超高难度 SPECIAL 活动(固定单曲,玩家手动进入后接管);"
             "'daily' = 日常(启动游戏+领签到/弹窗;清火打歌与每日三抽各有开关);"
-            "'story' = 阅读角色故事(用户筛选未读并停在乐队-培养页后接管)"
+            "'story' = 阅读角色故事(用户筛选未读并停在乐队-培养页后接管);"
+            "'eventstory' = 阅读活动故事(用户停在活动主页后接管,按剧情顺序读)"
         ),
         default="main",
     )
@@ -5805,6 +6187,16 @@ def _main_impl():
                      "小故事" if _STORY_TYPE == "member" else "回忆小故事",
                      _STORY_LIMIT)
         entry = "story"
+    elif args.mode == "eventstory":
+        # 阅读活动故事(2026-10-31 新增):用户手动停在活动主页,bot 点右侧
+        # 「活动故事」进话列表按剧情顺序读 —— 不启动游戏、不做签到。
+        # 入口节点 eventstory 先认活动主页的入口按钮,不在活动主页就停(不瞎点)。
+        SPECIAL_MODE = False
+        _DAILY_MODE = False
+        global _EVENTSTORY_MODE
+        _EVENTSTORY_MODE = True
+        logging.info("阅读活动故事:开始（请保持游戏停在活动主页）。")
+        entry = "eventstory"
     else:
         SPECIAL_MODE = False
         _DAILY_MODE = False
@@ -5833,6 +6225,23 @@ def _main_impl():
             _run_daily_flow(entry)
         else:
             maatasker.post_task(entry, _get_override_pipeline()).wait().get()
+            if _EVENTSTORY_MODE:
+                # 活动故事收尾汇总(2026-10-31,用户要求"明确提示")。
+                # 四种结局:入口没认出来(不在活动主页) / 未解锁暂停 /
+                # 列表本来就没有未读 / 逐话读到底。
+                _ev = event_story_state()
+                if _ev["entry_failed"]:
+                    logging.info("未开始阅读:没有检测到活动主页的入口按钮，"
+                                 "请先进入活动主页。")
+                elif _ev["blocked"] == "locked":
+                    logging.info("活动故事已暂停（当前话未解锁），本次共读 %d 话。",
+                                 _ev["read"])
+                elif _ev["read"] == 0:
+                    logging.info("未开始阅读:活动故事列表里没有未读的话。")
+                else:
+                    logging.info("活动故事已读到底，本次共 %d 话；"
+                                 "若活动还有未解锁的话，需活动 PT 达标后再运行。",
+                                 _ev["read"])
             if _STORY_MODE:
                 # 收尾汇总(用户定的口径,按结束方式区分):材料不足 / 达到上限
                 # (还有未读) / 没到上限就结束(列表读空) / 没读到第一个。

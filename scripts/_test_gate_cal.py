@@ -261,6 +261,7 @@ def test_drift_gate_and_bias():
         app.auto_cal_switch = None
         app._misalign_pending = None
         app._drift_pending = None
+        app._stall_pending = None
         app._bias_acc = 0
         app._last_cal_direction = 0
         app._cal_direction_prev = 0
@@ -313,6 +314,94 @@ def test_drift_gate_and_bias():
         app._on_play_result(payload(0, 100))
         check("大偏斜清零累计", app._bias_acc, 0)
         check("大偏斜按步长调整", app.gate < 65, True)
+    finally:
+        gui.CONFIG = old
+
+
+def test_stall_gate():
+    """模拟器卡顿门控(2026-10-31)。
+
+    背景:实机 00:10~00:19 一段里 #2 STAR BEAT 结算 miss19/fast59/slow35、
+    #320/#344 崩前 2~5 秒都有单批执行偏差 +67~183ms —— 这是模拟器/主机被抢
+    CPU,不是 gate 偏移。拿这种 FAST/SLOW 调 gate 会把环境问题写进下一首。
+    bot 侧只在「峰值 >60ms 或 超限 ≥3 批」时打 WARNING,GUI 报了就不校准。
+    """
+    import os
+    import tempfile
+    import time as _t
+
+    tmp = tempfile.mkdtemp()
+    cfg = os.path.join(tmp, "config.yml")
+    with open(cfg, "w", encoding="utf-8") as f:
+        f.write("timing:\n  photogate_latency_ms: 65\n")
+
+    def make_app():
+        app = gui.AutodoriGUI.__new__(gui.AutodoriGUI)
+        app.gate = 65
+        app.auto_cal = True
+        app.measure_anchor = False
+        app.songs_done = 0
+        app.m_songs = None
+        app.cal_label = None
+        app.status_gate = None
+        app.gate_step = None
+        app.auto_cal_switch = None
+        app._misalign_pending = None
+        app._drift_pending = None
+        app._stall_pending = None
+        app._bias_acc = 0
+        app._last_cal_direction = 0
+        app._cal_direction_prev = 0
+        app.cal_text = ""
+        app.warns = []
+        app._emit = lambda *a: app.warns.append(a)
+        app._set_cal = lambda t: setattr(app, "cal_text", t)
+        return app
+
+    old = gui.CONFIG
+    gui.CONFIG = cfg
+    try:
+        print("\n== 模拟器卡顿报告解析 ==")
+        check(
+            "曲末汇总版",
+            gui._parse_stall(
+                "模拟器响应异常: 本曲打歌期间单批执行偏差峰值 182.7ms"
+                "(超限 6 批),FAST/SLOW 不可信"),
+            182.7,
+        )
+        check(
+            "崩局收尾版(2026-11-01 起分行,数字行独立)",
+            gui._parse_stall(
+                "模拟器响应异常: 单批执行偏差峰值 135.2ms(超限 1 批)"),
+            135.2,
+        )
+        check(
+            "旧版整句仍能解析(存档日志)",
+            gui._parse_stall(
+                "模拟器响应异常: 本曲崩局伴随卡顿证据(单批执行偏差峰值 135.2ms,"
+                "超限 1 批),不是谱面/时序问题"),
+            135.2,
+        )
+        check("普通日志行返回 None", gui._parse_stall("随便一行"), None)
+
+        print("\n== 卡顿门控 ==")
+        app = make_app()
+        app._stall_pending = (182.7, _t.time())
+        app._on_play_result(payload(59, 35, perfect=741))
+        check("卡顿局不调 gate", app.gate, 65)
+        check("卡顿局清方向记忆", app._cal_direction_prev, 0)
+        check("CAL 行写明模拟器响应异常", "模拟器响应异常" in app.cal_text, True)
+
+        app = make_app()
+        app._stall_pending = (67.9, _t.time() - gui.MISALIGN_TTL_S - 5)
+        app._on_play_result(payload(59, 35, perfect=741))
+        check("过期卡顿报告不拦校准", app.gate != 65, True)
+
+        app = make_app()
+        app._drift_pending = (-31.1, _t.time())
+        app._stall_pending = (182.7, _t.time())
+        app._on_play_result(payload(28, 0, perfect=746))
+        check("卡顿优先于漂移(都跳过)", app.gate, 65)
     finally:
         gui.CONFIG = old
 
@@ -432,6 +521,8 @@ def main():
     test_misalign_skip()
 
     test_drift_gate_and_bias()
+
+    test_stall_gate()
 
     test_gui_render_gate()
 

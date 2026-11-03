@@ -61,7 +61,8 @@ def load_under_test():
     seeds = ("all_song_name_indexes", "_title_to_ids", "ambiguous_titles")
     wanted_consts = {
         "_TITLE_BRACKETS", "_TITLE_BRACKET_TRANS", "_POOL_SCORE_FLOOR",
-        "_SONG_LEVEL_ROI", "_DIFFICULTY_ORDER",
+        "_SONG_LEVEL_ROI", "_SONG_JACKET_ROI", "_DIFFICULTY_ORDER",
+        "JACKET_MIN_NCC", "JACKET_MIN_MARGIN",
         "_TITLE_CLOSERS", "_TITLE_OPENERS",
         "_OCR_TITLE_MISREAD",
     }
@@ -81,9 +82,12 @@ def load_under_test():
             s in seg for s in seeds
         ):
             segments.append(seg)
+    # 2026-10-31:_pick_song_id 新增了「谱面指纹 + 曲绘判别」两条路径,
+    # 一并提取;曲绘相关只在「等级相同且谱面不同」时才走,本测试不触发。
     for fn in ("_has_title_prefix", "_has_title_suffix", "_normalize_title",
                "fuzzy_match_song",
-               "_song_level", "_candidate_ids", "_pick_song_id"):
+               "_song_level", "_candidate_ids", "_charts_identical",
+               "_jacket_ncc", "_match_jacket", "_pick_song_id"):
         node = next(
             n
             for n in tree.body
@@ -92,6 +96,11 @@ def load_under_test():
         segments.append(ast.get_source_segment(source, node))
 
     all_songs = BestdoriAPI.get_song_list()
+    import json as _json
+    import hashlib as _hashlib
+    import cv2 as _cv2
+    import numpy as _np
+
     ns = {
         "fzwzfuzz": fzwzfuzz,
         "unicodedata": unicodedata,
@@ -101,6 +110,11 @@ def load_under_test():
         "Context": object,
         "DIFFICULTY": "hard",
         "all_songs": all_songs,
+        "BestdoriAPI": BestdoriAPI,
+        "json": _json,
+        "hashlib": _hashlib,
+        "cv2": _cv2,
+        "np": _np,
     }
     exec("\n".join(segments), ns)
     return ns

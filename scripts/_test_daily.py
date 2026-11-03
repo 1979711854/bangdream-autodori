@@ -49,17 +49,31 @@ class FakeTasker:
     play=True(默认)时 main 返回会模拟「至少开打一首」(_song_play_seq += 1):
     2026-10-19 起外层以序号是否增长识别断头弹窗(main 正常返回但没打歌),
     桩必须跟真实行为一致,否则会被误判成断头而重试。
+    settle_after=N:前 N 首**崩局**(开打了但没走到结算页,_song_settled 保持
+    False),第 N+1 首起才有结算。2026-11-01 起三抽只在结算后才查,
+    所以 settle_after=1 表示"第一首崩、第二首正常"。
+    locked=True 时模拟「每日演出还没完成」:post daily_pull 时置
+    _daily_pull_locked(MarkDailyPullDone reason=locked 的等价物)。
+    done=True 时 post daily_pull 置 _daily_pull_done(今日已抽完)。
+    no_play_after=N:打满 N 首之后 main 不再开打(模拟断头弹窗把链带走)。
     play=False 专门模拟断头弹窗(main 没打歌就"成功"返回)。
     fail_nodes 里的入口返回 failed=True,模拟 MAA 任务失败(2026-10-28 rank up
     弹窗事故:Job.get() 不抛异常,只能靠 job.failed 判断)。
     """
 
-    def __init__(self, boost_zero=False, fire_out=False, play=True, fail_nodes=()):
+    def __init__(self, boost_zero=False, fire_out=False, play=True,
+                 fail_nodes=(), settle_after=0, locked=False, done=False,
+                 no_play_after=None):
         self.posted = []
         self.boost_zero = boost_zero
         self.fire_out = fire_out
         self.play = play
         self.fail_nodes = set(fail_nodes)
+        self.settle_after = settle_after
+        self.locked = locked
+        self.done = done
+        self.no_play_after = no_play_after
+        self.plays = 0
 
     def post_task(self, node, pipeline=None):
         self.posted.append(node)
@@ -67,8 +81,18 @@ class FakeTasker:
             A._daily_boost_zero = True
         if node == "main" and self.fire_out:
             A._daily_fire_exhausted = True
-        if node == "main" and self.play and not self.fire_out:
+        playing = (
+            node == "main" and self.play and not self.fire_out
+            and (self.no_play_after is None or self.plays < self.no_play_after)
+        )
+        if playing:
+            self.plays += 1
             A._song_play_seq += 1
+            A._song_settled = self.plays > self.settle_after
+        if node == "daily_pull" and self.locked:
+            A._daily_pull_locked = True
+        if node == "daily_pull" and self.done:
+            A._daily_pull_done = True
         failed = node in self.fail_nodes
 
         class _R:
@@ -106,15 +130,98 @@ def test_flow_gating():
             (True, True, ["daily"] + (["main"] + pull_pre) * 2 + pull_pre),
         ):
             fake.posted.clear()
+            fake.plays = 0
             A._daily_boost_zero = False
             A._daily_fire_exhausted = False
             A._daily_pull_done = False
+            A._daily_pull_locked = False
             A._song_play_seq = 0
+            A._song_settled = False
             A._DAILY_CLEAR_FIRE = clear
             A._DAILY_FREE_PULL = pull
             A._DAILY_PULL_EACH_SONG = clear and pull
             A._run_daily_flow("daily")
             check("清火=%s 三抽=%s -> 跑的节点" % (clear, pull), fake.posted, want)
+
+
+def test_crash_skips_pull():
+    print("=== 1e. 崩局那首不查三抽,继续打歌(2026-11-01 用户要求) ===")
+    # 现场 autodori-20261101-083639.log:第 1 首 #13 崩局(生命值耗尽)→ 游戏不算完成
+    # 每日演出 → 仍去跑三抽 → locked → 旧逻辑把 locked 当"三抽已确认" → 直接进连打
+    # 然后收工,用户看到的就是"第一首崩了就停了"。现在:没结算就不查,接着打。
+    pull_pre = ["daily_pull_precheck", "daily_pull"]
+
+    # ① 每首都崩:一次三抽都不跑(只在收尾复核跑一次,force=True 的既有行为)
+    fake = FakeTasker(settle_after=99)
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 2), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._daily_pull_locked = False
+        A._song_play_seq = 0
+        A._song_settled = False
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("崩局首不查三抽,接着打下一首",
+          fake.posted, ["daily", "main", "main"] + pull_pre)
+    check("崩局不把日常判成三抽已确认", A._daily_pull_done, False)
+
+    # ② 第 1 首崩、第 2 首结算:三抽只在第 2 首之后查一次;locked 不算收工,
+    #    继续打歌(MAX_ROUNDS=2 跑满后由收尾复核兜一次)。
+    fake = FakeTasker(settle_after=1, locked=True)
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 2), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._daily_pull_locked = False
+        A._song_play_seq = 0
+        A._song_settled = False
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("首崩次结 -> 只在结算那首之后查三抽",
+          fake.posted, ["daily", "main", "main"] + pull_pre + pull_pre)
+    check("locked(需先完成每日演出)不算三抽已确认", A._daily_pull_done, False)
+
+
+def test_lianDa_no_play_retry():
+    print("=== 1f. 连打阶段断头弹窗:重试而不是静默收工(2026-11-01 现场) ===")
+    # 现场 autodori-20261101-083639.log:08:39:58 点主页「演出」→ 08:39:59 命中
+    # 教程弹窗 tutorial_close(节点没有 next)→ main 任务"成功"返回但一首没打,
+    # 于是直接回主页收尾。连打阶段以前只 post 一次 main,这里补上同款重试。
+    pull_pre = ["daily_pull_precheck", "daily_pull"]
+    fake = FakeTasker(done=True, no_play_after=1)
+    with patch.object(A, "maatasker", fake), \
+         patch.object(A, "_DAILY_MODE", True), \
+         patch.object(A, "_get_override_pipeline", lambda: {}), \
+         patch.object(A, "_DAILY_MAX_ROUNDS", 2), \
+         patch.object(A, "_MAIN_NO_PLAY_MAX", 3), \
+         patch.object(A, "_zero_boost_policy", lambda: "stop"):
+        A._daily_boost_zero = False
+        A._daily_fire_exhausted = False
+        A._daily_pull_done = False
+        A._daily_pull_locked = False
+        A._song_play_seq = 0
+        A._song_settled = False
+        A._DAILY_CLEAR_FIRE = True
+        A._DAILY_FREE_PULL = True
+        A._DAILY_PULL_EACH_SONG = True
+        A._run_daily_flow("daily")
+    check("三抽做完后连打遇到断头 -> 重试到上限",
+          fake.posted,
+          ["daily", "main"] + pull_pre
+          + ["main", "main", "main", "activity_back_to_home"] + pull_pre)
 
 
 def test_no_play_retry():
@@ -791,6 +898,8 @@ def test_select_live_home_back():
 
 def main():
     test_flow_gating()
+    test_crash_skips_pull()
+    test_lianDa_no_play_retry()
     test_no_play_retry()
     test_rankup_popup()
     test_pull_each_song_mode()

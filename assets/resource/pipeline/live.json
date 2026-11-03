@@ -54,7 +54,7 @@
    "select_song_ok",
    "comfirm_song"
   ],
-  "timeout": 4000,
+  "timeout": 8000,
   "on_error": "random_choice_song"
  },
  "select_song_ok": {
