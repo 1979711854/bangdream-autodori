@@ -3280,6 +3280,59 @@ def fuzzy_match_song(name, other_names=()):
         return None
     candidates = list(all_song_name_indexes.keys())
     longest = max(len(r) for r in readings)
+
+    # 短读数硬门(2026-11-22 事故):读数最长只有 1~2 个字时,不再直接拿 WRatio
+    # 打分 —— 它对短查询的 partial 分数普遍虚高:`メV` 与『メンタルチェンソー』
+    # 『メロウ』『メリッサ』… 全是同一个 60 分,同分时按索引顺序取第一个,最后
+    # 落到『前へススメ！』(#43)。而屏上真正的歌是 2 字标题『XV』(#793),
+    # 日文模型把 X 读成了片假名 メ。后果不是"认不出"而是"认错":整首按 #43 的
+    # 谱面打,开局 5 秒生命耗尽(2026-11-21 23:50 起 5 局,崩点固定在指令索引
+    # 200/300)。
+    #
+    # 短读数分三种情况:
+    #   ① 与候选标题**完全相等** → 直接用(『閃光』『XV』这类 2 字标题的正常读法);
+    #   ② 是某个候选标题的**连续片段** → 它是有信息的截断读数,交回原打分逻辑
+    #      (『at』之于 great escape、『の』之于魂のルフラン,旧行为不能破);
+    #   ③ 谁都不是片段 → 只认「等长且只差一个字」的唯一候选(`メV` → `XV`),
+    #      再没有就回 None,由 `get_song_name` 的 on_error 换歌重选。
+    if longest <= 2:
+        exact = list(dict.fromkeys(
+            k for k in candidates if _normalize_title(k) in readings
+        ))
+        if len(exact) == 1:
+            return (exact[0], 100.0)
+        # 片段与近邻判定都只看**最长**读数:更短的读数证据更弱(`V` 是大量标题的
+        # 子串),而且 1 字读数与 1 字标题的"相同字符数 ≥ 长度-1"恒成立
+        # (0 ≥ 0),会让近邻候选泛滥(2026-11-22 调试:`天`/`V` 一度收到 4~5 个)。
+        longest_readings = [r for r in readings if len(r) == longest]
+        is_fragment = any(
+            r in _normalize_title(k)
+            for r in longest_readings
+            for k in candidates
+        )
+        if not is_fragment:
+            near = []
+            for k in candidates:
+                kn = _normalize_title(k)
+                for r in longest_readings:
+                    if len(kn) != len(r):
+                        continue
+                    same = sum(1 for a, b in zip(r, kn) if a == b)
+                    if same == len(r) or (len(r) >= 2 and same >= len(r) - 1):
+                        near.append(k)
+                        break
+            if len(near) == 1:
+                logging.info(
+                    "短标题读数为 %r,按等长一位之差认成 %r", readings, near[0]
+                )
+                return (near[0], 80.0)
+            # 近邻不唯一(或没有近邻)时不在这里裁掉,交回原打分逻辑(旧行为):
+            # 『闪光』这种简中读数与繁体标题『閃光』只共享一个字,和『逆光』
+            # 并列,一刀切会把本来能对的样本也变成认不出。
+            logging.debug(
+                "短标题读数 %r 没有唯一近邻候选,按原打分逻辑继续", readings
+            )
+
     # 前缀池用**原始**读数判定(归一化理论上不动方括号,但别依赖这一点)
     query_has_prefix = _has_title_prefix(name) or (
         bool(other_names) and _has_title_prefix(other_names[0])

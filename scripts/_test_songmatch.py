@@ -207,6 +207,12 @@ CASES = [
     # 被 ja 模型读成形近字「乗」,默认模型读出空串 → 匹配 0 分 → 选歌死循环。
     # 旧逻辑下同样认不出( baseline 对「乗」只能蒙一个低分条目)。
     ("乗", "", "513"),
+    # 2026-11-22 实测(debug/autodori-20261122-164256.log 18:03:51):屏显 2 字标题
+    # 「XV」(#793),日文模型读成『メＶ』、默认模型读成『V』。旧逻辑靠 2 字读数的
+    # partial 同分(60 分,『メンタルチェンソー』『メロウ』… 全一样)按索引顺序命中
+    # 『前へススメ！』(#43)→ 整首按错谱面打,开局 5 秒生命耗尽
+    # (11-21 23:50 起 5 局,崩点固定在指令索引 200/300)。
+    ("メＶ", "43", "793"),
 ]
 
 
@@ -244,6 +250,11 @@ def test_corpus_table():
     changed = []
     for text, old_id, want_id in CASES:
         hit = match_song(text)
+        # 2026-11-22:短读数硬门会让部分样本直接返回 None,这里不能崩,
+        # 要把它算成一条 FAIL 并继续跑完,才能看清整体回归面。
+        if hit is None:
+            check(False, "%r 匹配结果为空(期望 #%s)" % (text[:30], want_id))
+            continue
         got = song_id(hit[0])
         base = song_id(baseline_match(text)[0])
         if base != got:
