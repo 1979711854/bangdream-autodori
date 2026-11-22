@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """活动故事阅读的离线回归(2026-10-31)。
 
-覆盖三件事:
+覆盖四件事:
 1. 「取最下面的 NEW」—— 不撞「该剧情尚未解锁」的核心判据;
 2. 进度文件落盘与读取(只做记录,不参与流程判断);
-3. eventstory.json 的节点引用完整性 + MAA 查重铁律(不跑真机也能查出笔误)。
+3. 列表滚不动时提前收工(2026-11-06 实机:到顶后仍空滑 6 次约 10 秒);
+4. eventstory.json 的节点引用完整性 + MAA 查重铁律(不跑真机也能查出笔误)。
 
 有实机截图(debug/local/_evt_*.png)时额外做真实模板匹配:
 列表页必须选中 y 更大的那个 NEW,剧情界面必须一个都认不出。
@@ -64,6 +65,72 @@ def test_progress_file():
         check("history 累积", len(data.get("history") or []) == 2)
     finally:
         ev.PROGRESS_PATH = old
+
+
+class _FakeCtx:
+    """只实现 analyze 里用到的 run_recognition,其它一律不用。"""
+
+    def run_recognition(self, *args, **kwargs):
+        return None
+
+
+class _FakeArg:
+    def __init__(self, image):
+        self.image = image
+
+
+def test_pick_early_stop():
+    """2026-11-06 实机问题:列表到顶后仍空滑 6 次(约 10 秒)。
+
+    判据不变(没有 NEW 才算读完),只是"连续两次画面没变"就提前收工。
+    """
+    print("[6] 列表滚不动时提前收工")
+    import time as _time
+
+    saved_shot, saved_swipe = ev._screencap, ev._swipe_list_up
+    saved_time = ev.time
+    ev.time = type("T", (), {"sleep": staticmethod(lambda _s: None),
+                             "strftime": staticmethod(_time.strftime)})()
+    calls = {"swipe": 0}
+    ev._swipe_list_up = lambda ctx: calls.__setitem__("swipe", calls["swipe"] + 1)
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    ev._STATE.update({"read": 0, "blocked": "", "entry_failed": False,
+                      "end_reason": "", "scroll_attempts": 0})
+    try:
+        ev._screencap = lambda ctx: frame.copy()
+        res = ev.EventChapterPick().analyze(_FakeCtx(), _FakeArg(frame.copy()))
+        detail = json.loads(res.detail)
+        check("画面不动时 found=false", detail.get("found") is False, f"{detail}")
+        check("只滑 2 次就收工", calls["swipe"] == 2, f"swipe={calls['swipe']}")
+        check("结束原因=列表已到顶",
+              ev._STATE["end_reason"] == "no_new_no_scroll", f"{ev._STATE}")
+
+        # 反向:每次滑动画面都在变 → 必须滚满 SCROLL_LIMIT 次才结束
+        ev._STATE.update({"end_reason": "", "scroll_attempts": 0})
+        calls["swipe"] = 0
+        frames = iter([np.full((720, 1280, 3), (i + 1) * 20, dtype=np.uint8)
+                       for i in range(ev.SCROLL_LIMIT + 2)])
+        ev._screencap = lambda ctx: next(frames)
+        ev.EventChapterPick().analyze(_FakeCtx(), _FakeArg(frame.copy()))
+        check("画面在变时滚满 %d 次" % ev.SCROLL_LIMIT,
+              calls["swipe"] == ev.SCROLL_LIMIT, f"swipe={calls['swipe']}")
+        check("结束原因=滚满上限",
+              ev._STATE["end_reason"] == "no_new_scroll_limit", f"{ev._STATE}")
+    finally:
+        ev._screencap, ev._swipe_list_up = saved_shot, saved_swipe
+        ev.time = saved_time
+        ev._STATE.update({"read": 0, "blocked": "", "entry_failed": False,
+                          "end_reason": "", "scroll_attempts": 0})
+
+
+def test_frame_diff():
+    print("[7] 画面比对")
+    a = np.zeros((10, 10, 3), dtype=np.uint8)
+    check("同一帧差为 0", ev._frame_diff_mean(a, a.copy()) == 0.0)
+    b = np.full((10, 10, 3), 200, dtype=np.uint8)
+    check("大改动的平均差很大", ev._frame_diff_mean(a, b) > 1.0)
+    check("尺寸不一致按「变了」处理(保守)",
+          ev._frame_diff_mean(a, np.zeros((5, 5, 3), dtype=np.uint8)) == 255.0)
 
 
 def test_pipeline_refs():
@@ -146,6 +213,8 @@ def test_templates_on_shot():
 def main():
     test_pick_lowest()
     test_progress_file()
+    test_pick_early_stop()
+    test_frame_diff()
     test_pipeline_refs()
     if _has_shots():
         test_templates_on_shot()

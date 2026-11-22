@@ -283,6 +283,28 @@
    "read_after"
   ]
  },
+ "rankup_dialog": {
+  "recognition": "OCR",
+  "expected": [
+   "确定",
+   "确认"
+  ],
+  "roi": [
+   500,
+   470,
+   340,
+   120
+  ],
+  "threshold": 0.8,
+  "action": "Click",
+  "post_delay": 1500,
+  "next": [
+   "rankup_dialog",
+   "event_reward_confirm",
+   "activity_liveagain",
+   "daily_song_done"
+  ]
+ },
  "liveagain": {
   "recognition": "TemplateMatch",
   "template": "live/button/liveagain.png",

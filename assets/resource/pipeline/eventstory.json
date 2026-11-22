@@ -28,9 +28,6 @@
         "post_delay": 1200,
         "next": [
             "eventstory_read"
-        ],
-        "on_error": [
-            "eventstory_done"
         ]
     },
     "eventstory_read": {

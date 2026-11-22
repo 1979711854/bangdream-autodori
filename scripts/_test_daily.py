@@ -364,15 +364,24 @@ def test_rankup_popup():
     check("点完「确定」进确认页", ok_node["next"], ["comfirm_song"])
     d = json.loads(
         Path("assets/resource/pipeline/daily.json").read_text(encoding="utf-8"))
+    # 2026-11-12:precheck 拆两层 —— 跳板(带弹窗点掉)+ 主页判定。
+    # 现场 autodori-20261112-122736.log:rank up 面板留在屏上,precheck 直接 5s
+    # 超时 → 三抽被跳过。现在跳板先点掉残留弹窗,再判主页。
     pre = d["daily_pull_precheck"]
+    pre_home = d["daily_pull_precheck_home"]
     check("三抽前置校验认主页「演出」按钮",
-          pre["template"], "live/button/live_home.png")
+          pre_home["template"], "live/button/live_home.png")
     # 2026-10-28 二次修:precheck 原来 next 直连 daily_pull,而 daily_pull 是必定
     # 命中的跳板 —— post 一次 precheck 就等于整套三抽跑一遍,Python 又 post 一次,
     # 每轮跑两遍(18:05 场日志两行「今日次数已抽完」)。它只能是阀门。
-    check("前置校验只当阀门,next 只能是 stop", pre["next"], ["stop"])
-    check("前置校验认不到就超时(不无限等)",
-          pre.get("timeout"), 5000)
+    check("前置校验只当阀门,主页判定后只能是 stop", pre_home["next"], ["stop"])
+    check("跳板 next 只到主页判定", pre["next"], ["daily_pull_precheck_home"])
+    check("跳板首位点掉 rank up 面板", pre["interrupt"][0], "rankup_dialog")
+    check("跳板也点奖励弹窗/公告/通用按钮",
+          all(n in pre["interrupt"] for n in
+              ("event_reward_confirm", "song_announce_confirm",
+               "ok_button", "close_button", "confirm_button")), True)
+    check("前置校验认不到就超时(不无限等)", pre.get("timeout"), 8000)
     # 2026-10-28 二次修:抽卡页加载时 story_loading_wait 会误命中(「NOWLOADING…」
     # 「5MB/5MB」),而它的 next 只回剧情链 → 超时把整轮三抽带走。三抽链改用
     # 专用 loading 节点,加载完回 daily_pull_find_gacha 继续。
@@ -525,8 +534,30 @@ def test_pull_each_song_mode():
           "confirm_button" not in pipes["save_succeed_playresult"]["interrupt"], True)
     check("save_succeed_playresult 交回 daily_song_done",
           pipes["save_succeed_playresult"]["next"][-1], "daily_song_done")
-    check("event_reward_confirm 也先认再次演出再回主页",
-          pipes["event_reward_confirm"]["next"], ["activity_liveagain", "daily_song_done"])
+    # 2026-11-12:rank up 面板(「等级 RANK UP!!」+ 右下「确定」)会挡在结算链里,
+    # 原先这里只有 activity_liveagain / daily_song_done,面板上两者都认不到 →
+    # 20s Task timeout、三抽被跳过。现在两条 next 的首位都挂 rankup_dialog,
+    # 它认不到就自然往下走,不打乱原有顺序。
+    check("event_reward_confirm 先认 rank up 面板再认再次演出",
+          pipes["event_reward_confirm"]["next"],
+          ["rankup_dialog", "activity_liveagain", "daily_song_done"])
+    check("save_succeed_playresult 挂 rank up 面板(interrupt 首位)",
+          pipes["save_succeed_playresult"]["interrupt"][0], "rankup_dialog")
+    check("不用模板 rankup_confirm(白底会误命中)",
+          "rankup_confirm" in pipes["save_succeed_playresult"]["interrupt"], False)
+    _live = json.loads(
+        Path("assets/resource/pipeline/live.json").read_text(encoding="utf-8")
+    )
+    _ru = _live["rankup_dialog"]
+    check("rankup_dialog 识别方式 = OCR", _ru["recognition"], "OCR")
+    check("rankup_dialog 认的字包含「确定」", "确定" in _ru["expected"], True)
+    _roi = _ru["roi"]
+    check("rankup_dialog 的 roi 框住了实测按钮 [606,509,67,38]",
+          _roi[0] <= 606 and _roi[1] <= 509
+          and 606 + 67 <= _roi[0] + _roi[2]
+          and 509 + 38 <= _roi[1] + _roi[3], True)
+    check("rankup_dialog 自循环(一次升级多个角色)",
+          _ru["next"][0], "rankup_dialog")
     check("handle_life_exhausted 也交回 daily_song_done",
           pipes["handle_life_exhausted"]["next"], ["daily_song_done"])
     d = json.loads(Path("assets/resource/pipeline/live.json").read_text(encoding="utf-8"))

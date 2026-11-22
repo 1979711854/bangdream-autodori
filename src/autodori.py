@@ -3035,6 +3035,10 @@ def _dump_crash_diag(context, frame, song_label, batch_no, chart):
         "已打 %.1fs(自首音触发) · 发布批次 %d · 指令索引 %s/%s"
         " · 在线 lag %.1fms · 画面分数 '%s'"
     ) % (played_s, batch_no, sent, total, lag, score)
+    # 2026-11-11:锚点可疑时直接写在崩局行里 —— 一眼分清「开局全 miss(锚点)」
+    # 和「打到一半才崩(手势/卡顿)」,不用再去翻首音那行。
+    if diag.get("anchor_suspect"):
+        summary += " · 首音锚点可疑(早 %.0fms)" % diag.get("anchor_lead_ms", 0.0)
     logging.info("崩局诊断: %s", summary)
     try:
         os.makedirs("debug/crash", exist_ok=True)
@@ -3055,6 +3059,10 @@ def _dump_crash_diag(context, frame, song_label, batch_no, chart):
                 ))
             else:
                 f.write("# 首音触发: 本局无记录(未经过 wait_first_note)\n")
+            if "anchor_lead_ms" in diag:
+                f.write("# 首音锚点: 顶部判据早 %.0fms(阈值 %.0fms)%s\n" % (
+                    diag["anchor_lead_ms"], FIRST_NOTE_ANCHOR_SUSPECT_MS,
+                    "，可疑" if diag.get("anchor_suspect") else "，正常"))
     except Exception as e:  # noqa: BLE001 —— 诊断落盘失败不影响收尾
         logging.debug("崩局诊断落盘失败: %s", e)
 
@@ -4336,6 +4344,19 @@ TRIGGER_EDGE_WINDOW_MS = 150.0  # band 与顶部判据越阈值的最大允许�
 MAX_TRIGGER_REJECTS = 3         # 不同候选累计拒绝上限
 REJECT_GIVEUP_S = 8.0           # 累计拒绝时长上限(秒),到点放宽
 
+# 首音锚点可疑阈值(2026-11-11,用户定:**先告警、不改判定**)。
+# 一周实机(11-03~11-11,208 首)8 起有日志的崩局里 6 起是「开局 3~6 秒生命归零、
+# 画面分数≈0」;其中 5 起「顶部 7 行」判据比 band 判据早 195~498ms(正常曲目
+# -8~+1ms)。同一首同难度在早值正常时能全 P:
+#   #333-hard 早 364ms 崩 / 早 -5ms 全 P;#255-special 早 195ms 崩 / 早 -1ms 全 P;
+#   #410-hard 早 299ms 崩 / 当晚全 P。
+# 说明 band 判据迟钝时锚点会整体偏晚 0.2~0.5 秒,开局全 MISS。
+# 现有判据②(TRIGGER_EDGE_WINDOW_MS)**拦不住**这类:它比较的是 edge_last_t
+# (最近一次上升沿),而这条诊断用的是 edge_cross_t(首次越阈值),不是同一事件 ——
+# 实测这些崩局都是「拒绝0次」直接放行。
+# 所以现在只在日志/崩局诊断里标记,不参与判定;等攒够样本再决定改锚点还是改判据。
+FIRST_NOTE_ANCHOR_SUSPECT_MS = 150.0
+
 
 def _first_note_trigger_check(
     change_score,
@@ -4365,6 +4386,38 @@ def _first_note_trigger_check(
         if lead_ms < -TRIGGER_EDGE_WINDOW_MS:
             return False, "顶部判据晚 %.0fms(不是同一个物体)" % (-lead_ms)
     return True, ""
+
+
+# ---- 宽限期内「提前解除」判据(2026-11-11,方案 A)------------------------
+# 背景:#782-special Game Changer 11-11 两局连崩(22:18:25 / 22:19:12),崩局行都带
+# 「首音锚点可疑」,触发帧截图(debug/firstnote/221822-trigger.jpg)上机器人一条指令
+# 都还没发,画面已经有 MISS、生命 900/1000(第二局 700/1000)、分数 0 —— 说明真音符
+# 已经在跑,而首音检测还在宽限期里空等。
+# 取证:两天前的逐帧 trace(debug/firstnote/001810-scan.txt,#462-hard)给出形态对照 ——
+#   · 一个音符进入检测带 = **1~2 条轨道**变化(音符图比一条轨道宽,会压到邻轨),
+#     实测单帧 change 11~176,前 16ms 那一帧只有 0.45(尖端刚探头,不越阈值);
+#   · 场景切换/前奏残留(计数、"GO!"、舞台灯亮)是**整带**变化,即 SCENE_MIN_LANES
+#     那套 ≥5/7 轨的判据。
+# 但宽限期分支是「见到变化就丢」,不区分形态:782 那两局宽限期内出现了 8~35 的单轨
+# 变化(两次触发都卡在宽限结束 +1ms / +45ms,即宽限一结束就按当时画面锚定了),
+# 真首音被整段吞掉 → 锚点落到后面的变化上 → 全曲错位 0.3~0.5s → 2.8 秒崩。
+# 所以宽限期内只丢「不像音符」的变化;1~3 轨、且幅度明显高于阈值的,按真首音处理。
+# ⚠ 阈值取 10.0 而不是 CHANGE_THRESHOLD(3.0):实测真音符 11~176,而 782 宽限期内
+# 也出现过 3.10/3.86/2.33 这种小抖动,放到 3.0 会把噪声也当首音(等于把 08-28 修掉的
+# 「前奏残留误触发」放回来)。风险仍有:若某曲前奏残留只在 1~3 轨上、且幅度 >10,
+# 会提前触发 —— 真出现就调小 PRELUDE_NOTE_MAX_LANES 或把 MIN_CHANGE 提到 20。
+PRELUDE_NOTE_MAX_LANES = 3
+PRELUDE_NOTE_MIN_CHANGE = 10.0
+
+
+def _prelude_note_like(change_score, lanes_changed):
+    """宽限期内这一帧是不是「真音符」而不是前奏残留。纯函数,离线回归见
+    scripts/_test_firstnote.py 的「宽限期提前解除」一节。
+    """
+    return (
+        lanes_changed <= PRELUDE_NOTE_MAX_LANES
+        and change_score >= PRELUDE_NOTE_MIN_CHANGE
+    )
 
 
 # ---- L2:首音锚点在线实测(2026-10-27,先取证后启用)----
@@ -4445,8 +4498,13 @@ def wait_first_note():
     # 前奏残留元素(计数动画/"GO!")扫过检测带被当首音 → 图表比真首音早 ~1.5s
     # 开始 → 整首错位全 MISS → 崩。这里在冻结完成后给一段宽限期,期内越阈值
     # 一律视为前奏残留忽略;真首音通常要 1.5s+ 才到,不受影响。
+    # ⚠ 2026-11-11 修正:有曲子的首音就落在宽限期里(#782-special),整段吞掉后
+    # 锚点落到后面的变化上,开局全 miss 崩局。现在宽限期内只丢「不像音符」的变化
+    # (≥4 轨或幅度不足 PRELUDE_NOTE_MIN_CHANGE 的),单轨/双轨的大变化按首音处理,
+    # 见 PRELUDE_NOTE_MAX_LANES 那段注释。
     FIRST_NOTE_GRACE_MS = 500
     _freeze_done_t = None
+    _grace_release_logged = False  # 提前解除只报一次,别在触发前刷屏
 
     # 场景切换误触发修复(2026-10-21,连打第二首首音不对的根因):
     # 冻结完成后、真首音到来前,演出画面才「激活」(轨道亮起/READY 等)或转场,
@@ -4672,18 +4730,30 @@ def wait_first_note():
         底噪/带内重心是 2026-10-27 加的可信度门取证字段(见 _first_note_trigger_check)。"""
         _dump_frame_trace()
         band_ms = (cross_t - t_start) * 1000.0
+        lead_ms = 0.0
         if edge_cross_t is None:
             edge_desc, lead = "未越阈值", ""
         else:
             edge_ms = (edge_cross_t - t_start) * 1000.0
+            lead_ms = band_ms - edge_ms
             edge_desc = "%.0fms" % edge_ms
-            lead = "(灵敏判据早 %.0fms)" % (band_ms - edge_ms)
+            lead = "(灵敏判据早 %.0fms)" % lead_ms
         logging.info(
             "首音触发[%s]: band %.0fms change=%.2f, %d/7 轨变化, 顶部%d行 %s %s, "
             "底噪=%.2f 带内重心=%.1f/%.0f 拒绝%d次",
             kind, band_ms, change_score, lanes, edge_count, edge_desc, lead,
             noise_floor, _band_centroid(), row_count - 1, trigger_rejects,
         )
+        # 2026-11-11:锚点可疑只告警(见 FIRST_NOTE_ANCHOR_SUSPECT_MS 注释)。
+        # 一行 WARNING 让用户当场就知道「这局可能开局全 miss」,不用等崩了再查。
+        suspect = lead_ms >= FIRST_NOTE_ANCHOR_SUSPECT_MS
+        if suspect:
+            logging.warning(
+                "首音锚点可疑: band 判据比「顶部%d行」判据晚 %.0fms(阈值 %.0fms),"
+                "本曲时间线可能整体偏晚;若本局开局全 miss(画面分数≈0),"
+                "请把这一行连同 debug/crash/ 与 debug/firstnote/ 一起反馈",
+                edge_count, lead_ms, FIRST_NOTE_ANCHOR_SUSPECT_MS,
+            )
         # 2026-10-28 崩局诊断:把触发参数留给 _dump_crash_diag —— 崩局时
         # 「首音是怎么锚的」和「画面分数」放在一起才能判断锚点偏早还是偏晚。
         _FIRST_NOTE_DIAG.update({
@@ -4694,6 +4764,8 @@ def wait_first_note():
             "change": change_score, "noise": noise_floor,
             "y": -1.0 if note_y is None else float(note_y),
             "gate": PHOTOGATE_LATENCY, "t": cross_t, "post_saved": False,
+            # 2026-11-11:锚点偏差与可疑标记(每首都会覆盖,不会串到下一首)
+            "anchor_lead_ms": lead_ms, "anchor_suspect": suspect,
         })
 
     def _reject_trigger(reason, change_score, frame_t, kind):
@@ -4978,21 +5050,37 @@ def wait_first_note():
                 edge_last_t = frame_t
             prev_edge_change = edge_change
             now_t = time.perf_counter()
-            if (
+            in_grace = (
                 _freeze_done_t is not None
                 and (now_t - _freeze_done_t) * 1000.0 < FIRST_NOTE_GRACE_MS
-            ):
+            )
+            if in_grace and not _prelude_note_like(change_score, lanes_changed):
                 # 冻结后宽限期内:前奏残留 UI(计数/"GO!"等)常在此窗口扫过检测带,
-                # 一律忽略不触发,等真首音(通常 1.5s+ 后)
+                # 一律忽略不触发,等真首音(通常 1.5s+ 后)。
+                # 2026-11-11:只有「不像音符」的变化才丢(见 PRELUDE_NOTE_MAX_LANES),
+                # 单轨/双轨的大变化会落到下面的正常触发路径。
                 if change_score >= CHANGE_THRESHOLD:
                     _maybe_log(
                         change_score,
                         band_avg,
-                        "ignored(prelude {:.0f}ms)".format(
-                            (now_t - _freeze_done_t) * 1000.0
+                        "ignored(prelude {:.0f}ms {}/7 lanes)".format(
+                            (now_t - _freeze_done_t) * 1000.0, lanes_changed
                         ),
                     )
             elif last_avg is not None and prev_change is not None:
+                if in_grace and not _grace_release_logged:
+                    # 首音落在宽限期里 —— 必须有一条 INFO,否则日志上只能看到
+                    # 「触发」而看不出宽限被谁解除,下次再崩又要重新取证。
+                    _grace_release_logged = True
+                    logging.info(
+                        "首音宽限期提前解除: 冻结后 %.0fms 出现 %d/7 轨变化"
+                        "(change=%.2f, 阈值 %d 轨 / %.1f),按真音符处理",
+                        (now_t - _freeze_done_t) * 1000.0,
+                        lanes_changed,
+                        change_score,
+                        PRELUDE_NOTE_MAX_LANES,
+                        PRELUDE_NOTE_MIN_CHANGE,
+                    )
                 if prev_change < CHANGE_THRESHOLD <= change_score:
                     if lanes_changed >= SCENE_MIN_LANES:
                         # 场景切换/演出画面激活:几乎所有轨道同帧变化,不是音符。
@@ -5563,8 +5651,27 @@ def _get_override_pipeline():
             # 在角色卡牌下方白底实测误命中 0.9928,抢在 next_button 前面点了空白处,
             # 画面不走 → 20s Task timeout,整场连打被终止。活动页的推进交给
             # interrupt 里的 next_button(OCR「下一步」)。
-            "next": ["event_reward_confirm", "activity_liveagain", "daily_song_done"],
+            # ⚠ 2026-11-12 rank up 面板事故(autodori-20261112-122736.log / maa.log
+            # 12:30:16):点完「下一步」后弹出「等级 RANK UP!!」面板(角色:冰川纱夜,
+            # 下面一列 角色评级EXP / 成员EXP / 等级EXP / 乐队等级EXP,右下「确定」),
+            # **只有 OCR 认「下一步」的那条 interrupt 有效,面板上并没有「下一步」**
+            # → 9 条识别全部不命中,20s Task timeout(打歌阶段报「界面识别超时」),
+            # 面板留在屏上 → 随后三抽前置校验也认不到主页,三抽被跳过。
+            # 面板上的文字实测:确定 box[606,509,67,38] score 0.9999、RANK UP!! 0.9253、
+            # 等级 0.9997 —— 所以这里挂 rankup_dialog(OCR「确定」+ roi 只框按钮带)。
+            # 挂在 interrupt 而不是 next:interrupt 命中后 MAA 会**回到本条 next 列表**
+            # 继续识别(maa.log 12:22:16 confirm_button 命中后 cur_node_ 仍是 playsong、
+            # 列表原封不动),点掉面板后无论接的是奖励弹窗、再次演出还是主页,
+            # 都由原有那套识别接着处理,不用我在 rankup_dialog 里猜后续。
+            # ⚠ 为什么不用 rankup_confirm.png 模板:见上一条 10-28 误命中,同一块白底
+            # 卡牌会以 0.99 假命中,而「确定」两个字的 OCR 在同一画面是 0.9999。
+            "next": [
+                "event_reward_confirm",
+                "activity_liveagain",
+                "daily_song_done",
+            ],
             "interrupt": [
+                "rankup_dialog",
                 "story_loading_wait",
                 "reader_menu",
                 "next_button",
@@ -5583,7 +5690,9 @@ def _get_override_pipeline():
             "post_delay": 800,
             # 奖励弹窗点掉后仍然优先「再次演出」(活动分数页可能在弹窗下面)。
             # ⚠ 2026-10-28:这里同样不要挂 rankup_confirm(白底误命中,见上一条)。
-            "next": ["activity_liveagain", "daily_song_done"],
+            # 2026-11-12:rank up 面板也可能在奖励弹窗之后才弹(一次升级多个角色),
+            # 所以这条 next 也带上 rankup_dialog —— 它认不到就往下走,不影响原顺序。
+            "next": ["rankup_dialog", "activity_liveagain", "daily_song_done"],
         }
         all_pipelines["handle_life_exhausted"] = {
             "action": "Custom",
@@ -5672,7 +5781,11 @@ def _log_environment():
         emu_index = emu_cfg.get("index", "")
         gate = PHOTOGATE_LATENCY
         life = (config or {}).get("on_life_exhausted", "auto")
-        boost = (config or {}).get("play_at_zero_boost", True)
+        # 2026-11-11:这里原来打印**废弃键** play_at_zero_boost(只对 main 生效),
+        # 日常实际读的是 on_zero_boost,于是日志写着「火罐0继续=False」而实际
+        # 在 0 火后继续挖矿 —— 排查时完全对不上。改成打印当前生效的策略。
+        boost = {"stop": "停在主界面", "play": "继续挖矿",
+                 "exit": "退出游戏"}.get(_zero_boost_policy(), "?")
         wf = get_runtime_info(current_player.resolution)["wait_first"]
         logging.info("===== 环境诊断 =====")
         logging.info("版本: %s", version)
@@ -5686,7 +5799,7 @@ def _log_environment():
             res[0], res[1], orient, wf["from"], wf["to"],
         )
         logging.info(
-            "photogate=%sms, 生命耗尽=%s, 火罐0继续=%s, 难度=%s, 模式=%s",
+            "photogate=%sms, 生命耗尽=%s, 火罐0时=%s, 难度=%s, 模式=%s",
             gate, life, boost, DIFFICULTY,
             "超高难度SPECIAL活动(固定单曲, 打完即停)" if SPECIAL_MODE else LIVEMODE,
         )
@@ -5836,8 +5949,12 @@ def _run_daily_flow(entry: str) -> None:
         # daily_pull 是无 recognition 的跳板节点(必定命中),任何画面进来都能
         # "开始三抽";弹窗挡着时它会把弹窗里的白色「确定」当成
         # song_announce_confirm 点掉,然后断头 → 任务报"成功",三抽其实没做。
-        # precheck 认不到主页「演出」按钮就 5s 超时,这里跳过并告警。
+        # precheck 认不到主页「演出」按钮就超时,这里跳过并告警。
         # ⚠ 它的 next 只能是 stop(只当阀门);链进 daily_pull 就等于校验=开抽。
+        # 2026-11-12:precheck 拆成「跳板 + 主页判定」两层(daily.json),跳板带一串
+        # 弹窗点掉节点 —— 残留弹窗(rank up 面板、奖励弹窗、公告)挡着时先点掉再判,
+        # 判到主页才往下走。以前没有这层,今天 12:30 那局残留 rank up 面板直接把
+        # 这一轮三抽判成「不在主界面」跳过(免费三抽白丢)。总时限 8s。
         try:
             failed = _task_failed(
                 maatasker.post_task(
@@ -6257,8 +6374,11 @@ def _main_impl():
             maatasker.post_task(entry, _get_override_pipeline()).wait().get()
             if _EVENTSTORY_MODE:
                 # 活动故事收尾汇总(2026-10-31,用户要求"明确提示")。
-                # 四种结局:入口没认出来(不在活动主页) / 未解锁暂停 /
-                # 列表本来就没有未读 / 逐话读到底。
+                # 2026-11-06 细化:把「为什么结束」逐种写死 —— 入口没认出来 /
+                # 未解锁暂停 / 点击失败 / **流程中途异常停下**(没有任何结束标记) /
+                # 列表本来就没有未读 / 读到底(再分"列表已到顶"与"滚满 6 屏")。
+                # 中间那几种以前是静默失败:节点超时后 MAA 直接收工,
+                # 界面上什么提示都没有,玩家分不清"读完了"还是"卡住了"。
                 _ev = event_story_state()
                 if _ev["entry_failed"]:
                     logging.info("未开始阅读:没有检测到活动主页的入口按钮，"
@@ -6266,12 +6386,35 @@ def _main_impl():
                 elif _ev["blocked"] == "locked":
                     logging.info("活动故事已暂停（当前话未解锁），本次共读 %d 话。",
                                  _ev["read"])
+                elif _ev["blocked"] == "click_failed":
+                    logging.info("活动故事已暂停（无法点开话列表里的条目），"
+                                 "本次共读 %d 话。", _ev["read"])
+                elif _ev["blocked"] == "reward_failed":
+                    logging.info("活动故事已暂停（领取「故事达成奖励」失败），"
+                                 "本次共读 %d 话。", _ev["read"])
+                elif not _ev.get("end_reason"):
+                    # 没有任何结束标记 = 流程在中间被掐断(识别超时/看门狗停任务等),
+                    # 不能报成"读完",否则玩家会以为活动没剧情了。
+                    logging.error("活动故事未正常结束：流程中途停下（可能有界面没认"
+                                  "出来），本次已读 %d 话；请查看 debug/maa.log。",
+                                  _ev["read"])
                 elif _ev["read"] == 0:
                     logging.info("未开始阅读:活动故事列表里没有未读的话。")
+                elif _ev.get("end_reason") == "no_new_no_scroll":
+                    # 2026-11-06:列表已经滑不动 = 到顶,没有未读。与「滚满 6 屏」
+                    # 分开报 —— 出问题时一眼看得出是哪种结束方式。
+                    logging.info("活动故事已读到底（话列表已到顶，没有未读的话），"
+                                 "本次共 %d 话；若活动还有未解锁的话，"
+                                 "需活动 PT 达标后再运行。", _ev["read"])
+                elif _ev.get("end_reason") == "no_new_scroll_limit":
+                    logging.info("活动故事已读到底（向上滚动 %d 屏没有找到未读的话），"
+                                 "本次共 %d 话；若活动还有未解锁的话，"
+                                 "需活动 PT 达标后再运行。",
+                                 _ev.get("scroll_attempts", 0), _ev["read"])
                 else:
-                    logging.info("活动故事已读到底，本次共 %d 话；"
-                                 "若活动还有未解锁的话，需活动 PT 达标后再运行。",
-                                 _ev["read"])
+                    # 兜底:截图失败等异常路径,不能报成「已确认读完」
+                    logging.info("活动故事已读结束（未能确认列表是否到顶），"
+                                 "本次共 %d 话。", _ev["read"])
             if _STORY_MODE:
                 # 收尾汇总(用户定的口径,按结束方式区分):材料不足 / 达到上限
                 # (还有未读) / 没到上限就结束(列表读空) / 没读到第一个。

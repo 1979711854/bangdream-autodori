@@ -147,5 +147,27 @@ ok &= check(all_stamped, "空 stamp 全部被兜底为 HH:MM:SS -> %r"
 e._emit("19:00:00", "INFO", "keep")
 ok &= check(e._log_buf[-1][0] == "19:00:00", "显式时间戳原样保留")
 
+print("\n场景 7:活动故事日志要进「关键事件」(2026-11-06 用户反馈)")
+s3 = Stub()
+s3._handle_line("2026-11-06 14:11:48,012[INFO][root] "
+                "阅读活动故事:开始（请保持游戏停在活动主页）。")
+s3._handle_line("2026-11-06 14:12:08,882[INFO][root] "
+                "活动故事已读第 1 话（本次累计 1 话），已领取达成奖励。")
+s3._handle_line("2026-11-06 14:13:45,778[INFO][root] "
+                "活动故事已读到底（话列表已到顶，没有未读的话），本次共 6 话；"
+                "若活动还有未解锁的话，需活动 PT 达标后再运行。")
+s3._handle_line("2026-11-06 14:13:45,779[ERROR][root] "
+                "活动故事未正常结束：流程中途停下（可能有界面没认出来），"
+                "本次已读 2 话；请查看 debug/maa.log。")
+s3._handle_line("2026-11-06 14:12:52,000[ERROR][root] "
+                "活动故事暂停：当前话尚未解锁（活动 PT 不足或前面的剧情未读），"
+                "本次已读 1 话；活动 PT 达标后再次点击继续。")
+# 过程行(DEBUG)不该出现在界面里:用户只要开始/每话/收尾
+s3._handle_line("2026-11-06 14:12:52,001[DEBUG][root] "
+                "活动故事：找到 1 个未读话，取最下面的 y=148")
+msgs = [e[2] for e in s3.emitted]
+ok &= check(len(msgs) == 5, "开始/每话/收尾/异常/暂停 共 5 条放行 -> %d" % len(msgs))
+ok &= check(not any("找到" in m for m in msgs), "过程 DEBUG 行不刷屏")
+
 print("\n结果: " + ("全部通过 ✅" if ok else "存在失败 ❌"))
 sys.exit(0 if ok else 1)

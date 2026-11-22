@@ -22,6 +22,17 @@ r"""「阅读活动故事」专用流程(2026-10-31 新增)。
 - 不勾「连续阅读已解锁的故事」:连续模式由游戏自己推进,bot 无法在每话之间
   控制跳过,反而容易卡在播放中。
 
+「结束」的判据(2026-11-06 按用户反馈定死,改动前先读这段):
+  唯一判据 = **列表里找不到 NEW 标记**,不是"读满 N 话",也不是活动主页的话数
+  (那行浅灰小字 OCR 读不准,见下)。识别方式:在左栏最多向上滚 SCROLL_LIMIT 屏,
+  每屏都做一次 NEW 模板匹配;滚完仍没有 NEW 就结束。
+  2026-11-06 实机补充:读完最后一话后仍会向上滚满 6 屏、约 10 秒,而这 6 次截图
+  完全一致(maa.log 里 6 次识别分数都是同一个 0.450737)—— 列表早就到顶,滚动
+  是白做的,玩家看到的是「一直在点最后一个剧情、点了一会才结束」。
+  所以现在加一条提前收工:滚动前后画面完全没变,连续两次就判定「列表已到顶」,
+  直接按"没有未读"结束。**判据本身不变**,只是不再空滚;收尾日志按
+  end_reason 区分「列表已到顶」与「滚满 6 屏仍无 NEW」两种结束原因。
+
 为什么没有「还差几话」的数值提示:活动主页那行「7/7话 已解锁」是浅灰小字,
 2026-10-31 用 1x / 3x / 3x+二值化三种输入实测,ppocr 都只吐出「尿臀情。」这类
 乱码,读不出数字。与其编一个假数字,不如统一提示「PT 达标后再运行」。
@@ -37,6 +48,8 @@ import json
 import logging
 import os
 import time
+
+import numpy as np
 
 from challenge import click
 from maa.custom_action import CustomAction
@@ -58,6 +71,16 @@ CHAPTER_H = 96
 # 从最底部滚到顶 3 次足够;留到 6 次是给「列表更长」的活动兜底。
 SCROLL_LIMIT = 6
 
+# 提前收工判据(2026-11-06 实机问题):读完最后一话后列表已经到顶,再滑 6 次
+# 画面纹丝不动,白等约 10 秒,玩家看到的是「一直在点最后一个剧情」。
+# 滚动前后两帧的平均像素差 < STILL_DIFF 视为「没滚动」,连续 STILL_LIMIT 次
+# 就判定列表已到顶、按"没有未读"结束。
+# 阈值取 1.0(0~255):列表真滚动时左栏整列都在变,平均差在个位数量级以上;
+# 静态页面的呼吸/高光动画只有零点几。阈值给小了只是退回旧的 6 次空滚,
+# 不会误判成"滚动成功",所以宁可取小。
+STILL_DIFF = 1.0
+STILL_LIMIT = 2
+
 # 进度文件:只做记录,删除也不影响流程
 PROGRESS_PATH = os.path.join("data", "event_story_progress.json")
 
@@ -66,6 +89,10 @@ _STATE = {
     "read": 0,           # 本次运行已读话数
     "blocked": "",       # "" | "locked"
     "entry_failed": False,  # 入口没认出来(不在活动主页)
+    # 结束原因(只用于收尾文案,不参与判据):
+    # "" | "no_new_no_scroll"(列表滚不动=已到顶) | "no_new_scroll_limit"(滚满 6 屏)
+    "end_reason": "",
+    "scroll_attempts": 0,  # 本次收工前实际滑动了几次
 }
 
 
@@ -130,7 +157,8 @@ def _swipe_list_up(context):
     """在左栏把列表往上翻(看更靠上的话)。
 
     手指从上往下拖 = 内容向上滚。方向写反会一直停在同一条上,
-    表现为「滚了 6 次还是同一屏」→ 收工日志会误报读完。
+    表现为「滚了 6 次还是同一屏」。2026-11-06 起这种「滚不动」不再靠次数
+    兜底,由 _frame_diff_mean 提前判出来(见 STILL_DIFF 注释)。
     """
     context.run_action("_eventstory_scroll", pipeline_override={
         "_eventstory_scroll": {
@@ -141,6 +169,20 @@ def _swipe_list_up(context):
             "post_delay": 300,
         },
     })
+
+
+def _frame_diff_mean(a, b):
+    """两帧的平均像素差(0~255)。取不到帧/尺寸不一致一律返回 255。
+
+    返回大值是**保守方向**:当作"画面变了、滚动有效",继续滚下一屏 ——
+    宁可多滚一次,也不要因为比对失败把还有未读的列表判成已读完。
+    """
+    try:
+        if a is None or b is None or a.shape != b.shape:
+            return 255.0
+        return float(np.abs(a.astype(np.int16) - b.astype(np.int16)).mean())
+    except Exception:  # noqa: BLE001 —— 比对失败走保守分支
+        return 255.0
 
 
 class EventStoryEntry(CustomRecognition):
@@ -178,11 +220,19 @@ class EventChapterPick(CustomRecognition):
     需要往上翻:所以这里自带「找不到就滚一屏再找」,最多 SCROLL_LIMIT 次。
     滚到底仍没有 NEW → 返回 found=false,由 EventChapterPickClick 收工。
 
+    2026-11-06 实机补充:读完最后一话后列表已经到顶,旧写法还会再滑 6 次、
+    白等约 10 秒(6 次截图完全一致),玩家看到「一直在点最后一个剧情」。
+    现在滑完之后先比一帧:连续 STILL_LIMIT 次画面没变就判定列表到顶,
+    立刻按"没有未读"返回。判据没变(仍然要"找不到 NEW"),只是不再空滑。
+
     不点 NEW 标记本身,而是返回该条目区域让 Click 点中部 —— 标记在条目
     右上角,点标记边缘容易落到条目外。
     """
 
     def analyze(self, context, argv):
+        prev = None       # 上一次滑动之前的画面
+        still = 0         # 连续「滑了但画面没变」的次数
+        attempts = 0      # 本次实际滑动次数
         for attempt in range(SCROLL_LIMIT + 1):
             img = argv.image if attempt == 0 else _screencap(context)
             if img is None:
@@ -213,11 +263,32 @@ class EventChapterPick(CustomRecognition):
                                 "candidates": len(boxes)}),
                 )
             if attempt < SCROLL_LIMIT:
+                if prev is not None:
+                    diff = _frame_diff_mean(prev, img)
+                    still = still + 1 if diff < STILL_DIFF else 0
+                    if still >= STILL_LIMIT:
+                        _STATE["end_reason"] = "no_new_no_scroll"
+                        _STATE["scroll_attempts"] = attempts
+                        logging.debug(
+                            "活动故事：连续 %d 次滑动后画面未变化（平均差 %.2f），"
+                            "判定列表已到顶，停止滚动", still, diff)
+                        return CustomRecognition.AnalyzeResult(
+                            [LIST_X, LIST_Y, LIST_W, CHAPTER_H],
+                            json.dumps({"found": False, "candidates": 0,
+                                        "reason": "no_scroll"}),
+                        )
+                prev = img
                 _swipe_list_up(context)
+                attempts += 1
                 time.sleep(0.5)
+        reason = "no_new_scroll_limit" if attempts else "no_new_unknown"
+        _STATE["end_reason"] = reason
+        _STATE["scroll_attempts"] = attempts
+        logging.debug("活动故事：滑动 %d 次仍未找到 NEW，按读完处理", attempts)
         return CustomRecognition.AnalyzeResult(
             [LIST_X, LIST_Y, LIST_W, CHAPTER_H],
-            json.dumps({"found": False, "candidates": 0}),
+            json.dumps({"found": False, "candidates": 0,
+                        "reason": "scroll_limit" if attempts else "unknown"}),
         )
 
 
@@ -239,11 +310,21 @@ class EventChapterPickClick(CustomAction):
             except ValueError:
                 detail = {}
         if not (detail or {}).get("found"):
-            logging.info("活动故事列表里没有未读的话，本次阅读结束。")
+            logging.debug("活动故事列表里没有未读的话，本次阅读结束（reason=%s）。",
+                          (detail or {}).get("reason"))
             context.override_next("eventstory_pick", ["eventstory_done"])
             return CustomAction.RunResult(True)
         box = argv.box
-        return click(context, "_eventstory_pick_click", [box.x, box.y, box.w, box.h])
+        if not click(context, "_eventstory_pick_click", [box.x, box.y, box.w, box.h]):
+            # 点击失败不能靠返回 False:那会走 MAA 的 error handling 从 entry 重跑
+            # 整条链(见类注释)。显式记下失败原因,收尾日志才说得清是"没读完"还是
+            # "中途出错"。
+            _STATE["blocked"] = "click_failed"
+            _save_progress("click_failed")
+            logging.error("点击话列表里的条目失败，停止阅读。")
+            context.override_next("eventstory_pick", ["eventstory_done"])
+            return CustomAction.RunResult(True)
+        return CustomAction.RunResult(True)
 
 
 class EventChapterDone(CustomAction):
@@ -256,8 +337,13 @@ class EventChapterDone(CustomAction):
     def run(self, context, argv: CustomAction.RunArg):
         box = argv.box
         if not click(context, "_eventstory_reward_ok", [box.x, box.y, box.w, box.h]):
+            # 同上:返回 False 会触发 MAA 的 error handling 重跑 entry,
+            # 收尾日志也会变成"入口没认出来"这种误导性结论。
+            _STATE["blocked"] = "reward_failed"
+            _save_progress("reward_failed")
             logging.error("点击「故事达成奖励」的「确定」失败，停止阅读。")
-            return False
+            context.override_next("eventstory_reward", ["eventstory_done"])
+            return CustomAction.RunResult(True)
         _STATE["read"] += 1
         _save_progress()
         logging.info("活动故事已读第 %d 话（本次累计 %d 话），已领取达成奖励。",

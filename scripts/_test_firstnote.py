@@ -88,6 +88,22 @@ def main():
     ok, _ = gate(3.42, 2.8, 538, rejected_s=7.9)
     check("累计拒绝 7.9s 时仍拦", ok, False)
 
+    print("== 宽限期提前解除(2026-11-11 方案 A) ==")
+    # 形态数据来自 debug/firstnote/001810-scan.txt(#462-hard 逐帧 trace):
+    # 一个音符进检测带 = 1~2 轨变化、单帧 change 11~176;
+    # 场景切换/前奏残留 = 整带变化(≥5/7 轨)。782-special 崩局就是宽限期把
+    # 1 轨 change=30 的真首音当残留丢掉了。
+    like = A._prelude_note_like
+    check("单轨大变化 change=30.72(#462 实测) 按首音处理", like(30.72, 1), True)
+    check("双轨大变化 change=11.14(#462 实测) 按首音处理", like(11.14, 2), True)
+    check("三轨 change=12.0 仍按首音处理", like(12.0, 3), True)
+    check("四轨 change=30.0 不算音符(留给场景判据)", like(30.0, 4), False)
+    check("整带变化 change=67.80 6/7 轨(782 第二局实测)", like(67.80, 6), False)
+    check("小抖动 change=3.10 单轨(782 宽限期内实测)不解除", like(3.10, 1), False)
+    check("边界: change 恰等于 10.0、3 轨 → 解除", like(10.0, 3), True)
+    check("边界: change 9.99 → 不解除", like(9.99, 2), False)
+    check("全静默 change=0.0 0 轨 → 不解除", like(0.0, 0), False)
+
     print("== L2 重心工具函数 ==")
     import numpy as np
 

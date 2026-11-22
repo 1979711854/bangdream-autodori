@@ -186,6 +186,117 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
 
 ## 8. 踩坑清单(按重要度)
 
+- **抽到新卡时的「卡面演出页」挡死三抽链(2026-11-17,已修)**
+  **现象**:第 2 次免费抽抽到 5 星新卡 → 点掉「触摸跳过动画」→ 停在整屏卡面
+  (五颗星 + 卡名「不期而遇的小确幸 / 花园 多惠」+ NEW,画面里没有任何按钮),
+  bot 在 `daily_pull_again` 里每 0.7s 识别一次 `daily_pull_costume_ok /
+  daily_pull_confirm_wait / daily_pull_anim_wait`(外加 interrupt 里的
+  `daily_pull_cut_anim`),四条全不中,空转 21s 后整条任务 66s 超时,日志报
+  「每日免费三抽任务失败(界面识别超时),按异常收尾」。
+  **根因(三层)**:
+  1. 游戏侧:新卡才有这一屏「卡面演出」,它夹在「跳过动画」和「招募结果」之间,
+     既不是结果页(没有「招募结果」标题)、也不是 3D 服装确认弹窗(没有白色
+     「确定」),三条现有判据天然对不上;
+  2. bot 侧:三抽的识别链只有「确认免费 / 3D 服装确定 / 招募结果标题」三种页面,
+     没有「演出中间页」这一档,于是 next 全不中、interrupt 也没人接;
+  3. 次生伤害:`daily_pull` 失败后进入收尾复核,`daily_pull_precheck` 认不到
+     主页「演出」按钮(画面还压在卡面上),又把这一轮判成「当前不在游戏主界面,
+     跳过本次每日免费三抽」—— 当天剩下的免费次数白丢,而且日志看着像
+     「识别出错」,用户看不出真实原因。
+  **现场**:`debug/autodori-20261117-111034.log`(11:14:49 开始三抽 / 11:15:55
+  任务失败)、`debug/maa.log` 11:15:23 `daily_pull_again` 命中 →
+  11:15:34.107 `daily_pull_cut_anim` 命中(点 (622,626) 跳动画)→
+  11:15:34.9~11:15:55.7 每 0.7s 一轮、四次识别全不中;截图
+  `debug/local/now_pull.png`(卡面页)、`debug/local/after_tap.png`(点击后)。
+  **实测确认**:在卡面页点屏幕中心 (640,360) 直接进「招募结果」页,并弹出
+  「获得3D服装」白底「确定」——现有节点 `daily_pull_costume_ok` 就能接住,
+  所以这一屏只缺「点一下」这个动作,后续链路不用改。
+  **修改情况**:
+  1. 新增模板 `assets/resource/image/daily/button/result_card_star.png`:
+     星条是斜排(左低右高),取中间那颗星紧裁 (892,512)-(958,556),66x44,
+     避开左右邻星和下方红色卡名条 —— 卡名条底色会随主题变,星星不会;
+  2. `assets/resource/pipeline/daily.json` 新增节点 `daily_pull_card_show`:
+     TemplateMatch 认这颗星,`roi [700,450,580,180]`(只框底部星条带),
+     阈值 0.8,命中后点屏幕中心 `[630,350,20,60]`,post_delay 900,
+     `next` 回 `daily_pull_result_check`,`interrupt` 放常见按钮
+     (skip/ok/confirm/close/next),防止弹窗压上来时死等;
+  3. 三处挂载:`daily_pull_again.next` 末尾(点完免费抽后的等待窗口)、
+     `daily_pull_anim_wait.interrupt`(等「招募结果」标题时)、
+     `daily_pull_result_check.next` 末尾 —— 后者让「点一次没进去就再点」
+     成环,而不是点一下就断链;
+  4. 校验:135 节点、无重名节点、单个节点 next/interrupt/on_error 合集无重复、
+     引用全部存在;`scripts/_test_daily.py` 159 项全过;
+  5. 模板做正负样本对照:本图 1.0,结果页 0.2316 / 活动主页 0.3014 /
+     活动故事两屏 0.2756 / 0.2356,阈值 0.8 留了 0.5 余量。
+  **验证状态**:离线校验与回归已过;**新卡那一屏还没有实机复现**(要再抽到
+  新卡才会出现,今天剩余次数是普通结果),下次抽到新卡时重点看日志里
+  `node hit [result.name=daily_pull_card_show]` 是否出现、之后是否正常落到
+  `daily_pull_result_check`。
+  **⚠ 补充(2026-11-22,同一坑的第二种形态)**:卡面演出页**随星级不同分成两屏**,
+  星星模板只覆盖其中一种 ——
+  1. 5 星新卡:整屏 CG + 底部斜排星条(本次 11-17 修的那种),没有 SKIP;
+  2. 2 星/重复卡:角色立绘 + 星级在右上角 + **右上角半透明 SKIP 按钮**,
+     底部没有星条 —— 星星模板在这里只有 0.26,`skip_button`
+     (`common/button/skip/white.png`)最高也只有 0.589(阈值 0.7),
+     于是三抽又在原地空转 20s 超时(16:39:05~16:40:39,
+     现场 `autodori-20261122-163422.log`、`debug/maa.log` 16:40:19~39、
+     截图 `debug/local/now_pull2.png`)。
+  **补充修法**:新增 `daily_pull_card_skip` —— OCR 认 `SKIP`(roi `[1120,10,160,100]`,
+  点击识别框中心,post_delay 900),`next` 回 `daily_pull_result_check`;
+  与 `daily_pull_card_show` 一同挂在 `daily_pull_again.next`、
+  `daily_pull_anim_wait.interrupt`、`daily_pull_result_check.next`。
+  **实测**:在该屏点 SKIP(1199,71)→ 直接到「招募结果」页并弹「获得道具 /
+  已获得过相同的成员」,弹窗白「确定」在 y584-640,`daily_pull_costume_ok`
+  (roi `[480,490,330,175]`) 认得到,后续链路不用改(截图
+  `debug/local/after_skip.png`)。
+  **判据**:这屏的 SKIP 按钮是**半透明灰底**,模板分数天然上不去,只有 OCR 读
+  `SKIP` 稳(同一画面 `next_button` 的 OCR 读到 SKIP 0.9958);以后再加判据优先 OCR。
+  节点数基线 135 → 136,`_test_daily.py` 159 项全过。
+  **教训**:抽卡演出这类「中间页」不要用「点完免费抽就盲点屏幕中心」兜底 ——
+  动画播放期间会乱点(旧 `daily_pull_tap_center` 只在 on_error 兜底里用)。
+  正确做法是先认出页面特征再点,识别不到就让它超时报错,别悄悄点掉。
+
+- **结算后的「等级 RANK UP!!」面板挡死整条链(2026-11-12,已修)**
+  现象:打完歌 → 点「下一步」→ 弹「等级 RANK UP!!」面板(角色升级),结算链
+  **20s Task timeout**(打歌阶段报「界面识别超时」),面板留在屏上 → 后面的三抽
+  前置校验也认不到主页 → 当天免费三抽被跳过。
+  现场:`autodori-20261112-122736.log` / `debug/maa.log` 12:30:16,
+  `list=["event_reward_confirm","activity_liveagain","daily_song_done",
+  "story_loading_wait","reader_menu","next_button","close_button","ok_button",
+  "read_after"]` —— 9 条识别里没有一条认这面板(面板上既没有「下一步」也没有
+  「获得报酬」,`ok_button`/`close_button` 在那按钮上只有 0.4366/0.6207)。
+  该面板文字(同一帧全屏 OCR):`确定` box[606,509,67,38] **0.9999**、
+  `RANK UP!!` [478,111,322,87] 0.9253、`等级` 0.9997、`冰川纱夜` 0.9981。
+  **修法**:`live.json` 新增 `rankup_dialog` —— OCR 认「确定/确认」,
+  `roi=[500,470,340,120]` 只框按钮带,`Click` 不写 target(点识别框中心),
+  `next` 自循环 + 回结算链;挂到 daily 覆写的 `save_succeed_playresult.interrupt`
+  首位与 `event_reward_confirm.next` 首位。
+  **⚠ 不能用 `rankup_confirm.png` 模板**:10-28 已在同一块白底卡牌上实测 0.9928
+  假命中、点空白处导致 20s 超时(见 `src/autodori.py` 结算覆写那段注释),而
+  「确定」两个字的 OCR 在同一画面是 0.9999。
+  **⚠ 挂 interrupt 不挂 next**:实测 `maa.log` 12:22:16 `confirm_button`(从
+  interrupt 命中)之后 `cur_node_=playsong`、列表原封不动 —— **interrupt 命中
+  点完会回到父节点的 next 列表继续识别**;这样点掉面板后无论接奖励弹窗、再次
+  演出还是主页,都由原有那套识别接手,不用猜后续界面。
+  回归:`scripts/_test_daily.py` 钉住识别方式/roi/挂载位置;`check_pipeline.py`
+  134 节点 0 问题。
+
+- **三抽前置校验被残留弹窗判成「不在主界面」(2026-11-12,已修)**
+  现象:12:30:36 `三抽前置校验任务失败(界面识别超时)` →
+  `当前不在游戏主界面,跳过本次每日免费三抽`,当天的免费三抽白丢。
+  原因:`daily_pull_precheck` 只是个「认主页『演出』按钮」的模板节点,弹窗压着就
+  认不到,而且没有任何兜底(它的 interrupt 为空)。
+  **修法**(`daily.json` 拆两层,Python 侧入口名不变,任务序列断言不受影响):
+  - `daily_pull_precheck` 改成跳板(`timeout: 8000`),`next` 只到
+    `daily_pull_precheck_home`,把点弹窗的节点全放 `interrupt`:
+    `rankup_dialog / event_reward_confirm / song_announce_confirm / ok_button /
+    close_button / confirm_button / next_button / tap_to_next / login_expired /
+    connect_failed`;
+  - `daily_pull_precheck_home` = 原来的识别体,`next` 只 `stop`(仍是阀门,
+    不能直连 daily_pull,否则一次 post 等于整套三抽跑两遍 —— 见 10-28 那次)。
+  点掉弹窗后 interrupt 命中会回到跳板重判主页,判到才放行;点不掉才 8s 超时跳过。
+  `tap_to_next` 是 OCR 认「TAP TO NEXT」才点(不是盲点屏幕中心),不会误触选曲。
+
 - **#59-hard ふわふわ時間 恒定 miss 1 = 绿条尾被错标成 flick(2026-11-02,issue #14)**
   **完整复盘(含四次失败的原因)见 `docs/CASE_ISSUE14_59-hard.md`**,本节只留结论。
   现象:用户 5 局 + 本机 2 局(11:31、11:50)全部 `perfect 383 + miss 1`、maxcombo 198、fast/slow 全 0
@@ -235,7 +346,11 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
   `data/event_story_progress.json` 只记本次读了几话/是否卡住,不参与「从哪开始读」。
   PT 不足或前置剧情未读时「阅读」按钮变暗点不动 → 等不到亮按钮(6s)判 locked,
   停任务并提示 PT 达标后再运行;不在活动主页 → 入口识别失败,不盲点,直接停。
-  收尾文案四种:入口没认出 / 未解锁暂停 / 列表无未读 / 读到底 + PT 提醒。
+  收尾文案(2026-11-06 细化成七种):入口没认出 / 未解锁暂停 / 点击失败(条目或
+  奖励确认) / **流程中途异常停下**(没有任何结束标记,报 ERROR) / 列表本来无未读 /
+  读到底(再分「列表已到顶」与「滚满 6 屏」)+ PT 提醒。最后一种「没有结束标记
+  就报异常」是 2026-11-06 新加的:以前节点超时后 MAA 直接收工,界面上一句提示都
+  没有,玩家分不清「读完了」还是「卡住了」。
   **踩坑(通用,别再犯)**:CustomAction 想用 `return False` 触发 `on_error` 里的
   自定义收尾节点时,MAA 会走 error handling **从 entry 重跑整条链**,日志出现
   `error handling loop detected [node.name=<entry>]`,任务记 Failed,现象是
@@ -243,13 +358,32 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
   `context.override_next(当前节点, [收工节点])`,收工节点返回 True 且 `next: ["stop"]`。
   story 模式那种 `return False + on_error: ["stop"]` 能用,是因为 stop 是内置 StopTask,
   不经过自定义节点。
+  **2026-11-06 实机问题(用户反馈「读完最后一个剧情后一直在点它,点了一会才结束」)**:
+  读完最后一话后 `EventChapterPick` 仍向上滑满 `SCROLL_LIMIT=6` 次、约 10 秒,而
+  6 次截图完全一致(`maa.log` 里 6 次 NEW 识别分数都是同一个 0.450737)—— 列表
+  早已到顶,滑动是白做的,玩家看到的是手指反复压在最后一个条目上。修法:滚动前后
+  比一帧(`_frame_diff_mean`,整帧平均像素差 < `STILL_DIFF=1.0` 视为没动),
+  连续 `STILL_LIMIT=2` 次没动就判定到顶、按「没有未读」结束。**判据不变**
+  (仍然要"找不到 NEW"),只是不再空滑;`end_reason` 区分两种结束原因。
+  同批还修了两个收尾问题:① `eventstory_pick` 的 `on_error` 与运行时
+  `override_next` 都指向 `eventstory_done`,触发
+  `PipelineChecker ... duplicate elements in the next, interrupt and on_error`
+  报错,已删 `on_error`;② 点击失败改为记 `blocked=click_failed/reward_failed`
+  + `override_next` 收工(以前返回 False 会重跑 entry,收尾日志变成误导性的
+  「入口没认出来」)。
+  **GUI 日志**:`gui.py` 的 `_should_show` 是关键词白名单,活动故事日志全是 INFO,
+  2026-11-06 前界面上一条都看不到(只有 ERROR 能过)。已在 `_KEEP` 补
+  `阅读活动故事 / 活动故事已读 / 未开始阅读 / 活动故事已暂停 / 活动故事未正常结束`,
+  只放行「开始 / 每话 / 收尾」,过程 DEBUG 仍只在文件里。改 gui.py 要重新打包 exe。
   **模板**:`assets/resource/image/event/{event_story_entry,event_read_btn,event_new_tag,event_no_voice_btn}.png`
   (粉色连通块定位裁剪,勿目测 —— 显示图 1080 宽与 1280 差 1.185 倍);阅读内界面复用
   `common/reader/{menu,skip}.png` 与 `common/button/{skip/pink,rankup_confirm}.png`
   (实测 0.9787/1.0/0.9998/1.0)。活动主页「x/y话 已解锁」和活动名都是浅灰小字/艺术字,
   OCR 在 1x/3x/二值化下都读不准(实测只出「尿臀情。」),**不要靠它做数值提示**。
-  回归 `scripts/_test_eventstory.py`(11 项;有 `debug/local/_evt_*.png` 时额外跑真实截图匹配)。
-  实机:2026-10-31 连读 5 话、每话约 15s、全部领奖后收工;不在主页与无未读两条分支也已验。
+  回归 `scripts/_test_eventstory.py`(20 项;有 `debug/local/_evt_*.png` 时额外跑真实
+  截图匹配);GUI 日志过滤回归 `scripts/_test_logfix.py` 场景 7。
+  实机:2026-10-31 连读 5 话、每话约 15s、全部领奖后收工;11-06 连读 6 话后正常收工
+  (收尾多花的那 10 秒就是本次修掉的问题);不在主页与无未读两条分支也已验。
 
 - **熱色スターマイン 恒定 miss 12 = Bestdori 漏了 12 条 fever 方向 flick(2026-10-31 已用覆盖修)**:
   现象:#56-special 每局都是 `perfect 643 + miss 12`,maxcombo 恒定 404(fast/slow 全 0),
@@ -815,7 +949,24 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
     + 同名 txt(kind/band/轨数/底噪/触发帧 y)。
   **判读**:分数几乎为 0 → 时间线整体错(对照 trigger 与 firstnote+Xms 两张图,
   锚点偏早则判定线上没音符、偏晚则音符已压在判定线下方);分数涨过一大截再断
-  → 某一段崩。回归 `_test_crashdiag.py`(13 项)。
+  → 某一段崩。回归 `_test_crashdiag.py`(18 项)。
+- **首音锚点可疑告警(2026-11-11,用户定:只记录、不改判定)**:一周实机
+  (11-03~11-11,208 首)8 起有日志的崩局里 **6 起是「开局 3~6 秒生命归零、
+  画面分数≈0」**,其中 5 起「顶部 7 行」判据比 band 判据早 **195~498ms**
+  (正常曲目 -8~+1ms)。同一首同难度在早值正常时能全 P:`#333-hard` 早 364 崩 /
+  早 -5 全 P;`#255-special` 早 195 崩 / 早 -1 全 P;`#410-hard` 早 299 崩 /
+  当晚全 P。**判据②拦不住**:它比的是 `edge_last_t`(最近一次上升沿),
+  诊断值用的是 `edge_cross_t`(首次越阈值),不是同一事件 —— 实测这些崩局
+  都是「拒绝0次」放行。所以现在只在 `_log_trigger` 里打一行
+  `WARNING 首音锚点可疑: band 判据比「顶部N行」判据晚 XXms(阈值 150ms)`,
+  并写进 `_FIRST_NOTE_DIAG`(`anchor_lead_ms` / `anchor_suspect`):
+  崩局时 `崩局诊断` 行尾追加 `· 首音锚点可疑(早 XXms)`,crash txt 多一行
+  `# 首音锚点: 顶部判据早 XXms(阈值 150ms)，可疑/正常`。常量
+  `FIRST_NOTE_ANCHOR_SUSPECT_MS=150`。**攒够样本再改锚点或判据,别先动判定。**
+  回归 `_test_crashdiag.py` 18 项(新增可疑/正常两条)。
+  顺带修了一处日志口径:`环境诊断` 原来打印废弃键 `play_at_zero_boost`
+  (只对 main 生效),日常实际读 `on_zero_boost`,于是日志写「火罐0继续=False」
+  而实际 0 火后继续挖矿。现在打印生效策略(`火罐0时=停在主界面/继续挖矿/退出游戏`)。
 - **开局首音误锚 → 整曲 miss(2026-10-27 加可信度门,尚未实机验证)**:23:24 场
   #3-special ぽっぴん’しゃっふる 首曲,冻结期底噪 3.7~4.4,候选 `change=3.42`
   (仅高于阈值 1.4)就被锚定,触发帧截图 `debug/firstnote/232424-trigger.jpg`

@@ -108,6 +108,36 @@ def main():
         check("txt 带首音触发参数", "首音触发[interp]" in body, True)
         check("txt 带指令索引", "1234/5678" in body, True)
 
+        print("== 锚点可疑写进崩局诊断(2026-11-11) ==")
+        A._FIRST_NOTE_DIAG.clear()
+        A._FIRST_NOTE_DIAG.update({
+            "kind": "interp", "band_ms": 3053.0, "lanes": 1,
+            "change": 24.3, "noise": 0.0, "y": 512.0,
+            "gate": 50, "t": time.perf_counter() - 5.7, "post_saved": True,
+            "anchor_lead_ms": 299.0, "anchor_suspect": True,
+        })
+        A._dump_crash_diag(FakeContext("00004518"), frame(), "410-hard", 1,
+                           FakeChart())
+        files = [f for f in os.listdir("debug/crash") if "410-hard" in f]
+        check("可疑时 txt 落盘", len(files), 1)
+        body = open(os.path.join("debug/crash", files[0]), encoding="utf-8").read()
+        check("txt 记锚点偏差", "顶部判据早 299ms" in body, True)
+        check("txt 标可疑", "可疑" in body, True)
+
+        A._FIRST_NOTE_DIAG.clear()
+        A._FIRST_NOTE_DIAG.update({
+            "kind": "interp", "band_ms": 2684.0, "lanes": 4,
+            "change": 26.7, "noise": 0.0, "y": 512.0,
+            "gate": 50, "t": time.perf_counter() - 65.8, "post_saved": True,
+            "anchor_lead_ms": 7.0, "anchor_suspect": False,
+        })
+        A._dump_crash_diag(FakeContext("01023840"), frame(), "601-hard", 46,
+                           FakeChart())
+        files = [f for f in os.listdir("debug/crash") if "601-hard" in f]
+        check("正常时 txt 落盘", len(files), 1)
+        body = open(os.path.join("debug/crash", files[0]), encoding="utf-8").read()
+        check("txt 记正常", "顶部判据早 7ms" in body and "正常" in body, True)
+
         print("== 没有首音记录时也要能落盘 ==")
         A._FIRST_NOTE_DIAG.clear()
         _clear = os.listdir("debug/crash")
