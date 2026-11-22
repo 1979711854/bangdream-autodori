@@ -52,7 +52,14 @@ from minitouchpy import (
 import player
 from api import BestdoriAPI
 from chart import Chart, PlayRecord
-from challenge import ChallengeCPRecognition, SelectChallengeCP, challenge_overrides, click
+from challenge import (
+    CP_MULTIPLIERS,
+    DEFAULT_CP_MULTIPLIER,
+    ChallengeCPRecognition,
+    SelectChallengeCP,
+    challenge_overrides,
+    click,
+)
 from eventstory import (
     EventChapterDone,
     EventChapterLocked,
@@ -78,6 +85,7 @@ from util import *
 MIN_LIVEBOOST = 1
 LIVEMODE = "freelive"
 CHALLENGE_FINISH = "home"
+CHALLENGE_CP_MULTIPLIER = DEFAULT_CP_MULTIPLIER
 DIFFICULTY = "hard"
 # ---- 超高难度 SPECIAL 活动(限时单曲) ----
 # 活动入口由玩家手动进入:玩家把界面停在「开演前的确认页」,脚本从那里接管
@@ -5519,7 +5527,7 @@ def _get_override_pipeline():
     all_pipelines["select_live_mode"] = livemode_pipeline
 
     if LIVEMODE == "challengelive":
-        for name, override in challenge_overrides(CHALLENGE_FINISH).items():
+        for name, override in challenge_overrides(CHALLENGE_FINISH, CHALLENGE_CP_MULTIPLIER).items():
             all_pipelines.setdefault(name, {}).update(override)
 
     # _daily_song_stop 只有"还没确认三抽"时才为 True:那时每首打完都得回主页,
@@ -6124,6 +6132,14 @@ def _main_impl():
         help="挑战演出 CP 不足 200 后的动作: home 返回主页面, exit 退出游戏",
     )
     parser.add_argument(
+        "--challenge-cp-multiplier",
+        type=int,
+        choices=CP_MULTIPLIERS,
+        default=DEFAULT_CP_MULTIPLIER,
+        # 默认为 8，旧命令仍按实际余额选最高可用倍率。
+        help="挑战演出的首选 CP 倍率，余额不足时自动降档",
+    )
+    parser.add_argument(
         "--liveboost",
         type=int,
         default=1,
@@ -6155,7 +6171,8 @@ def _main_impl():
     )
     args = parser.parse_args()
 
-    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE, CHALLENGE_FINISH
+    global DIFFICULTY, MIN_LIVEBOOST, LIVEMODE, SPECIAL_MODE, DEVICE_OVERRIDE
+    global CHALLENGE_FINISH, CHALLENGE_CP_MULTIPLIER
     global _DAILY_MODE
     global _DAILY_CLEAR_FIRE, _DAILY_FREE_PULL
     DEVICE_OVERRIDE = str(args.device or "").strip()
@@ -6221,6 +6238,7 @@ def _main_impl():
         entry = "main"
     LIVEMODE = args.livemode
     CHALLENGE_FINISH = args.challenge_finish
+    CHALLENGE_CP_MULTIPLIER = args.challenge_cp_multiplier
     MIN_LIVEBOOST = args.liveboost
     init_maa()
     init_player_and_mnt()

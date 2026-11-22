@@ -583,6 +583,7 @@ def test_gui_config_keys():
     app.view = "daily"
     app.difficulty = "expert"
     app.challenge_difficulty = "hard"
+    app.challenge_cp_multiplier = 8  # 与真实 GUI 初始化一致，共用配置保存方法。
     app.challenge_exit_game = False
     # 2026-10-17 二次改名:显示名改成「继续挖矿」(配置值仍是 play)
     app.boost_mode = "继续挖矿"

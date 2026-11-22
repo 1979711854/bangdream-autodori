@@ -10,6 +10,8 @@ from maa.custom_recognition import CustomRecognition
 
 
 CP_PER_MULTIPLIER = 200
+CP_MULTIPLIERS = (8, 4, 2, 1)
+DEFAULT_CP_MULTIPLIER = CP_MULTIPLIERS[0]
 CP_ROWS = {1: 177, 2: 250, 4: 323, 8: 396}
 
 
@@ -19,8 +21,11 @@ def parse_cp_balance(text):
     return int(text) if re.fullmatch(r"[0-9]+", text) else None
 
 
-def choose_cp_multiplier(balance):
-    return next((m for m in (8, 4, 2, 1) if balance >= m * CP_PER_MULTIPLIER), 0)
+def choose_cp_multiplier(balance, max_multiplier=DEFAULT_CP_MULTIPLIER):
+    for multiplier in CP_MULTIPLIERS:
+        if multiplier <= max_multiplier and balance >= multiplier * CP_PER_MULTIPLIER:
+            return multiplier
+    return 0
 
 
 def click(context, name, target):
@@ -70,9 +75,10 @@ class SelectChallengeCP(CustomAction):
         if balance is None:
             logging.error("无法识别挑战点数，停止挑战演出。")
             return False
-        multiplier = choose_cp_multiplier(balance)
+        settings = json.loads(argv.custom_action_param)
+        multiplier = choose_cp_multiplier(balance, settings["cp_multiplier"])
         if multiplier == 0:
-            finish = json.loads(argv.custom_action_param)["finish"]
+            finish = settings["finish"]
             logging.info("剩余 %s CP，不足 200 CP，准备%s。", balance,
                          "退出游戏" if finish == "exit" else "返回主页面")
             x, y = detail["origin"]
@@ -91,7 +97,10 @@ class SelectChallengeCP(CustomAction):
         return click(context, "_challenge_confirm_cp", [x + 335, y + 566, 200, 39])
 
 
-def challenge_overrides(finish="home"):
+def challenge_overrides(finish="home", cp_multiplier=DEFAULT_CP_MULTIPLIER):
+    final_page = {"recognition": "OCR", "expected": "最终确认", "roi": [110, 55, 270, 50]}
+    song_selection = ["select_song", "challenge_back_to_song"]
+    after_result = [*song_selection, "liveagain", "select_live_mode", "live_home_button"]
     return {
         "main": {"next": ["select_song", "challenge_back_to_song", "select_live_mode", "live_home_button"]},
         "select_song": {"next": ["set_difficulty"], "roi": [110, 55, 270, 50]},
@@ -108,7 +117,7 @@ def challenge_overrides(finish="home"):
             "timeout": 10000, "on_error": "stop",
         },
         "challenge_final": {
-            "recognition": "OCR", "expected": "最终确认", "roi": [110, 55, 270, 50],
+            **final_page,
             "next": "challenge_cp_settings", "timeout": 10000, "on_error": "stop",
         },
         "challenge_cp_settings": {
@@ -119,9 +128,15 @@ def challenge_overrides(finish="home"):
         "challenge_cp_dialog": {
             "recognition": "Custom", "custom_recognition": "ChallengeCPRecognition",
             "action": "Custom", "custom_action": "SelectChallengeCP",
-            "custom_action_param": {"finish": finish},
-            "next": "challenge_start", "timeout": 10000, "on_error": "stop",
+            "custom_action_param": {"finish": finish, "cp_multiplier": cp_multiplier},
+            "next": "ensure_live_mode", "timeout": 10000, "on_error": "stop",
         },
+        # 先认挑战「最终确认」页，再用通用节点关闭 3D/MV。扣点核对仍紧挨开演。
+        "ensure_live_mode": {
+            **final_page,
+            "timeout": 10000, "on_error": "stop",
+        },
+        "disable_liveplay": {"next": "challenge_start"},
         "challenge_finish_home": {
             "action": "Click", "post_delay": 500,
             "next": "to_tome", "on_error": "stop",
@@ -133,15 +148,23 @@ def challenge_overrides(finish="home"):
             "timeout": 10000, "on_error": "stop",
         },
         "challenge_back_to_song": {
-            "recognition": "OCR", "expected": "最终确认", "roi": [110, 55, 270, 50],
+            **final_page,
             "action": "Click", "target": [30, 36, 46, 46], "post_delay": 500,
             "next": "select_song", "timeout": 10000, "on_error": "stop",
         },
-        "liveagain": {"next": ["select_song", "challenge_back_to_song"]},
+        # 升级模板在白底经验页会误命中，因此只在「再次演出」后确认，可连续处理多张弹窗。
+        "liveagain": {"next": ["rankup_confirm", *song_selection]},
+        "rankup_confirm": {"next": ["rankup_confirm", *song_selection, "liveagain"]},
         "save_succeed_playresult": {
-            "next": ["event_reward_confirm", "select_song", "challenge_back_to_song", "liveagain", "select_live_mode", "live_home_button"],
+            "next": ["event_reward_confirm", *after_result],
         },
+        # 「下一步」只推进结果页，自身没有后续节点，作为中断才能接着等挑战页面。
         "event_reward_confirm": {
-            "next": ["select_song", "challenge_back_to_song", "liveagain", "select_live_mode", "live_home_button"],
+            "next": ["event_reward_ok", *after_result],
+            "interrupt": ["next_button"],
+        },
+        "event_reward_ok": {
+            "next": after_result,
+            "interrupt": ["next_button"],
         },
     }

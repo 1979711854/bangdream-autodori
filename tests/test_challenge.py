@@ -24,10 +24,10 @@ class FakeContext:
         return self.override_ok
 
 
-def selection_arg(balance, finish="home"):
+def selection_arg(balance, finish="home", cp_multiplier=8):
     result = SimpleNamespace(detail=json.dumps({"cp": balance, "origin": [334, 36]}))
     return SimpleNamespace(reco_detail=SimpleNamespace(best_result=result),
-                           custom_action_param=json.dumps({"finish": finish}))
+                           custom_action_param=json.dumps({"finish": finish, "cp_multiplier": cp_multiplier}))
 
 
 class ChallengeTests(unittest.TestCase):
@@ -36,6 +36,14 @@ class ChallengeTests(unittest.TestCase):
                                   (799, 2), (800, 4), (1599, 4), (1600, 8), (12303, 8)):
             with self.subTest(balance=balance):
                 self.assertEqual(choose_cp_multiplier(balance), expected)
+
+    def test_preferred_multiplier_caps_each_round_and_falls_back(self):
+        for preferred, balance, expected in (
+            (8, 1600, 8), (4, 1600, 4), (2, 1600, 2), (1, 1600, 1),
+            (4, 799, 2), (4, 399, 1), (2, 399, 1), (1, 199, 0),
+        ):
+            with self.subTest(preferred=preferred, balance=balance):
+                self.assertEqual(choose_cp_multiplier(balance, preferred), expected)
 
     def test_clears_full_balance_with_remainder_below_one_cost(self):
         balance, multipliers = 12303, []
@@ -53,11 +61,12 @@ class ChallengeTests(unittest.TestCase):
 
     def test_selection_updates_start_cost_for_each_fresh_balance(self):
         action = SelectChallengeCP()
-        for balance, cost, row in ((1600, 1600, 396), (1599, 800, 323),
-                                   (799, 400, 250), (399, 200, 177)):
-            with self.subTest(balance=balance):
+        for preferred, balance, cost, row in (
+            (8, 1600, 1600, 396), (4, 1600, 800, 323), (4, 650, 400, 250), (4, 399, 200, 177),
+        ):
+            with self.subTest(preferred=preferred, balance=balance):
                 context = FakeContext()
-                self.assertTrue(action.run(context, selection_arg(balance)))
+                self.assertTrue(action.run(context, selection_arg(balance, cp_multiplier=preferred)))
                 self.assertEqual(context.actions[0]["target"], [868, 36 + row - 10, 20, 20])
                 self.assertEqual(context.actions[1]["target"], [669, 602, 200, 39])
                 pattern = context.overrides[0]["challenge_start"]["expected"]
@@ -125,8 +134,40 @@ class ChallengeTests(unittest.TestCase):
         self.assertNotIn("save_failed_playresult", overrides)
         self.assertIn("event_reward_confirm", overrides["save_succeed_playresult"]["next"])
         self.assertEqual(overrides["challenge_finish_home"]["next"], "to_tome")
-        self.assertEqual(overrides["challenge_cp_dialog"]["custom_action_param"], {"finish": "home"})
-        self.assertEqual(challenge_overrides("exit")["challenge_cp_dialog"]["custom_action_param"], {"finish": "exit"})
+        self.assertEqual(overrides["challenge_cp_dialog"]["custom_action_param"], {"finish": "home", "cp_multiplier": 8})
+        self.assertEqual(challenge_overrides("exit", 4)["challenge_cp_dialog"]["custom_action_param"],
+                         {"finish": "exit", "cp_multiplier": 4})
+
+    def test_challenge_reuses_reward_rankup_and_live_effect_nodes(self):
+        live_path = Path(__file__).resolve().parents[1] / "assets/resource/pipeline/live.json"
+        live = json.loads(live_path.read_text(encoding="utf-8"))
+        overrides = challenge_overrides()
+        pipeline = live | {name: live.get(name, {}) | fields for name, fields in overrides.items()}
+
+        # Reward detection does not click. The shared OK node must be reachable before resuming play.
+        self.assertEqual(pipeline["save_succeed_playresult"]["next"][0], "event_reward_confirm")
+        self.assertNotIn("rankup_confirm", pipeline["save_succeed_playresult"]["next"])
+        self.assertEqual(pipeline["event_reward_confirm"]["next"][0], "event_reward_ok")
+        self.assertEqual(pipeline["event_reward_ok"]["action"], "Click")
+        for name in ("event_reward_confirm", "event_reward_ok"):
+            self.assertIn("next_button", pipeline[name]["interrupt"])
+            self.assertNotIn("next_button", pipeline[name]["next"])
+            for next_node in ("select_song", "challenge_back_to_song", "liveagain"):
+                self.assertIn(next_node, pipeline[name]["next"])
+
+        self.assertIn("rankup_confirm", pipeline["liveagain"]["next"])
+        self.assertEqual(pipeline["rankup_confirm"]["action"], "Click")
+        self.assertEqual(pipeline["rankup_confirm"]["next"],
+                         ["rankup_confirm", "select_song", "challenge_back_to_song", "liveagain"])
+
+        self.assertEqual(pipeline["challenge_cp_dialog"]["next"], "ensure_live_mode")
+        self.assertEqual(pipeline["ensure_live_mode"]["expected"], "最终确认")
+        self.assertEqual(pipeline["ensure_live_mode"]["interrupt"], ["switch_liveplay_mode"])
+        self.assertEqual(pipeline["ensure_live_mode"]["next"], ["disable_liveplay"])
+        self.assertTrue(pipeline["disable_liveplay"]["inverse"])
+        self.assertEqual(pipeline["disable_liveplay"]["next"], "challenge_start")
+        self.assertEqual(pipeline["challenge_start"]["expected"], "CP_NOT_SELECTED")
+        self.assertEqual(pipeline["challenge_start"]["next"], "wait_live_start")
 
 
 if __name__ == "__main__":
