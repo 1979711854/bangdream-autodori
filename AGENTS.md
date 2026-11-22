@@ -186,6 +186,26 @@ CustomAction,只有循环自己能带自己出去)→ ②点「演出失败→�
 
 ## 8. 踩坑清单(按重要度)
 
+- **挑战演出可选 CP 倍率(2026-11-22 合入 #15,@Ars1027)**
+  GUI 挑战页新增「CP 倍率」下拉(`1600 / 800 / 400 / 200` → `8 / 4 / 2 / 1`),
+  配置键 `challenge_cp_multiplier` **只存整数倍率**(不存中文文案,改文案不影响旧配置),
+  旧配置没有该键时兜底 8 倍 —— 与原先「按余额自动选最高档」完全一致。
+  CLI 对应 `--challenge-cp-multiplier {8,4,2,1}`;`choose_cp_multiplier(balance,
+  max_multiplier)` 先按上限过滤再取最高可用档,余额不足 200 CP 返回 0(走
+  `--challenge-finish` 的回主页/退出)。
+  流程侧 `challenge_overrides(finish, cp_multiplier)` 把挑战节点补成了
+  `challenge_cp_dialog → ensure_live_mode → disable_liveplay → challenge_start`,
+  并复用了自由演出的 `event_reward_ok` / `rankup_confirm`。
+  **实机待验的两处**(合并时只过了离线测试,`test_challenge` 11 项 + `test_gui_challenge`
+  4 项 + `_test_daily` 159 项):
+  1. `ensure_live_mode` 在本 PR 里被覆写成 OCR 认「最终确认」(roi `[110,55,270,50]`)。
+     若选完 CP 到开演之间界面标题不是「最终确认」,会 10s timeout + `on_error: stop`
+     直接把整局停掉 —— 实机跑一次要盯这一页;
+  2. `liveagain` 之后复用 `rankup_confirm`(模板 `common/button/rankup_confirm.png`,
+     阈值 0.85)。同一个模板在 11-12 的白底卡牌上曾 0.9928 假命中(见下面 rank up 条目),
+     自由演出那边已改用 OCR 的 `rankup_dialog`,挑战流程这次是「只在再次演出后挂载」
+     来收窄触发面。若实机出现「点空白处」,按 11-12 的结论换成 `rankup_dialog`。
+
 - **抽到新卡时的「卡面演出页」挡死三抽链(2026-11-17,已修)**
   **现象**:第 2 次免费抽抽到 5 星新卡 → 点掉「触摸跳过动画」→ 停在整屏卡面
   (五颗星 + 卡名「不期而遇的小确幸 / 花园 多惠」+ NEW,画面里没有任何按钮),
