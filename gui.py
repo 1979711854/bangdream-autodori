@@ -61,6 +61,10 @@ BUILD_META = os.path.join(BASE, "assets", "build_metadata.json")
 LIVE_MODE = "freelive"
 DIFFICULTIES = ["easy", "normal", "hard", "expert", "special"]
 CHALLENGE_DIFFICULTIES = ["easy", "normal", "hard", "expert"]
+# GUI 展示消耗的 CP，配置和启动参数只保存倍率，避免改文案时影响旧设置。
+CHALLENGE_CP_DEFAULT = 8
+CHALLENGE_CP_LABELS = {8: "1600（8 倍）", 4: "800（4 倍）", 2: "400（2 倍）", 1: "200（1 倍）"}
+CHALLENGE_CP_MULTIPLIERS = {label: multiplier for multiplier, label in CHALLENGE_CP_LABELS.items()}
 # 超高难度 SPECIAL 活动(限时单曲):曲目固定、难度固定 SPECIAL、不打循环。
 # 标题写法必须与曲库一致(简中客户端标题),也可直接填 Bestdori 曲目 id。
 SPECIAL_SONGS = (
@@ -482,6 +486,12 @@ class AutodoriGUI:
         self.challenge_difficulty = cfg.get("challenge_difficulty", "hard")
         if self.challenge_difficulty not in CHALLENGE_DIFFICULTIES:
             self.challenge_difficulty = "hard"
+        # 旧配置没有倍率设置，默认沿用从 8 倍开始清 CP 的行为。
+        multiplier = cfg.get("challenge_cp_multiplier", CHALLENGE_CP_DEFAULT)
+        self.challenge_cp_multiplier = (
+            multiplier if type(multiplier) is int and multiplier in CHALLENGE_CP_LABELS
+            else CHALLENGE_CP_DEFAULT
+        )
         self.challenge_exit_game = bool(cfg.get("challenge_exit_game", False))
         # 火罐为 0 的策略:默认「停在游戏主界面」;老配置的显示名经 LEGACY_BOOST
         # 映射到新名字(2026-10-17 二次改名:停止日常→停在游戏主界面、
@@ -553,6 +563,7 @@ class AutodoriGUI:
             "view": self.view,
             "difficulty": self.difficulty,
             "challenge_difficulty": self.challenge_difficulty,
+            "challenge_cp_multiplier": self.challenge_cp_multiplier,
             "challenge_exit_game": self.challenge_exit_game,
             "boost_mode": self.boost_mode,
             "life_mode": self.life_mode,
@@ -933,8 +944,7 @@ class AutodoriGUI:
     def _detail_challenge(self, master):
         th = T.get()
         card = W.Card(master)
-        W.SectionTitle(card.body, "挑战演出清 CP",
-                       "按剩余 CP 自动选择可用倍率").pack(fill="x", pady=(0, 12))
+        W.SectionTitle(card.body, "挑战演出清 CP").pack(fill="x", pady=(0, 12))
 
         self._device_row(card.body)
 
@@ -944,17 +954,22 @@ class AutodoriGUI:
                       value=self.challenge_difficulty, width=200, min_width=180,
                       on_change=self._on_challenge_difficulty).pack(side="left")
 
+        r = W.Row(card.body, "CP 倍率")
+        r.pack(fill="x", pady=(0, 16))
+        W.DropdownBox(r.slot, CHALLENGE_CP_LABELS.values(),
+                      value=CHALLENGE_CP_LABELS[self.challenge_cp_multiplier],
+                      width=200, min_width=180,
+                      on_change=self._on_challenge_cp_multiplier).pack(side="left")
+
+        # 顶栏「开始日常」始终走自由演出，挑战页须明确提示从本页启动才会应用 CP 设置。
         for line in (
-            "先在游戏里选好挑战歌曲和队伍，停在挑战选曲界面。",
-            "按剩余CP选择最高可用倍率:8一4一2一1倍；不足200 CP时停止。",
+            "在游戏里选好挑战歌曲和队伍，停在选曲界面，再点本页的「开始清 CP」。",
+            "剩余 CP 不足所选倍率时自动降档，不足 200 CP 时停止。",
         ):
             tk.Label(card.body, text=line, bg=th["surface"], fg=th["text_2"],
                      font=T.font(self.font_size - 1), anchor="w",
                      justify="left").pack(anchor="w", pady=(0, 6))
 
-        # 2026-10-17 顶栏「开始自由演出」已删除,GUI 上只剩「开始日常」与
-        # 「开始清 CP」两个打歌入口,原来那句"注意右上角按钮与本页无关"的提示
-        # 已经过时,一并删掉。
         exit_game = tk.BooleanVar(master=card.body, value=self.challenge_exit_game)
         tk.Checkbutton(
             card.body, text="清完 CP 后退出游戏（未勾选则返回主页面）",
@@ -972,6 +987,10 @@ class AutodoriGUI:
 
     def _on_challenge_difficulty(self, value):
         self.challenge_difficulty = value
+        self._save_gui_config()
+
+    def _on_challenge_cp_multiplier(self, label):
+        self.challenge_cp_multiplier = CHALLENGE_CP_MULTIPLIERS[label]
         self._save_gui_config()
 
     def _on_challenge_exit_game(self, value):
@@ -1890,8 +1909,9 @@ class AutodoriGUI:
             args = ["--mode", "special", "--special-song", str(self.special_song)]
         elif mode == "challenge":
             args = ["--mode", "main", "--difficulty", str(self.challenge_difficulty),
-                    "--livemode", "challengelive", "--challenge-finish",
-                    "exit" if self.challenge_exit_game else "home"]
+                    "--livemode", "challengelive",
+                    "--challenge-cp-multiplier", str(self.challenge_cp_multiplier),
+                    "--challenge-finish", "exit" if self.challenge_exit_game else "home"]
         elif mode in ("story_member", "story_memoir"):
             # 阅读角色故事(2026-10-25 新增):游戏一次只能筛选一种未读,
             # 小故事与回忆小故事是两个独立入口,对应 --story-type。
